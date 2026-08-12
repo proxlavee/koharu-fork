@@ -36,6 +36,14 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run headless Rust tests
+        run: cargo test --workspace --tests
+
+      - name: Run headless Vitest suite
+        run: bun run --filter @koharu/app test
+
       - name: Generate release changelog
         id: release_notes
         shell: bash
