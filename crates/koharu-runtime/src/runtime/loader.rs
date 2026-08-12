@@ -38,7 +38,7 @@ fn add_dll_directory(dir: &Path) {
         .chain(std::iter::once(0))
         .collect();
     unsafe {
-        extern "system" {
+        unsafe extern "system" {
             fn AddDllDirectory(NewDirectory: *const u16) -> *mut std::ffi::c_void;
             fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
         }
