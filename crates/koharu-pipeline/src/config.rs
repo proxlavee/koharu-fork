@@ -3,7 +3,9 @@ use koharu_translator::{GenerationConfig, Language};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::Type;
 
-use crate::stages::{Flux2KleinConfig, Flux1FillDevConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixedConfig};
+use crate::stages::{
+    Flux1FillDevConfig, Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixedConfig,
+};
 
 #[derive(Clone, Debug, PartialEq, Type)]
 pub struct PipelineConfig {
@@ -81,7 +83,9 @@ impl Serialize for PipelineConfig {
                 processor.flux2_klein.get_or_insert_with(|| config.clone());
             }
             InpaintingModel::Flux1FillDev(config) => {
-                processor.flux1_fill_dev.get_or_insert_with(|| config.clone());
+                processor
+                    .flux1_fill_dev
+                    .get_or_insert_with(|| config.clone());
             }
             InpaintingModel::RoremMixed(config) => {
                 processor.rorem_mixed.get_or_insert_with(|| config.clone());
@@ -140,9 +144,9 @@ impl<'de> Deserialize<'de> for PipelineConfig {
             "flux2-klein" => {
                 InpaintingModel::Flux2Klein(file.processor.flux2_klein.clone().unwrap_or_default())
             }
-            "flux1-fill-dev" => {
-                InpaintingModel::Flux1FillDev(file.processor.flux1_fill_dev.clone().unwrap_or_default())
-            }
+            "flux1-fill-dev" => InpaintingModel::Flux1FillDev(
+                file.processor.flux1_fill_dev.clone().unwrap_or_default(),
+            ),
             "rorem-mixed" => {
                 InpaintingModel::RoremMixed(file.processor.rorem_mixed.clone().unwrap_or_default())
             }

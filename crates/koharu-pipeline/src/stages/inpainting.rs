@@ -13,8 +13,8 @@ use image::{
 use imageproc::region_labelling::{Connectivity, connected_components};
 use koharu_ml::{
     aot_inpainting::AotInpainting,
-    flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
     flux1_fill_dev::{Flux1FillDevInpaint, Flux1FillDevInpaintOptions},
+    flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
     lama::{InpaintRequest, LaMa},
     rorem_mixed::{DEFAULT_NEGATIVE_PROMPT, DEFAULT_PROMPT, RoremMixed, RoremMixedOptions},
 };

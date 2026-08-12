@@ -10,9 +10,9 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, DetectionModel, Flux2KleinConfig, Flux1FillDevConfig, InpaintingModel, KoharuLayoutRFDetrSeg2XLConfig,
-    OcrModel, Operation, Pipeline, PipelineConfig, Progress, Request, RoremMixedConfig, Scope,
-    StageOutput, TranslationConfig,
+    Committer, DetectionModel, Flux1FillDevConfig, Flux2KleinConfig, InpaintingModel,
+    KoharuLayoutRFDetrSeg2XLConfig, OcrModel, Operation, Pipeline, PipelineConfig, Progress,
+    Request, RoremMixedConfig, Scope, StageOutput, TranslationConfig,
 };
 use koharu_renderer::{RasterOptions, Renderer};
 use koharu_scene::{AssetInput, AssetMetadata, AssetRole, At, PageDraft, Session};
