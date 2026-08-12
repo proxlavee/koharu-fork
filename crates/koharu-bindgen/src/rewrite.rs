@@ -411,4 +411,3 @@ mod tests {
         assert!(rewritten.contains("__koharu_bindgen_load_library"));
     }
 }
-
