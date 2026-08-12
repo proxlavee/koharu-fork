@@ -14,6 +14,7 @@ use imageproc::region_labelling::{Connectivity, connected_components};
 use koharu_ml::{
     aot_inpainting::AotInpainting,
     flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
+    flux1_fill_dev::{Flux1FillDevInpaint, Flux1FillDevInpaintOptions},
     lama::{InpaintRequest, LaMa},
     rorem_mixed::{DEFAULT_NEGATIVE_PROMPT, DEFAULT_PROMPT, RoremMixed, RoremMixedOptions},
 };
@@ -36,6 +37,20 @@ pub struct Flux2KleinConfig {
 }
 
 impl Default for Flux2KleinConfig {
+    fn default() -> Self {
+        Self {
+            prompt: "Remove the text and reconstruct the background.".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default)]
+pub struct Flux1FillDevConfig {
+    pub prompt: String,
+}
+
+impl Default for Flux1FillDevConfig {
     fn default() -> Self {
         Self {
             prompt: "Remove the text and reconstruct the background.".to_owned(),
@@ -75,6 +90,12 @@ impl Processor {
                     "FLUX.2 prompt contains NUL"
                 );
             }
+            InpaintingModel::Flux1FillDev(settings) => {
+                ensure!(
+                    !settings.prompt.contains('\0'),
+                    "FLUX.1 prompt contains NUL"
+                );
+            }
             InpaintingModel::RoremMixed(settings) => {
                 ensure!(
                     !settings.prompt.contains('\0') && !settings.negative_prompt.contains('\0'),
@@ -98,6 +119,7 @@ impl StageProcessor for Processor {
             InpaintingModel::LaMa {} => "lama",
             InpaintingModel::AotInpainting {} => "aot-inpainting",
             InpaintingModel::Flux2Klein(_) => "flux2-klein",
+            InpaintingModel::Flux1FillDev(_) => "flux1-fill-dev",
             InpaintingModel::RoremMixed(_) => "rorem-mixed",
         };
         ModelRef::new(name, &self.model)
@@ -123,9 +145,13 @@ impl StageProcessor for Processor {
 enum Model {
     LaMa(Arc<Mutex<LaMa>>),
     Aot(Arc<Mutex<AotInpainting>>),
-    Flux {
+    Flux2 {
         model: Arc<Mutex<Flux2KleinInpaint>>,
         config: Flux2KleinConfig,
+    },
+    Flux1FillDev {
+        model: Arc<Mutex<Flux1FillDevInpaint>>,
+        config: Flux1FillDevConfig,
     },
     Rorem {
         model: Arc<Mutex<RoremMixed>>,
@@ -142,8 +168,12 @@ impl Model {
             InpaintingModel::AotInpainting {} => Ok(Self::Aot(Arc::new(Mutex::new(
                 AotInpainting::load(device).await?,
             )))),
-            InpaintingModel::Flux2Klein(config) => Ok(Self::Flux {
-                model: Arc::new(Mutex::new(Flux2KleinInpaint::load(device).await?)),
+            InpaintingModel::Flux2Klein(config) => Ok(Self::Flux2 {
+                model: Arc::new(Mutex::new(Flux2KleinInpaint::load(device.clone()).await?)),
+                config: config.clone(),
+            }),
+            InpaintingModel::Flux1FillDev(config) => Ok(Self::Flux1FillDev {
+                model: Arc::new(Mutex::new(Flux1FillDevInpaint::load(device.clone()).await?)),
                 config: config.clone(),
             }),
             InpaintingModel::RoremMixed(config) => Ok(Self::Rorem {
@@ -211,7 +241,7 @@ impl Model {
                     .context("AOT task panicked")??,
                 )
             }
-            Self::Flux { model, config } => {
+            Self::Flux2 { model, config } => {
                 let model = model.clone();
                 let config = config.clone();
                 (
@@ -219,7 +249,7 @@ impl Model {
                     tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
                         let model = model
                             .lock()
-                            .map_err(|_| anyhow!("FLUX model lock is poisoned"))?;
+                            .map_err(|_| anyhow!("FLUX.2 model lock is poisoned"))?;
                         inpaint_tiled(
                             &prepared.image,
                             &prepared.mask,
@@ -237,7 +267,36 @@ impl Model {
                         )
                     })
                     .await
-                    .context("FLUX task panicked")??,
+                    .context("FLUX.2 task panicked")??,
+                )
+            }
+            Self::Flux1FillDev { model, config } => {
+                let model = model.clone();
+                let config = config.clone();
+                (
+                    "flux1-fill-dev",
+                    tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
+                        let model = model
+                            .lock()
+                            .map_err(|_| anyhow!("FLUX.1 Fill Dev model lock is poisoned"))?;
+                        inpaint_tiled(
+                            &prepared.image,
+                            &prepared.mask,
+                            &prepared.text_mask,
+                            &prepared.flat_fill_regions,
+                            |image, mask| {
+                                model.inference(
+                                    &config.prompt,
+                                    image,
+                                    None,
+                                    &DynamicImage::ImageLuma8(mask.clone()),
+                                    &Flux1FillDevInpaintOptions::default(),
+                                )
+                            },
+                        )
+                    })
+                    .await
+                    .context("FLUX.1 task panicked")??,
                 )
             }
             Self::Rorem { model, config } => {

@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
 use koharu_config::Config;
 use koharu_pipeline::{
-    Committer, DetectionModel, Flux2KleinConfig, InpaintingModel, KoharuLayoutRFDetrSeg2XLConfig,
+    Committer, DetectionModel, Flux2KleinConfig, Flux1FillDevConfig, InpaintingModel, KoharuLayoutRFDetrSeg2XLConfig,
     OcrModel, Operation, Pipeline, PipelineConfig, Progress, Request, RoremMixedConfig, Scope,
     StageOutput, TranslationConfig,
 };
@@ -82,6 +82,8 @@ enum InpaintingChoice {
     AotInpainting,
     #[value(name = "flux2-klein")]
     Flux2Klein,
+    #[value(name = "flux1-fill-dev")]
+    Flux1FillDev,
     #[value(name = "rorem-mixed")]
     RoremMixed,
 }
@@ -117,6 +119,9 @@ impl Arguments {
                 InpaintingChoice::AotInpainting => InpaintingModel::AotInpainting {},
                 InpaintingChoice::Flux2Klein => {
                     InpaintingModel::Flux2Klein(Flux2KleinConfig::default())
+                }
+                InpaintingChoice::Flux1FillDev => {
+                    InpaintingModel::Flux1FillDev(Flux1FillDevConfig::default())
                 }
                 InpaintingChoice::RoremMixed => {
                     InpaintingModel::RoremMixed(RoremMixedConfig::default())
