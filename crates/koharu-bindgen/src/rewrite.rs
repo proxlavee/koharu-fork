@@ -116,6 +116,7 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
             if let Some(contents) = directory.parent() {
                 paths.push(contents.join("Frameworks").join(library_file_name));
             }
+            paths.push(directory.join("resources").join(library_file_name));
             paths.push(directory.join(library_file_name));
             paths
         }
@@ -150,6 +151,48 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
             None
         }
 
+        #[cfg(target_os = "windows")]
+        unsafe fn __koharu_bindgen_load_library(
+            path: &::std::path::Path,
+        ) -> ::std::result::Result<::libloading::Library, ::libloading::Error> {
+            use ::libloading::os::windows::{
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
+            };
+            if let Some(parent) = path.parent() {
+                use ::std::os::windows::ffi::OsStrExt as _;
+                let wide: ::std::vec::Vec<u16> = parent
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(::std::iter::once(0))
+                    .collect();
+                unsafe {
+                    extern "system" {
+                        fn AddDllDirectory(NewDirectory: *const u16) -> *mut ::std::ffi::c_void;
+                        fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
+                    }
+                    AddDllDirectory(wide.as_ptr());
+                    SetDllDirectoryW(wide.as_ptr());
+                }
+            }
+            if let Ok(library) = unsafe {
+                Library::load_with_flags(
+                    path.as_os_str(),
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                )
+            } {
+                return Ok(library.into());
+            }
+            unsafe { ::libloading::Library::new(path) }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        unsafe fn __koharu_bindgen_load_library(
+            path: &::std::path::Path,
+        ) -> ::std::result::Result<::libloading::Library, ::std::string::String> {
+            unsafe { ::libloading::Library::new(path) }
+                .map_err(|error| error.to_string())
+        }
+
         unsafe fn __koharu_bindgen_open_library(
             library_file_name: &str,
         ) -> ::std::result::Result<::libloading::Library, ::std::string::String> {
@@ -159,7 +202,7 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
             }
 
             for path in __koharu_bindgen_bundled_library_paths(library_file_name) {
-                if let Ok(library) = unsafe { ::libloading::Library::new(path) } {
+                if let Ok(library) = unsafe { __koharu_bindgen_load_library(&path) } {
                     return Ok(library);
                 }
             }
@@ -180,9 +223,9 @@ fn loader_tokens(library_names: &[String]) -> TokenStream {
                     }
                 }
 
-                if libraries.is_empty() {
+                if !errors.is_empty() {
                     panic!(
-                        "failed to load any dynamic library from [{}]: {}",
+                        "failed to load dynamic library from [{}]: {}",
                         __KOHARU_BINDGEN_LIBRARY_NAMES.join(", "),
                         errors.join("; ")
                     );
@@ -351,3 +394,21 @@ fn link_name(attr: &Attribute) -> Option<String> {
 fn is_link_attr(attr: &Attribute) -> bool {
     attr.path().is_ident("link_name") || attr.path().is_ident("link_ordinal")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_bindings_with_resources_search_path() {
+        let source = r#"
+            extern "C" {
+                pub fn sample_func(x: i32) -> i32;
+            }
+        "#;
+        let rewritten = rewrite_bindings(source, "koharu-torch").unwrap();
+        assert!(rewritten.contains("directory.join(\"resources\").join(library_file_name)"));
+        assert!(rewritten.contains("__koharu_bindgen_load_library"));
+    }
+}
+

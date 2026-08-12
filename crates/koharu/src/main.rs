@@ -11,9 +11,9 @@ struct Cli {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    panic::install();
     let _cli = Cli::parse();
     let _guard = sentry::initialize();
-    panic::install();
     let filter = tracing_subscriber::filter::EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
         .from_env_lossy();
