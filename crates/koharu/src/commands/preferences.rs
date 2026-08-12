@@ -184,6 +184,9 @@ fn remember_pipeline_profiles(config: &mut PipelineConfig) {
     if let koharu_pipeline::InpaintingModel::Flux2Klein(settings) = &config.inpainting {
         config.processor.flux2_klein = Some(settings.clone());
     }
+    if let koharu_pipeline::InpaintingModel::Flux1FillDev(settings) = &config.inpainting {
+        config.processor.flux1_fill_dev = Some(settings.clone());
+    }
     if let koharu_pipeline::InpaintingModel::RoremMixed(settings) = &config.inpainting {
         config.processor.rorem_mixed = Some(settings.clone());
     }
