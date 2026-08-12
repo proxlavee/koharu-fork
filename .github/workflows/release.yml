@@ -63,6 +63,7 @@ jobs:
           {
             echo 'release_body<<EOF'
             bun git-cliff --current --strip all | head -c 120000
+            echo ""
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
