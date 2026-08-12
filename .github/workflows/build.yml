@@ -16,24 +16,10 @@ jobs:
     name: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-latest, windows-2022, ubuntu-latest]
+        os: [windows-2022]
       fail-fast: false
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Install dependencies
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo apt update
-          sudo apt install --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
