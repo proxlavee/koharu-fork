@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use koharu_pipeline::{Committer, Progress, RunStatus, StageOutput, StopToken};
-use koharu_scene::{Revision, Snapshot};
+use koharu_scene::Snapshot;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -224,7 +224,6 @@ pub(crate) async fn process(
 
         struct PipelineCommitter {
             handle: AppHandle<Cef>,
-            revisions: Vec<Revision>,
         }
 
         #[async_trait::async_trait]
@@ -234,13 +233,13 @@ pub(crate) async fn process(
                     let projects = self.handle.state::<CurrentProject>();
                     let mut projects = projects.project.lock().await;
                     let project = projects.as_mut().context("no project is open")?;
-                    let commit = project.commit_pipeline_output(output).await?;
+                    let Some(commit) = project.commit_rebased(output.patch).await? else {
+                        return Ok(project.snapshot());
+                    };
+                    project.record_commit(&commit);
                     let page = project.active_page();
                     (commit, page)
                 };
-                if commit.changes.from != commit.changes.to {
-                    self.revisions.push(commit.revision);
-                }
                 let snapshot = commit.snapshot.clone();
                 let canvas_view = self.handle.state::<CanvasView>();
                 let desktop = self.handle.state::<Desktop>();
@@ -257,7 +256,6 @@ pub(crate) async fn process(
 
         let mut committer = PipelineCommitter {
             handle: task_handle.clone(),
-            revisions: Vec::new(),
         };
         let result = pipeline.execute(snapshot, request, &mut committer).await;
         let (stopped, error) = match result {
@@ -268,15 +266,6 @@ pub(crate) async fn process(
             }
         };
         task_handle.state::<Processing>().stops.lock().remove(&id);
-        if !committer.revisions.is_empty() {
-            {
-                let projects = task_handle.state::<CurrentProject>();
-                let mut projects = projects.project.lock().await;
-                if let Some(project) = projects.as_mut() {
-                    project.record(committer.revisions);
-                }
-            }
-        }
         let job = task_handle
             .state::<Processing>()
             .jobs

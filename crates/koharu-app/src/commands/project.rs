@@ -876,19 +876,27 @@ impl Project {
         }
     }
 
-    pub(crate) async fn commit_pipeline_output(
+    pub(crate) async fn commit_rebased(
         &mut self,
-        output: koharu_pipeline::StageOutput,
-    ) -> Result<Commit> {
-        // Pipeline presentation runs outside the project lock. Rebase at the
-        // locked commit boundary so an interleaved edit cannot leave the
-        // pipeline one revision behind the durable scene.
+        patch: koharu_scene::Patch,
+    ) -> Result<Option<Commit>> {
         let current = self.snapshot();
-        let patch = output
-            .patch
-            .rebase_on(&current)
-            .with_context(|| format!("{} output inputs changed before commit", output.stage))?;
-        self.commit(patch).await
+        let patch = match patch.rebase_on(&current) {
+            Ok(patch) => patch,
+            Err(
+                error @ (koharu_scene::Error::PatchConflict(_)
+                | koharu_scene::Error::EntityNotFound(_)
+                | koharu_scene::Error::RelationNotFound(_)),
+            ) => {
+                tracing::debug!(%error, "pipeline output was superseded by a document edit");
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if patch.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.commit(patch).await?))
     }
 
     async fn commit(&mut self, patch: koharu_scene::Patch) -> Result<Commit> {
@@ -1298,73 +1306,80 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn pipeline_commit_rebases_over_an_unrelated_interleaved_edit() {
+    async fn pipeline_commit_rebases_or_yields_to_the_manual_edit() {
         let mut session = Session::memory().await.unwrap();
-        let mut entities = None;
-        let create = session
-            .snapshot()
-            .patch(|edit| {
-                let page = edit.add_page(PageDraft::new("page", 100.0, 100.0), At::End)?;
-                entities = Some((
-                    edit.add_entity(page, At::End)?,
-                    edit.add_entity(page, At::End)?,
-                ));
-                Ok(())
-            })
+        let mut setup = session.snapshot().edit();
+        let pipeline_page = setup
+            .add_page(PageDraft::new("pipeline", 100.0, 100.0), At::End)
             .unwrap();
-        let base = session.commit(create).await.unwrap().snapshot;
-        let (pipeline_entity, user_entity) = entities.unwrap();
-        let pipeline_patch = base
+        let manual_page = setup
+            .add_page(PageDraft::new("manual", 100.0, 100.0), At::End)
+            .unwrap();
+        session.commit(setup.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+
+        let base = project.snapshot();
+        let pipeline = base
             .patch(|edit| {
-                edit.set(
-                    pipeline_entity,
-                    &SceneGeometry::rectangle(0.0, 0.0, 10.0, 10.0),
+                edit.set_page(
+                    pipeline_page,
+                    PageDraft::new("pipeline result", 100.0, 100.0),
                 )
             })
             .unwrap();
-        let user_patch = base
-            .patch(|edit| {
-                edit.set(
-                    user_entity,
-                    &SceneGeometry::rectangle(20.0, 20.0, 10.0, 10.0),
-                )
-            })
+        let manual = base
+            .patch(|edit| edit.set_page(manual_page, PageDraft::new("manual edit", 100.0, 100.0)))
             .unwrap();
-        session.commit(user_patch).await.unwrap();
-        let mut project = Project {
-            session,
-            name: "test".to_owned(),
-            active_page: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-        };
+        project.commit(manual).await.unwrap();
 
-        let commit = project
-            .commit_pipeline_output(koharu_pipeline::StageOutput {
-                page: base.pages().next().unwrap().id(),
-                stage: koharu_pipeline::Stage::Inpainting,
-                patch: pipeline_patch,
-            })
-            .await
-            .unwrap();
-
+        let commit = project.commit_rebased(pipeline).await.unwrap().unwrap();
         assert_eq!(
-            commit.revision,
-            base.revision().next().unwrap().next().unwrap()
-        );
-        assert!(
             commit
                 .snapshot
-                .component::<SceneGeometry>(pipeline_entity)
+                .page(pipeline_page)
                 .unwrap()
-                .is_some()
+                .page()
+                .unwrap()
+                .label,
+            "pipeline result"
         );
-        assert!(
+        assert_eq!(
             commit
                 .snapshot
-                .component::<SceneGeometry>(user_entity)
+                .page(manual_page)
                 .unwrap()
-                .is_some()
+                .page()
+                .unwrap()
+                .label,
+            "manual edit"
+        );
+
+        let base = project.snapshot();
+        let pipeline = base
+            .patch(|edit| {
+                edit.set_page(
+                    pipeline_page,
+                    PageDraft::new("stale pipeline", 100.0, 100.0),
+                )
+            })
+            .unwrap();
+        let manual = base
+            .patch(|edit| {
+                edit.set_page(pipeline_page, PageDraft::new("latest manual", 100.0, 100.0))
+            })
+            .unwrap();
+        project.commit(manual).await.unwrap();
+
+        assert!(project.commit_rebased(pipeline).await.unwrap().is_none());
+        assert_eq!(
+            project
+                .snapshot()
+                .page(pipeline_page)
+                .unwrap()
+                .page()
+                .unwrap()
+                .label,
+            "latest manual"
         );
     }
 
