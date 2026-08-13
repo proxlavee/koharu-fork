@@ -84,6 +84,9 @@ jobs:
           printf 'APP_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
       - name: Generate release notes
         shell: bash
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           bun git-cliff --current --strip all > release-notes-full.md
           head -c 120000 release-notes-full.md > release-notes.md
