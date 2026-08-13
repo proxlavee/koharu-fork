@@ -41,7 +41,7 @@ use crate::{
     images::{DecodedImage, ImageCache, decode},
     raster::{Rasterizer, rgba},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
-    text_renderer::{StrokeOptions, TextNodeDescriptor, TextRenderer},
+    text_renderer::{StrokeOptions, StrokeSizing, TextNodeDescriptor, TextRenderer},
 };
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
@@ -56,6 +56,11 @@ const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
 const MINIMUM_FONT_SIZE: f32 = 9.0;
+// Keep automatically translated text near the source's detected glyph scale.
+// manga-image-translator uses 0.7 as its default downscale constraint and notes
+// that further balloon-area shrinking commonly makes text too small.
+// https://github.com/zyddnys/manga-image-translator/blob/95227a2bb0fd306cd4f0c104d57284026f991b3a/manga_translator/rendering/text_render_eng.py#L336-L353
+const MINIMUM_DETECTED_FONT_RATIO: f32 = 0.7;
 
 #[derive(Clone)]
 pub struct Renderer {
@@ -865,7 +870,7 @@ impl Traversal<'_> {
                 .and_then(|value| value.font_style)
                 .map(Into::into),
             font_size: typography.as_ref().and_then(|value| value.size),
-            minimum_font_size: MINIMUM_FONT_SIZE,
+            minimum_font_size: resolve_minimum_font_size(typography.as_ref()),
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
@@ -1498,11 +1503,26 @@ fn resolve_alignment(
 fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
     let typography = typography?;
     let width_px = typography.stroke_width.filter(|width| *width > 0.0)?;
+    let generated_auto_fit = typography.auto_fit && !matches!(&typography.origin, Origin::User);
     Some(StrokeOptions {
         color: typography.stroke_color.unwrap_or([u8::MAX; 4]),
         width_px,
-        scale_with_font: typography.auto_fit && !matches!(&typography.origin, Origin::User),
+        sizing: if generated_auto_fit {
+            StrokeSizing::Generated {
+                reference_font_size: typography.size,
+            }
+        } else {
+            StrokeSizing::Absolute
+        },
     })
+}
+
+fn resolve_minimum_font_size(typography: Option<&Typography>) -> f32 {
+    typography
+        .filter(|typography| typography.auto_fit && !matches!(&typography.origin, Origin::User))
+        .and_then(|typography| typography.size)
+        .map(|font_size| (font_size * MINIMUM_DETECTED_FONT_RATIO).max(MINIMUM_FONT_SIZE))
+        .unwrap_or(MINIMUM_FONT_SIZE)
 }
 
 struct CachedNode {
@@ -1866,7 +1886,7 @@ mod tests {
             preferred_font: None,
             font_weight: None,
             font_style: None,
-            size: (!auto_fit).then_some(24.0),
+            size: Some(24.0),
             auto_fit,
             color: None,
             stroke_color: Some([255; 4]),
@@ -1879,20 +1899,33 @@ mod tests {
             koharu_scene::ProducerId::new("dev.koharu.test").unwrap(),
         ));
 
-        assert!(
+        assert_eq!(
             resolve_stroke(Some(&typography(generated.clone(), true)))
                 .unwrap()
-                .scale_with_font
+                .sizing,
+            StrokeSizing::Generated {
+                reference_font_size: Some(24.0)
+            }
         );
-        assert!(
-            !resolve_stroke(Some(&typography(generated, false)))
+        assert_eq!(
+            resolve_stroke(Some(&typography(generated.clone(), false)))
                 .unwrap()
-                .scale_with_font
+                .sizing,
+            StrokeSizing::Absolute
         );
-        assert!(
-            !resolve_stroke(Some(&typography(Origin::User, true)))
+        assert_eq!(
+            resolve_stroke(Some(&typography(Origin::User, true)))
                 .unwrap()
-                .scale_with_font
+                .sizing,
+            StrokeSizing::Absolute
+        );
+        assert_eq!(
+            resolve_minimum_font_size(Some(&typography(generated, true))),
+            16.8
+        );
+        assert_eq!(
+            resolve_minimum_font_size(Some(&typography(Origin::User, true))),
+            MINIMUM_FONT_SIZE
         );
     }
 

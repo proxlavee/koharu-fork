@@ -48,6 +48,14 @@ const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
 const COLOR_CLUSTER_COUNT: usize = 4;
 const MIN_EXTREME_COLOR_PIXELS: u32 = 4;
 const MIN_MEASURED_STROKE_WIDTH: u8 = 2;
+// manga-image-translator renders a protective outline at roughly seven percent
+// of the detected font size. Keep the generated outline proportional so the
+// same page style survives both high-resolution sources and later auto-fit.
+// https://github.com/zyddnys/manga-image-translator/blob/95227a2bb0fd306cd4f0c104d57284026f991b3a/manga_translator/rendering/text_render.py#L1100-L1107
+const SYNTHETIC_STROKE_FONT_RATIO: f32 = 0.07;
+const MIN_SYNTHETIC_STROKE_WIDTH: f32 = 1.0;
+const MIN_TEXT_CONTRAST_RATIO: f32 = 4.5;
+const MIN_LOW_CONTRAST_BACKGROUND_FRACTION: f32 = 0.08;
 const NMS_CONTAINMENT_THRESHOLD: f32 = 0.9;
 const DIALOGUE_MASK_CONTAINMENT_THRESHOLD: f32 = 0.9;
 
@@ -541,7 +549,7 @@ fn write_region<'a>(
                 preferred_font: None,
                 font_weight: None,
                 font_style: None,
-                size: None,
+                size: inferred.map(|value| value.font_size),
                 auto_fit: true,
                 color: inferred
                     .map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
@@ -641,6 +649,7 @@ struct InferredTypography {
     color: [u8; 3],
     stroke_color: Option<[u8; 3]>,
     stroke_width: Option<f32>,
+    font_size: f32,
     angle_degrees: f32,
     writing_mode: WritingMode,
 }
@@ -657,6 +666,13 @@ struct MaskPixel {
     y: u32,
     color: [u8; 3],
     inside_mask: bool,
+}
+
+struct InferredPaint {
+    color: [u8; 3],
+    stroke_color: Option<[u8; 3]>,
+    stroke_width: Option<f32>,
+    ink_pixels: Vec<MaskPixel>,
 }
 
 // BallonsTranslator normalizes vertical-line angles relative to upright text:
@@ -689,7 +705,7 @@ fn infer_typography(
     let background_margin = sample_margin.ceil() as u32;
     let mut points = Vec::new();
     let mut pixels = Vec::new();
-    let mut background = Vec::new();
+    let mut background_samples = Vec::new();
     for y in top..bottom {
         let row = y as usize * mask.width as usize;
         for x in left..right {
@@ -714,7 +730,7 @@ fn infer_typography(
                 || y < top + background_margin
                 || y + background_margin >= bottom
             {
-                background.push(color);
+                background_samples.push(color);
             }
         }
     }
@@ -722,18 +738,39 @@ fn infer_typography(
         return None;
     }
 
-    let background = if background.is_empty() {
+    let background_seed = if background_samples.is_empty() {
         median_pixel_color(&pixels)
     } else {
-        median_color(&background)
+        median_color(&background_samples)
     };
-    let (angle_degrees, vertical) = mask_angle(&points, detection.bbox);
-    let (color, stroke_color, stroke_width) =
-        infer_text_paint(&pixels, background, local_width, local_height);
+    let paint = infer_text_paint(&pixels, background_seed, local_width, local_height);
+    let paint_points = paint
+        .ink_pixels
+        .iter()
+        .map(|pixel| MaskPoint {
+            x: f64::from(pixel.x) + 0.5,
+            y: f64::from(pixel.y) + 0.5,
+        })
+        .collect::<Vec<_>>();
+    let typography_points = if paint_points.len() >= 8 {
+        &paint_points
+    } else {
+        &points
+    };
+    let (angle_degrees, vertical) = mask_angle(typography_points, detection.bbox);
+    let font_size = mask_font_size(typography_points, angle_degrees, vertical);
+    let (stroke_color, stroke_width) = ensure_legible_outline(
+        paint.color,
+        paint.stroke_color,
+        paint.stroke_width,
+        &background_samples,
+        font_size,
+    );
     Some(InferredTypography {
-        color,
+        color: paint.color,
         stroke_color,
         stroke_width,
+        font_size,
         angle_degrees,
         writing_mode: if vertical {
             WritingMode::Vertical
@@ -741,6 +778,149 @@ fn infer_typography(
             WritingMode::Horizontal
         },
     })
+}
+
+// BallonsTranslator keeps the source glyph scale instead of growing every
+// translation from the full balloon. Its detector averages the cross-line
+// dimensions of detected line quadrilaterals. RF-DETR supplies a mask instead,
+// so occupied runs in the same rotated projection recover those line widths
+// without counting the whitespace between them.
+// https://github.com/dmMaze/BallonsTranslator/blob/c02102e89b7deb52cd3c01468d3f93134475b4cd/ballontranslator/utils/textblock.py#L587-L608
+fn mask_font_size(points: &[MaskPoint], angle_degrees: f32, vertical: bool) -> f32 {
+    let (sin, cos) = f64::from(angle_degrees).to_radians().sin_cos();
+    let (axis_x, axis_y) = if vertical { (cos, sin) } else { (-sin, cos) };
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    let projections = points
+        .iter()
+        .map(|point| point.x * axis_x + point.y * axis_y)
+        .inspect(|projection| {
+            minimum = minimum.min(*projection);
+            maximum = maximum.max(*projection);
+        })
+        .collect::<Vec<_>>();
+    if projections.is_empty() || !minimum.is_finite() || !maximum.is_finite() {
+        return 1.0;
+    }
+
+    let origin = minimum.floor();
+    let profile_len = (maximum.ceil() - origin).max(0.0) as usize + 1;
+    let mut profile = vec![0_u32; profile_len];
+    for projection in projections {
+        let index = (projection - origin)
+            .floor()
+            .clamp(0.0, (profile_len - 1) as f64) as usize;
+        profile[index] += 1;
+    }
+    let peak = profile.iter().copied().max().unwrap_or_default();
+    if peak == 0 {
+        return 1.0;
+    }
+    let occupancy_threshold = peak.div_ceil(32).max(1);
+    let mut occupied = profile
+        .iter()
+        .map(|count| *count >= occupancy_threshold)
+        .collect::<Vec<_>>();
+
+    // Close only narrow holes inside a glyph row. Actual inter-line gaps are a
+    // meaningful fraction of the cross-line extent and remain separate.
+    let maximum_internal_gap = ((profile_len as f32 * 0.025).round() as usize).max(1);
+    let mut index = 0;
+    while index < occupied.len() {
+        if occupied[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < occupied.len() && !occupied[index] {
+            index += 1;
+        }
+        if start > 0 && index < occupied.len() && index - start <= maximum_internal_gap {
+            occupied[start..index].fill(true);
+        }
+    }
+
+    let minimum_run = ((profile_len as f32 * 0.01).ceil() as usize).max(1);
+    let mut run_lengths = Vec::new();
+    let mut index = 0;
+    while index < occupied.len() {
+        if !occupied[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < occupied.len() && occupied[index] {
+            index += 1;
+        }
+        if index - start >= minimum_run {
+            run_lengths.push(index - start);
+        }
+    }
+    if run_lengths.is_empty() {
+        return (maximum - minimum + 1.0) as f32;
+    }
+    run_lengths.iter().sum::<usize>() as f32 / run_lengths.len() as f32
+}
+
+fn ensure_legible_outline(
+    fill: [u8; 3],
+    stroke_color: Option<[u8; 3]>,
+    stroke_width: Option<f32>,
+    background: &[[u8; 3]],
+    font_size: f32,
+) -> (Option<[u8; 3]>, Option<f32>) {
+    if stroke_color.is_some() || stroke_width.is_some() || background.is_empty() {
+        return (stroke_color, stroke_width);
+    }
+    let fill_luminance = relative_luminance(fill);
+    let mut low_contrast = 0_usize;
+    let mut black_background_contrast = 0.0;
+    let mut white_background_contrast = 0.0;
+    for sample in background {
+        let background_luminance = relative_luminance(*sample);
+        if luminance_contrast(fill_luminance, background_luminance) >= MIN_TEXT_CONTRAST_RATIO {
+            continue;
+        }
+        low_contrast += 1;
+        black_background_contrast += luminance_contrast(0.0, background_luminance);
+        white_background_contrast += luminance_contrast(1.0, background_luminance);
+    }
+    if low_contrast as f32 / (background.len() as f32) < MIN_LOW_CONTRAST_BACKGROUND_FRACTION {
+        return (None, None);
+    }
+
+    let black = [0, 0, 0];
+    let white = [u8::MAX; 3];
+    let low_contrast = low_contrast as f32;
+    let black_score =
+        luminance_contrast(fill_luminance, 0.0).min(black_background_contrast / low_contrast);
+    let white_score =
+        luminance_contrast(fill_luminance, 1.0).min(white_background_contrast / low_contrast);
+    let stroke = if white_score >= black_score {
+        white
+    } else {
+        black
+    };
+    (
+        Some(stroke),
+        Some((font_size * SYNTHETIC_STROKE_FONT_RATIO).max(MIN_SYNTHETIC_STROKE_WIDTH)),
+    )
+}
+
+fn luminance_contrast(left: f32, right: f32) -> f32 {
+    (left.max(right) + 0.05) / (left.min(right) + 0.05)
+}
+
+fn relative_luminance(color: [u8; 3]) -> f32 {
+    let linear = color.map(|channel| {
+        let channel = f32::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
 }
 
 fn typography_sample_margin(width: u32, height: u32) -> f32 {
@@ -842,14 +1022,15 @@ fn infer_text_paint(
     background_seed: [u8; 3],
     width: u32,
     height: u32,
-) -> ([u8; 3], Option<[u8; 3]>, Option<f32>) {
+) -> InferredPaint {
     let clusters = color_clusters(pixels, background_seed);
     if let Some(outline) = infer_outline(&clusters, background_seed, width, height) {
-        return (
-            outline.fill_color,
-            Some(outline.stroke_color),
-            Some(outline.stroke_width),
-        );
+        return InferredPaint {
+            color: outline.fill_color,
+            stroke_color: Some(outline.stroke_color),
+            stroke_width: Some(outline.stroke_width),
+            ink_pixels: outline.ink_pixels,
+        };
     }
 
     let nonempty = clusters
@@ -859,11 +1040,13 @@ fn infer_text_paint(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if nonempty.len() == 1 {
-        return (
-            normalize_text_color(clusters[nonempty[0]].color),
-            None,
-            None,
-        );
+        let cluster = &clusters[nonempty[0]];
+        return InferredPaint {
+            color: normalize_text_color(cluster.color),
+            stroke_color: None,
+            stroke_width: None,
+            ink_pixels: masked_cluster_pixels(cluster),
+        };
     }
 
     let background_index = nonempty
@@ -879,15 +1062,21 @@ fn infer_text_paint(
     let color = fill
         .map(|index| representative_ink_color(&clusters[index]))
         .unwrap_or(clusters[background_index].color);
-    (normalize_text_color(color), None, None)
+    let ink_cluster = &clusters[fill.unwrap_or(background_index)];
+    InferredPaint {
+        color: normalize_text_color(color),
+        stroke_color: None,
+        stroke_width: None,
+        ink_pixels: masked_cluster_pixels(ink_cluster),
+    }
 }
 
-#[derive(Clone, Copy)]
 struct OutlinePaint {
     fill_color: [u8; 3],
     stroke_color: [u8; 3],
     stroke_width: f32,
     score: u64,
+    ink_pixels: Vec<MaskPixel>,
 }
 
 fn infer_outline(
@@ -969,18 +1158,38 @@ fn infer_outline(
                 .filter(|pixel| pixel.inside_mask)
                 .count();
             let evidence = enclosed_fill.len() + inside_fill;
+            let mut ink_pixels = enclosed_fill;
+            ink_pixels.extend(stroke_pixels);
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
                 stroke_color: normalized_stroke,
                 stroke_width,
                 score: u64::from(contrast) * evidence.min(4096) as u64,
+                ink_pixels,
             };
-            if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
+            if best
+                .as_ref()
+                .is_none_or(|current: &OutlinePaint| candidate.score > current.score)
+            {
                 best = Some(candidate);
             }
         }
     }
     best
+}
+
+fn masked_cluster_pixels(cluster: &ColorCluster) -> Vec<MaskPixel> {
+    let inside = cluster
+        .pixels
+        .iter()
+        .copied()
+        .filter(|pixel| pixel.inside_mask)
+        .collect::<Vec<_>>();
+    if inside.len() >= 8 {
+        inside
+    } else {
+        cluster.pixels.clone()
+    }
 }
 
 fn reachable_without_cluster(
@@ -2245,6 +2454,7 @@ mod tests {
         assert_eq!(typography.color, Some([0, 0, 0, 255]));
         assert_eq!(typography.stroke_color, Some([255, 255, 255, 255]));
         assert_eq!(typography.stroke_width, Some(3.0));
+        assert_eq!(typography.size, Some(20.0));
     }
 
     #[test]
@@ -2413,8 +2623,9 @@ mod tests {
 
         assert!((inferred.angle_degrees - 12.0).abs() < 1.0);
         assert_eq!(inferred.color, [24, 80, 160]);
-        assert_eq!(inferred.stroke_color, None);
-        assert_eq!(inferred.stroke_width, None);
+        assert_eq!(inferred.stroke_color, Some([0, 0, 0]));
+        assert!(inferred.stroke_width.is_some_and(|width| width <= 1.1));
+        assert!((inferred.font_size - 12.0).abs() < 2.0);
         assert_eq!(inferred.writing_mode, WritingMode::Horizontal);
     }
 
@@ -2425,6 +2636,7 @@ mod tests {
         let inferred = infer_typography(&image, &detection).unwrap();
 
         assert!((inferred.angle_degrees - 9.0).abs() < 1.0);
+        assert!((inferred.font_size - 12.0).abs() < 2.0);
         assert_eq!(inferred.writing_mode, WritingMode::Vertical);
     }
 
@@ -2468,6 +2680,7 @@ mod tests {
 
         assert_eq!(inferred.writing_mode, WritingMode::Horizontal);
         assert!((inferred.angle_degrees - 8.0).abs() < 1.0);
+        assert!((inferred.font_size - 5.0).abs() < 1.0);
     }
 
     #[test]
@@ -2555,47 +2768,82 @@ mod tests {
     }
 
     #[test]
-    fn colors_in_the_same_luminance_class_do_not_create_a_border() {
+    fn rejected_antialias_band_still_gets_a_legibility_outline() {
         let (image, detection) = outlined_text(3, [0, 0, 0], [48, 48, 48]);
 
         let inferred = infer_typography(&image, &detection).unwrap();
 
         assert_eq!(inferred.color, [0, 0, 0]);
-        assert_eq!(inferred.stroke_color, None);
-        assert_eq!(inferred.stroke_width, None);
+        assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
+        assert!(inferred.stroke_width.is_some_and(|width| width <= 1.5));
     }
 
     #[test]
-    fn wide_antialias_bands_do_not_create_borders() {
-        for (fill, antialias, background) in [
-            ([20, 115, 235], [133, 180, 240], [245, 245, 245]),
-            ([0, 0, 0], [96, 96, 96], [245, 245, 245]),
+    fn antialias_bands_are_not_preserved_as_measured_outlines() {
+        for (fill, antialias, background, expected_stroke) in [
+            (
+                [20, 115, 235],
+                [133, 180, 240],
+                [245, 245, 245],
+                Some([0, 0, 0]),
+            ),
+            ([0, 0, 0], [96, 96, 96], [245, 245, 245], None),
         ] {
             let (image, detection) = outlined_text_on_background(4, fill, antialias, background);
 
             let inferred = infer_typography(&image, &detection).unwrap();
 
             assert_eq!(inferred.color, fill);
-            assert_eq!(inferred.stroke_color, None);
-            assert_eq!(inferred.stroke_width, None);
+            assert_eq!(inferred.stroke_color, expected_stroke);
+            assert!(inferred.stroke_width.is_none_or(|width| width < 2.0));
         }
     }
 
     #[test]
     fn text_region_background_is_not_mistaken_for_the_fill() {
-        for (fill, background, expected) in [
-            ([24, 40, 80], [225, 130, 175], [0, 0, 0]),
-            ([220, 240, 255], [16, 24, 88], [255, 255, 255]),
-            ([20, 115, 235], [245, 245, 245], [20, 115, 235]),
+        for (fill, background, expected, expected_stroke) in [
+            ([24, 40, 80], [225, 130, 175], [0, 0, 0], None),
+            ([220, 240, 255], [16, 24, 88], [255, 255, 255], None),
+            (
+                [20, 115, 235],
+                [245, 245, 245],
+                [20, 115, 235],
+                Some([0, 0, 0]),
+            ),
         ] {
             let (image, detection) = region_masked_text(fill, background);
 
             let inferred = infer_typography(&image, &detection).unwrap();
 
             assert_eq!(inferred.color, expected);
-            assert_eq!(inferred.stroke_color, None);
-            assert_eq!(inferred.stroke_width, None);
+            assert_eq!(inferred.stroke_color, expected_stroke);
+            assert!(
+                (inferred.font_size - 3.0).abs() < 0.5,
+                "the solid region mask replaced the ink-derived font size: {}",
+                inferred.font_size,
+            );
         }
+    }
+
+    #[test]
+    fn background_contrast_adds_only_the_outline_needed_by_each_tone() {
+        let dark_texture = [[0, 0, 0], [12, 12, 12], [230, 230, 230], [255, 255, 255]];
+        let (stroke, width) =
+            super::ensure_legible_outline([0, 0, 0], None, None, &dark_texture, 40.0);
+        assert_eq!(stroke, Some([255, 255, 255]));
+        assert!((width.unwrap() - 2.8).abs() < 0.001);
+
+        let light_texture = [[245, 245, 245]; 16];
+        let (stroke, width) =
+            super::ensure_legible_outline([20, 115, 235], None, None, &light_texture, 40.0);
+        assert_eq!(stroke, Some([0, 0, 0]));
+        assert!((width.unwrap() - 2.8).abs() < 0.001);
+
+        let white_balloon = [[255, 255, 255]; 16];
+        assert_eq!(
+            super::ensure_legible_outline([0, 0, 0], None, None, &white_balloon, 40.0,),
+            (None, None)
+        );
     }
 
     #[test]

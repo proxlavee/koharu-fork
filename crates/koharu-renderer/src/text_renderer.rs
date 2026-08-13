@@ -19,9 +19,11 @@ use crate::{
 };
 
 // Detection measures a source outline in page pixels, but translated text may
-// auto-fit much smaller. Keep inferred outlines subordinate to the final glyphs;
-// explicit user-authored widths remain absolute.
-const MAX_INFERRED_STROKE_FONT_RATIO: f32 = 0.25;
+// auto-fit smaller. Preserve the source ratio while bounding unusually broad
+// detected bands; explicit user-authored widths remain absolute. The normal
+// generated outline is seven percent of the font, so twelve percent leaves room
+// for intentionally heavy source lettering without swallowing small glyphs.
+const MAX_INFERRED_STROKE_FONT_RATIO: f32 = 0.12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextNodeDescriptor {
@@ -69,18 +71,30 @@ pub(crate) struct RenderedTextMetadata {
 pub(crate) struct StrokeOptions {
     pub color: [u8; 4],
     pub width_px: f32,
-    pub scale_with_font: bool,
+    pub sizing: StrokeSizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum StrokeSizing {
+    Absolute,
+    Generated { reference_font_size: Option<f32> },
 }
 
 impl StrokeOptions {
     fn for_font_size(self, font_size: f32) -> Self {
-        if !self.scale_with_font {
+        let StrokeSizing::Generated {
+            reference_font_size,
+        } = self.sizing
+        else {
             return self;
-        }
+        };
+        let scaled_width = reference_font_size
+            .filter(|reference| reference.is_finite() && *reference > 0.0)
+            .map_or(self.width_px, |reference| {
+                self.width_px * font_size / reference
+            });
         Self {
-            width_px: self
-                .width_px
-                .min((font_size * MAX_INFERRED_STROKE_FONT_RATIO).max(0.0)),
+            width_px: scaled_width.min((font_size * MAX_INFERRED_STROKE_FONT_RATIO).max(0.0)),
             ..self
         }
     }
@@ -192,13 +206,7 @@ impl TextRenderer {
                 entity: descriptor.entity,
                 source,
             })?;
-        let automatic_maximum = || automatic_maximum(descriptor, bounds, is_bubble_text);
-        let maximum = if descriptor.auto_fit {
-            automatic_maximum()
-        } else {
-            descriptor.font_size.unwrap_or_else(automatic_maximum)
-        };
-        let minimum = descriptor.minimum_font_size.min(maximum);
+        let (minimum, maximum) = font_size_limits(descriptor, bounds, is_bubble_text);
         let mut layout = TextLayout::new(&fonts[0])
             .with_fallback_fonts(&fonts[1..])
             .with_writing_mode(descriptor.writing_mode)
@@ -358,6 +366,30 @@ fn automatic_maximum(
     }
 }
 
+fn maximum_font_size(
+    descriptor: &TextNodeDescriptor,
+    bounds: LayoutBox,
+    is_bubble_text: bool,
+) -> f32 {
+    descriptor
+        .font_size
+        .unwrap_or_else(|| automatic_maximum(descriptor, bounds, is_bubble_text))
+}
+
+fn font_size_limits(
+    descriptor: &TextNodeDescriptor,
+    bounds: LayoutBox,
+    is_bubble_text: bool,
+) -> (f32, f32) {
+    let maximum = maximum_font_size(descriptor, bounds, is_bubble_text);
+    let maximum = if descriptor.auto_fit {
+        maximum.max(descriptor.minimum_font_size)
+    } else {
+        maximum
+    };
+    (descriptor.minimum_font_size.min(maximum), maximum)
+}
+
 fn is_chinese_or_japanese_language(language: &str) -> bool {
     language
         .split(['-', '_'])
@@ -500,6 +532,8 @@ mod tests {
 
         assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+        assert_eq!(maximum_font_size(&descriptor, bounds, true), 6.0);
+        assert_eq!(font_size_limits(&descriptor, bounds, true), (9.0, 9.0));
     }
 
     #[test]
@@ -507,14 +541,23 @@ mod tests {
         let inferred = StrokeOptions {
             color: [255; 4],
             width_px: 10.0,
-            scale_with_font: true,
+            sizing: StrokeSizing::Generated {
+                reference_font_size: Some(40.0),
+            },
         };
         let user = StrokeOptions {
-            scale_with_font: false,
+            sizing: StrokeSizing::Absolute,
+            ..inferred
+        };
+        let generated_without_reference = StrokeOptions {
+            sizing: StrokeSizing::Generated {
+                reference_font_size: None,
+            },
             ..inferred
         };
 
-        assert_eq!(inferred.for_font_size(12.0).width_px, 3.0);
+        assert!((inferred.for_font_size(12.0).width_px - 1.44).abs() < 0.001);
+        assert!((generated_without_reference.for_font_size(12.0).width_px - 1.44).abs() < 0.001);
         assert_eq!(user.for_font_size(12.0).width_px, 10.0);
     }
 }
