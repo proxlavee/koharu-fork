@@ -57,7 +57,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: koharu-app
           key: x86_64-pc-windows-msvc
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: actions/cache@v6
         with:

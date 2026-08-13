@@ -5,7 +5,7 @@ use std::{
     sync::OnceLock,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use fs4::FileExt;
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -14,6 +14,45 @@ static ROOT: OnceLock<PathBuf> = OnceLock::new();
 pub struct Store;
 
 impl Store {
+    /// Moves an installation-owned package store into a persistent location.
+    pub fn migrate(legacy: impl AsRef<Path>, persistent: impl AsRef<Path>) -> Result<()> {
+        let legacy = legacy.as_ref();
+        let persistent = persistent.as_ref();
+        if !legacy.try_exists().with_context(|| {
+            format!(
+                "failed to inspect legacy runtime store {}",
+                legacy.display()
+            )
+        })? {
+            return Ok(());
+        }
+        if !legacy.is_dir() {
+            bail!(
+                "legacy runtime store is not a directory: {}",
+                legacy.display()
+            );
+        }
+
+        let parent = persistent.parent().with_context(|| {
+            format!(
+                "persistent runtime store has no parent: {}",
+                persistent.display()
+            )
+        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+
+        if !persistent.exists() && std::fs::rename(legacy, persistent).is_ok() {
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(persistent)
+            .with_context(|| format!("failed to create {}", persistent.display()))?;
+        merge_directory(legacy, persistent)?;
+        remove_if_empty(legacy)?;
+        Ok(())
+    }
+
     /// Selects the store before the first artifact or runtime is resolved.
     pub fn configure(root: impl Into<PathBuf>) -> Result<()> {
         let requested = root.into();
@@ -139,6 +178,67 @@ impl Store {
     }
 }
 
+fn merge_directory(source: &Path, destination: &Path) -> Result<()> {
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", source.display()))?;
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", source.display()))?;
+
+        if kind.is_dir() {
+            if !destination.exists() && std::fs::rename(&source, &destination).is_ok() {
+                continue;
+            }
+            if destination.exists() && !destination.is_dir() {
+                bail!(
+                    "cannot merge runtime store directory {} into file {}",
+                    source.display(),
+                    destination.display()
+                );
+            }
+            std::fs::create_dir_all(&destination)
+                .with_context(|| format!("failed to create {}", destination.display()))?;
+            merge_directory(&source, &destination)?;
+            remove_if_empty(&source)?;
+        } else if kind.is_file() {
+            if destination.exists() {
+                continue;
+            }
+            if std::fs::rename(&source, &destination).is_err() {
+                std::fs::copy(&source, &destination).with_context(|| {
+                    format!(
+                        "failed to copy {} to {}",
+                        source.display(),
+                        destination.display()
+                    )
+                })?;
+                std::fs::remove_file(&source)
+                    .with_context(|| format!("failed to remove {}", source.display()))?;
+            }
+        } else {
+            bail!(
+                "runtime store contains an unsupported filesystem entry: {}",
+                source.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remove_if_empty(path: &Path) -> Result<()> {
+    let mut entries =
+        std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if entries.next().is_none() {
+        std::fs::remove_dir(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 struct Lock(File);
 
 impl Lock {
@@ -185,6 +285,61 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn migrated_store_survives_installation_directory_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let persistent = root
+            .path()
+            .join("local-data")
+            .join("KoharuData")
+            .join("store");
+        let old_store = root.path().join("Koharu-0.66.4").join("store");
+        let new_store = root.path().join("Koharu-0.66.5").join("store");
+        std::fs::create_dir_all(old_store.join("models")).unwrap();
+        std::fs::write(old_store.join("models").join("lama.bin"), b"cached model").unwrap();
+
+        Store::migrate(&old_store, &persistent).unwrap();
+        Store::migrate(&new_store, &persistent).unwrap();
+
+        assert_eq!(
+            std::fs::read(persistent.join("models").join("lama.bin")).unwrap(),
+            b"cached model"
+        );
+        assert!(!old_store.exists());
+        assert!(!new_store.exists());
+    }
+
+    #[test]
+    fn migration_merges_without_replacing_persistent_files() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("installation").join("store");
+        let persistent = root
+            .path()
+            .join("local-data")
+            .join("KoharuData")
+            .join("store");
+        std::fs::create_dir_all(legacy.join("models")).unwrap();
+        std::fs::create_dir_all(persistent.join("models")).unwrap();
+        std::fs::write(legacy.join("models").join("lama.bin"), b"legacy lama").unwrap();
+        std::fs::write(legacy.join("models").join("flux.bin"), b"legacy flux").unwrap();
+        std::fs::write(
+            persistent.join("models").join("lama.bin"),
+            b"persistent lama",
+        )
+        .unwrap();
+
+        Store::migrate(&legacy, &persistent).unwrap();
+
+        assert_eq!(
+            std::fs::read(persistent.join("models").join("lama.bin")).unwrap(),
+            b"persistent lama"
+        );
+        assert_eq!(
+            std::fs::read(persistent.join("models").join("flux.bin")).unwrap(),
+            b"legacy flux"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_installation_wins_for_a_shared_target() {

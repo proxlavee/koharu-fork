@@ -80,13 +80,21 @@ pub fn run(context: tauri::Context<Cef>) -> Result<()> {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(crate::commands::bindings().invoke_handler())
         .setup(move |application| {
-            koharu_runtime::Store::configure(
+            let store = application
+                .path()
+                .local_data_dir()
+                .context("failed to locate Koharu's persistent data directory")?
+                .join("KoharuData")
+                .join("store");
+            koharu_runtime::Store::migrate(
                 application
                     .path()
                     .resource_dir()
                     .context("failed to locate Koharu's installation directory")?
                     .join("store"),
+                &store,
             )?;
+            koharu_runtime::Store::configure(store)?;
 
             application.manage(CurrentProject {
                 project: Mutex::new(None),
