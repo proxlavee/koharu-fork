@@ -24,9 +24,15 @@ fn selected(path: &Path, patterns: &[&str]) -> bool {
 }
 
 fn unzip(archive: &Path, destination: &Path, patterns: &[&str]) -> Result<()> {
-    let mut archive = zip::ZipArchive::new(File::open(archive)?)?;
+    let archive_name = archive.display().to_string();
+    let archive_file =
+        File::open(archive).with_context(|| format!("failed to open {archive_name}"))?;
+    let mut archive = zip::ZipArchive::new(archive_file)
+        .with_context(|| format!("failed to read ZIP archive {archive_name}"))?;
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("failed to read entry {index} from {archive_name}"))?;
         let Some(path) = entry.enclosed_name() else {
             continue;
         };
@@ -34,18 +40,35 @@ fn unzip(archive: &Path, destination: &Path, patterns: &[&str]) -> Result<()> {
             continue;
         }
         let output = destination.join(path);
-        create_dir_all(output.parent().context("archive entry has no parent")?)?;
-        copy(&mut entry, &mut File::create(output)?)?;
+        let parent = output.parent().context("archive entry has no parent")?;
+        create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        let mut file = File::create(&output)
+            .with_context(|| format!("failed to create extracted file {}", output.display()))?;
+        copy(&mut entry, &mut file)
+            .with_context(|| format!("failed to extract {}", output.display()))?;
     }
     Ok(())
 }
 
 fn untar(archive: &Path, destination: &Path, patterns: &[&str]) -> Result<()> {
-    let mut archive = tar::Archive::new(GzDecoder::new(File::open(archive)?));
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if selected(&entry.path()?, patterns) {
-            entry.unpack_in(destination)?;
+    let archive_name = archive.display().to_string();
+    let archive_file =
+        File::open(archive).with_context(|| format!("failed to open {archive_name}"))?;
+    let mut archive = tar::Archive::new(GzDecoder::new(archive_file));
+    let entries = archive
+        .entries()
+        .with_context(|| format!("failed to read TAR archive {archive_name}"))?;
+    for (index, entry) in entries.enumerate() {
+        let mut entry =
+            entry.with_context(|| format!("failed to read entry {index} from {archive_name}"))?;
+        let path = entry
+            .path()
+            .with_context(|| format!("entry {index} in {archive_name} has an invalid path"))?
+            .into_owned();
+        if selected(&path, patterns) {
+            entry.unpack_in(destination).with_context(|| {
+                format!("failed to extract {} from {archive_name}", path.display())
+            })?;
         }
     }
     Ok(())

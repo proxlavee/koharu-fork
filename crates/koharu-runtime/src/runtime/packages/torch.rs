@@ -9,6 +9,7 @@ use strum::EnumProperty;
 use crate::{
     Hardware, Store,
     downloads::Transfer,
+    filesystem,
     runtime::{
         DiscoverablePackage, Package, RuntimePackage,
         graph::Component,
@@ -200,7 +201,17 @@ impl Package for Torch {
                     transfer.fetch(&url, archive.path()).await?;
                     extract(archive.path(), &stage, &patterns)?;
                 }
-                std::fs::rename(stage.join("torch"), stage.join("libtorch"))?;
+                let source = stage.join("torch");
+                let destination = stage.join("libtorch");
+                filesystem::rename(&source, &destination)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare Torch {self} libraries from {} to {}",
+                            source.display(),
+                            destination.display()
+                        )
+                    })?;
                 Ok(())
             },
         )

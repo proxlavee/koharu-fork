@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use fs4::FileExt;
 
+use crate::filesystem;
+
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Koharu's process-wide immutable package store.
@@ -134,7 +136,7 @@ impl Store {
             "installer produced an incomplete package"
         );
 
-        match std::fs::rename(stage.path(), &target) {
+        match filesystem::rename(stage.path(), &target).await {
             Ok(()) => Ok(target),
             Err(_) if valid(&target) => Ok(target),
             Err(error) => {
@@ -170,9 +172,8 @@ impl Store {
             std::fs::remove_file(&target)
                 .with_context(|| format!("failed to replace incomplete {}", target.display()))?;
         }
-        stage
-            .persist(&target)
-            .map_err(|error| error.error)
+        filesystem::rename(stage.as_ref(), &target)
+            .await
             .with_context(|| format!("failed to publish {}", target.display()))?;
         Ok(target)
     }
