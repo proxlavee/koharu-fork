@@ -7,10 +7,6 @@ on:
         description: stable-diffusion.cpp branch or tag to build
         required: true
         default: master-769-cc73429
-  push:
-    branches: ['main']
-    paths:
-      - '.github/workflows/stable-diffusion-cpp.yml'
   pull_request:
     branches: ['main']
     paths:

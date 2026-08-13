@@ -7,11 +7,6 @@ on:
         description: llama.cpp branch or tag to build
         required: true
         default: b9982
-  push:
-    branches: ['main']
-    paths:
-      - '.github/llama.cpp/**'
-      - '.github/workflows/llama-cpp.yml'
   pull_request:
     branches: ['main']
     paths:

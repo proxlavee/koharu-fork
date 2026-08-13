@@ -6,6 +6,7 @@ on:
       - 'v*.*.*'
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -24,22 +25,11 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Verify downloadable Windows ML runtimes
+      - name: Verify or build pinned Windows runtimes
         shell: bash
-        run: |
-          base=https://github.com/proxlavee/koharu-fork/releases/download
-          assets=(
-            "$base/llama.cpp-b9982/llama-cuda-windows-2022.tar.gz"
-            "$base/llama.cpp-b9982/llama-hip-windows-2022.tar.gz"
-            "$base/llama.cpp-b9982/llama-vulkan-windows-2022.tar.gz"
-            "$base/stable-diffusion.cpp-master-769-cc73429/stable-diffusion-cuda-windows-2022.tar.gz"
-            "$base/stable-diffusion.cpp-master-769-cc73429/stable-diffusion-hip-windows-2022.tar.gz"
-            "$base/stable-diffusion.cpp-master-769-cc73429/stable-diffusion-vulkan-windows-2022.tar.gz"
-          )
-          for asset in "${assets[@]}"; do
-            curl.exe --fail --silent --show-error --location --head \
-              --retry 4 --retry-all-errors "$asset" >/dev/null
-          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/ensure-windows-runtimes.sh --dispatch-missing
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
         with:
