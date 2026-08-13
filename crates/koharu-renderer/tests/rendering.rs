@@ -165,6 +165,72 @@ async fn rasterized_png_contains_source_and_cleanup_pixels() {
     assert_eq!(raster.image.get_pixel(2, 1).0, [240, 30, 20, 255]);
 }
 
+#[tokio::test]
+async fn long_page_source_and_export_cross_gpu_tile_boundaries() {
+    const WIDTH: u32 = 16;
+    const HEIGHT: u32 = 9_000;
+    let mut source = image::RgbaImage::new(WIDTH, HEIGHT);
+    for (x, y, pixel) in source.enumerate_pixels_mut() {
+        *pixel = image::Rgba([
+            (y % 251) as u8,
+            ((y / 251 + x) % 251) as u8,
+            (x * 11) as u8,
+            255,
+        ]);
+    }
+    let expected = source.clone();
+    let mut session = Session::memory().await.unwrap();
+    let mut page = None;
+    let patch = session
+        .snapshot()
+        .patch(|edit| {
+            let created = edit.add_page(
+                PageDraft::new("long-page", f64::from(WIDTH), f64::from(HEIGHT)),
+                At::End,
+            )?;
+            edit.set_asset(
+                created,
+                &AssetRole::new("source")?,
+                AssetInput::new(
+                    png_image(source),
+                    "image/png",
+                    AssetMetadata {
+                        width: Some(WIDTH),
+                        height: Some(HEIGHT),
+                        attributes: BTreeMap::new(),
+                    },
+                ),
+            )?;
+            page = Some(created);
+            Ok(())
+        })
+        .unwrap();
+    let snapshot = session.commit(patch).await.unwrap().snapshot;
+    let renderer = Renderer::new().unwrap();
+    let frame = renderer.render(&snapshot, page.unwrap()).await.unwrap();
+    let raster = renderer
+        .rasterize(&frame, RasterOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(raster.image.dimensions(), (WIDTH, HEIGHT));
+    for y in [
+        0,
+        4_093,
+        4_094,
+        4_095,
+        8_187,
+        8_188,
+        8_191,
+        8_192,
+        HEIGHT - 1,
+    ] {
+        for x in [0, WIDTH / 2, WIDTH - 1] {
+            assert_eq!(raster.image.get_pixel(x, y), expected.get_pixel(x, y));
+        }
+    }
+}
+
 #[test]
 fn public_layer_kinds_remain_export_metadata() {
     let _ = LayerKind::Image(koharu_renderer::ImageMetadata {

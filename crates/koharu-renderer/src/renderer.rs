@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ops::Range,
     sync::{Arc, OnceLock, Weak},
 };
 
@@ -45,6 +46,12 @@ use crate::{
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
+// WGPU guarantees less than Koharu's document limit on some desktop adapters.
+// Retained images therefore use bounded textures independent of the eventual
+// canvas or export device. A one-pixel gutter preserves bilinear samples at
+// tile boundaries while the core clip prevents overlapping draws.
+const MAX_IMAGE_TEXTURE_DIMENSION: u32 = 4_096;
+const IMAGE_TILE_GUTTER: u32 = 1;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
@@ -1157,17 +1164,49 @@ fn build_node(
                     image.blob, decoded.width, decoded.height, image.require_size
                 )));
             }
-            let pixels: Arc<dyn AsRef<[u8]> + Send + Sync> =
-                Arc::new(ImageBytes(decoded.pixels.clone()));
-            let data = ImageData {
-                data: Blob::new(pixels),
-                format: ImageFormat::Rgba8,
-                alpha_type: ImageAlphaType::Alpha,
-                width: decoded.width,
-                height: decoded.height,
-            };
             let mut scene = Scene::new();
-            scene.draw_image(&data, Affine::IDENTITY);
+            if decoded.width <= MAX_IMAGE_TEXTURE_DIMENSION
+                && decoded.height <= MAX_IMAGE_TEXTURE_DIMENSION
+            {
+                let pixels: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(ImageBytes::Shared {
+                    pixels: decoded.pixels.clone(),
+                    range: 0..decoded.pixels.len(),
+                });
+                let data = ImageData {
+                    data: Blob::new(pixels),
+                    format: ImageFormat::Rgba8,
+                    alpha_type: ImageAlphaType::Alpha,
+                    width: decoded.width,
+                    height: decoded.height,
+                };
+                scene.draw_image(&data, Affine::IDENTITY);
+            } else {
+                for tile in image_tiles(decoded, MAX_IMAGE_TEXTURE_DIMENSION)? {
+                    let pixels: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(tile.pixels);
+                    let data = ImageData {
+                        data: Blob::new(pixels),
+                        format: ImageFormat::Rgba8,
+                        alpha_type: ImageAlphaType::Alpha,
+                        width: tile.data[2] - tile.data[0],
+                        height: tile.data[3] - tile.data[1],
+                    };
+                    scene.push_clip_layer(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        &Rect::new(
+                            f64::from(tile.core[0]),
+                            f64::from(tile.core[1]),
+                            f64::from(tile.core[2]),
+                            f64::from(tile.core[3]),
+                        ),
+                    );
+                    scene.draw_image(
+                        &data,
+                        Affine::translate((f64::from(tile.data[0]), f64::from(tile.data[1]))),
+                    );
+                    scene.pop_layer();
+                }
+            }
             Ok(RetainedNode {
                 descriptor,
                 scene: Arc::new(scene),
@@ -1621,12 +1660,113 @@ impl AffectedDependencies {
     }
 }
 
-struct ImageBytes(Arc<[u8]>);
+#[derive(Clone)]
+enum ImageBytes {
+    Shared {
+        pixels: Arc<[u8]>,
+        range: Range<usize>,
+    },
+    Owned(Arc<[u8]>),
+}
 
 impl AsRef<[u8]> for ImageBytes {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        match self {
+            Self::Shared { pixels, range } => &pixels[range.clone()],
+            Self::Owned(pixels) => pixels,
+        }
     }
+}
+
+#[derive(Clone)]
+struct ImageTile {
+    core: [u32; 4],
+    data: [u32; 4],
+    pixels: ImageBytes,
+}
+
+fn image_tiles(image: &DecodedImage, maximum_dimension: u32) -> Result<Vec<ImageTile>> {
+    if maximum_dimension <= IMAGE_TILE_GUTTER * 2 {
+        return Err(Error::invalid(
+            "image texture limit is too small for tile gutters",
+        ));
+    }
+    let core_dimension = maximum_dimension - IMAGE_TILE_GUTTER * 2;
+    let row_bytes = usize::try_from(image.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| Error::invalid("decoded image row size overflow"))?;
+    let mut tiles = Vec::new();
+    let mut core_top = 0;
+    while core_top < image.height {
+        let core_bottom = core_top.saturating_add(core_dimension).min(image.height);
+        let mut core_left = 0;
+        while core_left < image.width {
+            let core_right = core_left.saturating_add(core_dimension).min(image.width);
+            let data = [
+                core_left.saturating_sub(IMAGE_TILE_GUTTER),
+                core_top.saturating_sub(IMAGE_TILE_GUTTER),
+                core_right
+                    .saturating_add(IMAGE_TILE_GUTTER)
+                    .min(image.width),
+                core_bottom
+                    .saturating_add(IMAGE_TILE_GUTTER)
+                    .min(image.height),
+            ];
+            let pixels = if data[0] == 0 && data[2] == image.width {
+                let start = usize::try_from(data[1])
+                    .ok()
+                    .and_then(|top| top.checked_mul(row_bytes))
+                    .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
+                let end = usize::try_from(data[3])
+                    .ok()
+                    .and_then(|bottom| bottom.checked_mul(row_bytes))
+                    .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
+                ImageBytes::Shared {
+                    pixels: image.pixels.clone(),
+                    range: start..end,
+                }
+            } else {
+                let tile_width = usize::try_from(data[2] - data[0])
+                    .map_err(|_| Error::invalid("decoded image tile width overflow"))?;
+                let tile_height = usize::try_from(data[3] - data[1])
+                    .map_err(|_| Error::invalid("decoded image tile height overflow"))?;
+                let tile_row_bytes = tile_width
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::invalid("decoded image tile row size overflow"))?;
+                let mut pixels = Vec::new();
+                pixels
+                    .try_reserve_exact(tile_row_bytes.checked_mul(tile_height).ok_or_else(
+                        || Error::invalid("decoded image tile allocation size overflow"),
+                    )?)
+                    .map_err(|source| Error::Backend(anyhow!(source)))?;
+                let left = usize::try_from(data[0])
+                    .ok()
+                    .and_then(|left| left.checked_mul(4))
+                    .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
+                for y in data[1]..data[3] {
+                    let start = usize::try_from(y)
+                        .ok()
+                        .and_then(|y| y.checked_mul(row_bytes))
+                        .and_then(|row| row.checked_add(left))
+                        .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
+                    let end = start
+                        .checked_add(tile_row_bytes)
+                        .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
+                    pixels.extend_from_slice(&image.pixels[start..end]);
+                }
+                ImageBytes::Owned(pixels.into())
+            };
+            tiles.push(ImageTile {
+                core: [core_left, core_top, core_right, core_bottom],
+                data,
+                pixels,
+            });
+            core_left = core_right;
+        }
+        core_top = core_bottom;
+    }
+    Ok(tiles)
 }
 
 fn draw_font_preview(scene: &mut Scene, layout: &crate::LayoutRun<'_>) -> anyhow::Result<()> {
@@ -1747,6 +1887,61 @@ mod tests {
         assert!(!renderer.inner.fonts.is_system_initialized());
         assert!(renderer.inner.workers.get().is_none());
         assert!(renderer.inner.rasterizer.get().is_none());
+    }
+
+    #[test]
+    fn image_tiles_preserve_every_source_pixel_with_bounded_gutters() {
+        let width = 7;
+        let height = 6;
+        let pixels = (0..width * height)
+            .flat_map(|index| [index as u8, index as u8 + 1, index as u8 + 2, 255])
+            .collect::<Vec<_>>();
+        let image = DecodedImage {
+            width,
+            height,
+            pixels: pixels.clone().into(),
+        };
+
+        let tiles = image_tiles(&image, 4).unwrap();
+        let mut reconstructed = vec![0_u8; pixels.len()];
+        let mut coverage = vec![0_u8; (width * height) as usize];
+        for tile in tiles {
+            let data_width = tile.data[2] - tile.data[0];
+            let data_height = tile.data[3] - tile.data[1];
+            assert!(data_width <= 4 && data_height <= 4);
+            let bytes = tile.pixels.as_ref();
+            for y in tile.core[1]..tile.core[3] {
+                for x in tile.core[0]..tile.core[2] {
+                    let source =
+                        (((y - tile.data[1]) * data_width + x - tile.data[0]) * 4) as usize;
+                    let destination = ((y * width + x) * 4) as usize;
+                    reconstructed[destination..destination + 4]
+                        .copy_from_slice(&bytes[source..source + 4]);
+                    coverage[(y * width + x) as usize] += 1;
+                }
+            }
+        }
+
+        assert_eq!(reconstructed, pixels);
+        assert!(coverage.into_iter().all(|count| count == 1));
+    }
+
+    #[test]
+    fn narrow_long_image_tiles_share_the_decoded_storage() {
+        let image = DecodedImage {
+            width: 2,
+            height: 9,
+            pixels: Arc::from([0_u8; 2 * 9 * 4]),
+        };
+
+        let tiles = image_tiles(&image, 4).unwrap();
+
+        assert!(tiles.len() > 1);
+        assert!(
+            tiles
+                .iter()
+                .all(|tile| matches!(tile.pixels, ImageBytes::Shared { .. }))
+        );
     }
 
     #[tokio::test]

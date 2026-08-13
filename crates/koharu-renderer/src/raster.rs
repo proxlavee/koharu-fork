@@ -69,6 +69,9 @@ impl Default for RasterOptions {
 }
 
 const MAX_SUPERSAMPLING_FACTOR: u32 = 4;
+// Bound export working sets even when an adapter exposes very large textures.
+// The final CPU image retains the authored dimensions; only the GPU work is tiled.
+const MAX_RASTER_TILE_DIMENSION: u32 = 4_096;
 
 #[derive(Debug)]
 pub struct Raster {
@@ -207,6 +210,74 @@ impl Rasterizer {
         height: u32,
         background: [u8; 4],
     ) -> Result<Vec<u8>> {
+        let device_limit = {
+            let gpu = self.gpu.lock();
+            gpu.context.devices[gpu.device_id]
+                .device
+                .limits()
+                .max_texture_dimension_2d
+        };
+        let maximum_dimension = device_limit.min(MAX_RASTER_TILE_DIMENSION);
+        let tiles = raster_tiles(width, height, maximum_dimension)?;
+        if tiles.len() == 1 {
+            return self.readback_tile(scene, width, height, background);
+        }
+
+        let row_bytes = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .context("render surface row size overflow")?;
+        let image_bytes = row_bytes
+            .checked_mul(usize::try_from(height).context("render surface height overflow")?)
+            .context("render surface allocation size overflow")?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(image_bytes)
+            .context("failed to allocate the render surface")?;
+        pixels.resize(image_bytes, 0);
+        for tile in tiles {
+            let mut tile_scene = Scene::new();
+            tile_scene.append(
+                scene,
+                Some(Affine::translate((
+                    -f64::from(tile.left),
+                    -f64::from(tile.top),
+                ))),
+            );
+            let tile_pixels =
+                self.readback_tile(&tile_scene, tile.width, tile.height, background)?;
+            let tile_row_bytes = usize::try_from(tile.width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .context("render tile row size overflow")?;
+            let left_bytes = usize::try_from(tile.left)
+                .ok()
+                .and_then(|left| left.checked_mul(4))
+                .context("render tile offset overflow")?;
+            for row in 0..usize::try_from(tile.height).context("render tile height overflow")? {
+                let source = row
+                    .checked_mul(tile_row_bytes)
+                    .context("render tile source offset overflow")?;
+                let destination = usize::try_from(tile.top)
+                    .ok()
+                    .and_then(|top| top.checked_add(row))
+                    .and_then(|row| row.checked_mul(row_bytes))
+                    .and_then(|offset| offset.checked_add(left_bytes))
+                    .context("render tile destination offset overflow")?;
+                pixels[destination..destination + tile_row_bytes]
+                    .copy_from_slice(&tile_pixels[source..source + tile_row_bytes]);
+            }
+        }
+        Ok(pixels)
+    }
+
+    fn readback_tile(
+        &self,
+        scene: &Scene,
+        width: u32,
+        height: u32,
+        background: [u8; 4],
+    ) -> Result<Vec<u8>> {
         let size = Extent3d {
             width,
             height,
@@ -303,6 +374,38 @@ impl Rasterizer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RasterTile {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+}
+
+fn raster_tiles(width: u32, height: u32, maximum_dimension: u32) -> Result<Vec<RasterTile>> {
+    if maximum_dimension == 0 {
+        bail!("WGPU reported a zero texture dimension limit");
+    }
+    let mut tiles = Vec::new();
+    let mut top = 0;
+    while top < height {
+        let tile_height = height.saturating_sub(top).min(maximum_dimension);
+        let mut left = 0;
+        while left < width {
+            let tile_width = width.saturating_sub(left).min(maximum_dimension);
+            tiles.push(RasterTile {
+                left,
+                top,
+                width: tile_width,
+                height: tile_height,
+            });
+            left = left.saturating_add(tile_width);
+        }
+        top = top.saturating_add(tile_height);
+    }
+    Ok(tiles)
+}
+
 impl RenderTarget {
     fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self> {
         let size = Extent3d {
@@ -347,4 +450,53 @@ impl RenderTarget {
 
 pub(crate) fn rgba([r, g, b, a]: [u8; 4]) -> Color {
     Color::from_rgba8(r, g, b, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tall_render_surfaces_are_covered_by_bounded_tiles() {
+        let tiles = raster_tiles(720, 10_259, 4_096).unwrap();
+
+        assert_eq!(
+            tiles,
+            vec![
+                RasterTile {
+                    left: 0,
+                    top: 0,
+                    width: 720,
+                    height: 4_096,
+                },
+                RasterTile {
+                    left: 0,
+                    top: 4_096,
+                    width: 720,
+                    height: 4_096,
+                },
+                RasterTile {
+                    left: 0,
+                    top: 8_192,
+                    width: 720,
+                    height: 2_067,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn two_dimensional_tiles_cover_each_pixel_once() {
+        let tiles = raster_tiles(9, 7, 4).unwrap();
+        let mut coverage = vec![0_u8; 9 * 7];
+        for tile in tiles {
+            assert!(tile.width <= 4 && tile.height <= 4);
+            for y in tile.top..tile.top + tile.height {
+                for x in tile.left..tile.left + tile.width {
+                    coverage[(y * 9 + x) as usize] += 1;
+                }
+            }
+        }
+        assert!(coverage.into_iter().all(|count| count == 1));
+    }
 }
