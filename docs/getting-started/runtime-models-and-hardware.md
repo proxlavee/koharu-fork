@@ -38,14 +38,6 @@ Smaller local-model quantizations use less memory, usually with some quality tra
 
 Automatic inpainting expands detected text masks before inference so glyph outlines, antialiasing, and glow do not remain as silhouettes. Manual inpainting keeps the brush mask exact; paint over the full visible outline when repairing a region by hand.
 
-## FLUX.1 Fill Dev
-
-The optional FLUX.1 Fill Dev inpainting profile downloads about 10 GiB of pinned model files. It requires at least 16 GiB of system memory; more memory gives Windows and other applications safer headroom while the model is active.
-
-On NVIDIA GPUs, Koharu keeps the CLIP-L and T5 text encoders on the CPU and limits the CUDA allocation to 75% of detected VRAM. On a 16 GiB RTX 5060 Ti, that budget is 12 GiB. The diffusion weights can stream from system memory, leaving GPU capacity for the VAE and for other pipeline models. Koharu still evicts idle stages when necessary.
-
-FLUX.1 Fill Dev is governed by the [FLUX.1 Dev non-commercial license](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md). Review that license before using generated output outside personal or evaluation workflows.
-
 ## When startup fails
 
 Confirm that GitHub release assets and Hugging Face are reachable, update the GPU driver, and retry once. If the same package repeatedly fails, capture the full error and follow [Troubleshooting](/reference/troubleshooting/).

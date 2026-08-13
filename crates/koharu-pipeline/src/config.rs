@@ -3,9 +3,7 @@ use koharu_translator::{GenerationConfig, Language};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use specta::Type;
 
-use crate::stages::{
-    Flux1FillDevConfig, Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixedConfig,
-};
+use crate::stages::{Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixedConfig};
 
 #[derive(Clone, Debug, PartialEq, Type)]
 pub struct PipelineConfig {
@@ -70,7 +68,6 @@ impl Serialize for PipelineConfig {
             InpaintingModel::LaMa {} => "lama",
             InpaintingModel::AotInpainting {} => "aot-inpainting",
             InpaintingModel::Flux2Klein(_) => "flux2-klein",
-            InpaintingModel::Flux1FillDev(_) => "flux1-fill-dev",
             InpaintingModel::RoremMixed(_) => "rorem-mixed",
         };
         let mut processor = self.processor.clone();
@@ -81,11 +78,6 @@ impl Serialize for PipelineConfig {
         match &self.inpainting {
             InpaintingModel::Flux2Klein(config) => {
                 processor.flux2_klein.get_or_insert_with(|| config.clone());
-            }
-            InpaintingModel::Flux1FillDev(config) => {
-                processor
-                    .flux1_fill_dev
-                    .get_or_insert_with(|| config.clone());
             }
             InpaintingModel::RoremMixed(config) => {
                 processor.rorem_mixed.get_or_insert_with(|| config.clone());
@@ -144,9 +136,6 @@ impl<'de> Deserialize<'de> for PipelineConfig {
             "flux2-klein" => {
                 InpaintingModel::Flux2Klein(file.processor.flux2_klein.clone().unwrap_or_default())
             }
-            "flux1-fill-dev" => InpaintingModel::Flux1FillDev(
-                file.processor.flux1_fill_dev.clone().unwrap_or_default(),
-            ),
             "rorem-mixed" => {
                 InpaintingModel::RoremMixed(file.processor.rorem_mixed.clone().unwrap_or_default())
             }
@@ -228,12 +217,6 @@ impl PipelineConfig {
                     .clone()
                     .unwrap_or_else(|| config.clone()),
             )),
-            InpaintingModel::Flux1FillDev(config) => Ok(InpaintingModel::Flux1FillDev(
-                self.processor
-                    .flux1_fill_dev
-                    .clone()
-                    .unwrap_or_else(|| config.clone()),
-            )),
             InpaintingModel::RoremMixed(config) => Ok(InpaintingModel::RoremMixed(
                 self.processor
                     .rorem_mixed
@@ -263,8 +246,6 @@ pub struct ProcessorConfig {
     pub koharu_layout_rfdetr_seg_2xl: Option<KoharuLayoutRFDetrSeg2XLConfig>,
     #[serde(rename = "flux2-klein")]
     pub flux2_klein: Option<Flux2KleinConfig>,
-    #[serde(rename = "flux1-fill-dev")]
-    pub flux1_fill_dev: Option<Flux1FillDevConfig>,
     #[serde(rename = "rorem-mixed")]
     pub rorem_mixed: Option<RoremMixedConfig>,
 }
@@ -296,8 +277,6 @@ pub enum InpaintingModel {
     AotInpainting {},
     #[serde(rename = "flux2-klein")]
     Flux2Klein(Flux2KleinConfig),
-    #[serde(rename = "flux1-fill-dev")]
-    Flux1FillDev(Flux1FillDevConfig),
     #[serde(rename = "rorem-mixed")]
     RoremMixed(RoremMixedConfig),
 }
@@ -440,27 +419,6 @@ mod tests {
             panic!("expected FLUX profile")
         };
         assert_eq!(config.prompt, "saved prompt");
-    }
-
-    #[test]
-    fn serializes_flux_fill_selection_and_profile() {
-        let expected = "Restore the artwork behind the lettering.";
-        let config = PipelineConfig {
-            inpainting: InpaintingModel::Flux1FillDev(Flux1FillDevConfig {
-                prompt: expected.to_owned(),
-            }),
-            ..PipelineConfig::default()
-        };
-
-        let document = toml::to_string(&config).unwrap();
-        assert!(document.contains("[inpainting]\nmodel = \"flux1-fill-dev\""));
-        assert!(document.contains("[processor.flux1-fill-dev]"));
-
-        let restored = toml::from_str::<PipelineConfig>(&document).unwrap();
-        assert!(matches!(
-            restored.inpainting().unwrap(),
-            InpaintingModel::Flux1FillDev(config) if config.prompt == expected
-        ));
     }
 
     #[test]

@@ -16,9 +16,7 @@ use imageproc::{
     region_labelling::{Connectivity, connected_components},
 };
 use koharu_ml::{
-    InferenceControl, InferenceProgress,
     aot_inpainting::AotInpainting,
-    flux1_fill_dev::{Flux1FillDevInpaint, Flux1FillDevInpaintOptions},
     flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
     lama::{InpaintRequest, LaMa},
     rorem_mixed::{DEFAULT_NEGATIVE_PROMPT, DEFAULT_PROMPT, RoremMixed, RoremMixedOptions},
@@ -31,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use super::{StageInput, StageProcessor, finish, generation};
-use crate::{InpaintingModel, ModelCell, Progress, progress};
+use crate::{InpaintingModel, ModelCell};
 
 const PRODUCER: &str = "dev.koharu.pipeline.inpainting";
 
@@ -42,20 +40,6 @@ pub struct Flux2KleinConfig {
 }
 
 impl Default for Flux2KleinConfig {
-    fn default() -> Self {
-        Self {
-            prompt: "Remove the text and reconstruct the background.".to_owned(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
-#[serde(default)]
-pub struct Flux1FillDevConfig {
-    pub prompt: String,
-}
-
-impl Default for Flux1FillDevConfig {
     fn default() -> Self {
         Self {
             prompt: "Remove the text and reconstruct the background.".to_owned(),
@@ -95,12 +79,6 @@ impl Processor {
                     "FLUX.2 prompt contains NUL"
                 );
             }
-            InpaintingModel::Flux1FillDev(settings) => {
-                ensure!(
-                    !settings.prompt.contains('\0'),
-                    "FLUX.1 prompt contains NUL"
-                );
-            }
             InpaintingModel::RoremMixed(settings) => {
                 ensure!(
                     !settings.prompt.contains('\0') && !settings.negative_prompt.contains('\0'),
@@ -124,7 +102,6 @@ impl StageProcessor for Processor {
             InpaintingModel::LaMa {} => "lama",
             InpaintingModel::AotInpainting {} => "aot-inpainting",
             InpaintingModel::Flux2Klein(_) => "flux2-klein",
-            InpaintingModel::Flux1FillDev(_) => "flux1-fill-dev",
             InpaintingModel::RoremMixed(_) => "rorem-mixed",
         }
     }
@@ -157,10 +134,6 @@ enum Model {
         model: Arc<Mutex<Flux2KleinInpaint>>,
         config: Flux2KleinConfig,
     },
-    Flux1FillDev {
-        model: Arc<Mutex<Flux1FillDevInpaint>>,
-        config: Flux1FillDevConfig,
-    },
     Rorem {
         model: Arc<Mutex<RoremMixed>>,
         config: RoremMixedConfig,
@@ -180,10 +153,6 @@ impl Model {
                 model: Arc::new(Mutex::new(Flux2KleinInpaint::load(device.clone()).await?)),
                 config: config.clone(),
             }),
-            InpaintingModel::Flux1FillDev(config) => Ok(Self::Flux1FillDev {
-                model: Arc::new(Mutex::new(Flux1FillDevInpaint::load(device.clone()).await?)),
-                config: config.clone(),
-            }),
             InpaintingModel::RoremMixed(config) => Ok(Self::Rorem {
                 model: Arc::new(Mutex::new(RoremMixed::load(device).await?)),
                 config: config.clone(),
@@ -200,8 +169,6 @@ impl Model {
         let original = prepared.original.clone();
         let cleanup = prepared.cleanup.take();
         let cleanup_entity = prepared.cleanup_entity;
-        let stop = input.stop.clone();
-        let progress_sink = input.progress.clone();
         let page = input.page;
         let (model_name, image) = match self {
             Self::LaMa(model) => {
@@ -217,7 +184,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask, _| {
+                            |image, mask| {
                                 Ok(DynamicImage::ImageRgb8(model.inference(
                                     image,
                                     mask,
@@ -243,7 +210,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask, _| {
+                            |image, mask| {
                                 Ok(DynamicImage::ImageRgb8(model.inference(image, mask)?))
                             },
                         )
@@ -266,7 +233,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask, _| {
+                            |image, mask| {
                                 model.inference(
                                     &config.prompt,
                                     image,
@@ -279,54 +246,6 @@ impl Model {
                     })
                     .await
                     .context("FLUX.2 task panicked")??,
-                )
-            }
-            Self::Flux1FillDev { model, config } => {
-                let model = model.clone();
-                let config = config.clone();
-                (
-                    "flux1-fill-dev",
-                    tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
-                        let model = model
-                            .lock()
-                            .map_err(|_| anyhow!("FLUX.1 Fill Dev model lock is poisoned"))?;
-                        inpaint_tiled(
-                            &prepared.image,
-                            &prepared.mask,
-                            &prepared.text_mask,
-                            &prepared.flat_fill_regions,
-                            |image, mask, tile| {
-                                let stop = stop.clone();
-                                let progress_sink = progress_sink.clone();
-                                let control = InferenceControl::new(
-                                    move || stop.stopped(),
-                                    move |native| {
-                                        let (completed, total) =
-                                            tile_inference_progress(tile, native);
-                                        progress::emit(
-                                            progress_sink.as_ref(),
-                                            Progress::Running {
-                                                page,
-                                                stage: crate::Stage::Inpainting,
-                                                model: "flux1-fill-dev".to_owned(),
-                                                completed,
-                                                total,
-                                            },
-                                        );
-                                    },
-                                );
-                                model.inference_with_control(
-                                    &config.prompt,
-                                    image,
-                                    &DynamicImage::ImageLuma8(mask.clone()),
-                                    &Flux1FillDevInpaintOptions::default(),
-                                    &control,
-                                )
-                            },
-                        )
-                    })
-                    .await
-                    .context("FLUX.1 task panicked")??,
                 )
             }
             Self::Rorem { model, config } => {
@@ -343,7 +262,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask, _| {
+                            |image, mask| {
                                 let options = RoremMixedOptions {
                                     // The shared pipeline mask has already been
                                     // expanded in page space.
@@ -602,7 +521,7 @@ const TILE_CONTEXT: u32 = 128;
 // RORem's reference pipeline defaults to a 20-pixel square dilation kernel:
 // https://github.com/leeruibin/RORem/blob/891ab8a17bbcfb16a773c078cb256aae8cb30468/myutils/img_util.py#L29-L36
 // A ten-pixel L-infinity radius gives a conservative centered 21x21 footprint
-// and fixes the same detector-mask halo for LaMa, AOT, and FLUX.
+// and fixes the same detector-mask halo for every inpainting model.
 const AUTOMATIC_MASK_DILATION: u8 = 10;
 const UNIFORM_BACKGROUND_MIN_PIXELS: usize = 16;
 const FLAT_FILL_EDGE_MARGIN: f32 = 3.0;
@@ -616,12 +535,6 @@ struct InpaintTile {
     components: Vec<u32>,
     core: [u32; 4],
     crop: [u32; 4],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct InpaintTileProgress {
-    index: usize,
-    total: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -641,7 +554,7 @@ fn inpaint_tiled(
     mask: &GrayImage,
     text_mask: &GrayImage,
     flat_fill_regions: &[FlatFillRegion],
-    mut inference: impl FnMut(&DynamicImage, &GrayImage, InpaintTileProgress) -> Result<DynamicImage>,
+    mut inference: impl FnMut(&DynamicImage, &GrayImage) -> Result<DynamicImage>,
 ) -> Result<DynamicImage> {
     ensure!(
         image.dimensions() == mask.dimensions() && mask.dimensions() == text_mask.dimensions(),
@@ -655,7 +568,7 @@ fn inpaint_tiled(
     let mut pending_mask = mask.clone();
     fill_uniform_regions(&mut output, &mut pending_mask, text_mask, flat_fill_regions);
     let (component_labels, tiles) = inpaint_tiles(&pending_mask);
-    for (index, tile) in tiles.iter().enumerate() {
+    for tile in &tiles {
         let [left, top, right, bottom] = tile.crop;
         let crop_width = right - left;
         let crop_height = bottom - top;
@@ -663,14 +576,7 @@ fn inpaint_tiled(
             image::imageops::crop_imm(&output, left, top, crop_width, crop_height).to_image();
         let crop_mask = crop_tile_mask(&pending_mask, tile);
 
-        let generated = inference(
-            &DynamicImage::ImageRgb8(crop_image),
-            &crop_mask,
-            InpaintTileProgress {
-                index,
-                total: tiles.len(),
-            },
-        )?;
+        let generated = inference(&DynamicImage::ImageRgb8(crop_image), &crop_mask)?;
         let generated = if generated.dimensions() == (crop_width, crop_height) {
             generated.to_rgb8()
         } else {
@@ -685,16 +591,6 @@ fn inpaint_tiled(
         composite_generated(&mut output, &component_labels, tile, &generated);
     }
     Ok(DynamicImage::ImageRgb8(output))
-}
-
-fn tile_inference_progress(tile: InpaintTileProgress, native: InferenceProgress) -> (usize, usize) {
-    let total = tile.total.saturating_mul(native.total);
-    let completed = tile
-        .index
-        .saturating_mul(native.total)
-        .saturating_add(native.completed.min(native.total))
-        .min(total);
-    (completed, total)
 }
 
 fn fill_uniform_regions(
@@ -1058,10 +954,6 @@ mod tests {
                 page,
                 png: encode(&DynamicImage::ImageLuma8(transient)),
             }),
-            crate::stages::StageControl {
-                stop: crate::StopToken::default(),
-                progress: None,
-            },
         );
 
         let prepared = prepare(&input).await.unwrap();
@@ -1093,7 +985,7 @@ mod tests {
             &expanded,
             &expanded,
             &[],
-            |tile, _, _| {
+            |tile, _| {
                 Ok(DynamicImage::ImageRgb8(RgbImage::from_pixel(
                     tile.width(),
                     tile.height(),
@@ -1105,30 +997,6 @@ mod tests {
         .to_rgb8();
 
         assert!(output.pixels().all(|pixel| pixel == &Rgb([0, 0, 0])));
-    }
-
-    #[test]
-    fn tile_progress_accumulates_native_sampling_steps() {
-        assert_eq!(
-            tile_inference_progress(
-                InpaintTileProgress { index: 1, total: 3 },
-                InferenceProgress {
-                    completed: 25,
-                    total: 50,
-                },
-            ),
-            (75, 150)
-        );
-        assert_eq!(
-            tile_inference_progress(
-                InpaintTileProgress { index: 2, total: 3 },
-                InferenceProgress {
-                    completed: 60,
-                    total: 50,
-                },
-            ),
-            (150, 150)
-        );
     }
 
     fn rectangle_region([left, top, right, bottom]: [u32; 4]) -> FlatFillRegion {
@@ -1160,7 +1028,7 @@ mod tests {
             &mask,
             &mask,
             &[rectangle_region([0, 0, 96, 96])],
-            |_, _, _| {
+            |_, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
             },
@@ -1211,7 +1079,7 @@ mod tests {
                 rectangle_region([10, 10, 90, 90]),
                 rectangle_region([110, 10, 190, 90]),
             ],
-            |_, _, _| {
+            |_, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
             },
@@ -1240,7 +1108,7 @@ mod tests {
             &mask,
             &mask,
             &[],
-            |tile, tile_mask, _| {
+            |tile, tile_mask| {
                 calls += 1;
                 assert_eq!(
                     tile_mask.pixels().filter(|pixel| pixel[0] >= 127).count(),
@@ -1316,7 +1184,7 @@ mod tests {
             &mask,
             &mask,
             &[],
-            |tile, _, _| {
+            |tile, _| {
                 calls += 1;
                 assert!(tile.width() <= TILE_CONTEXT * 2 + 1);
                 assert!(tile.height() <= TILE_CONTEXT * 2 + 1);

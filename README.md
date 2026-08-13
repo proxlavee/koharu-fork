@@ -81,7 +81,6 @@ These models recognize source text after detection.
 
 These models remove source lettering before translated text is rendered back onto the page.
 
-- [FLUX.1 Fill Dev](https://huggingface.co/YarvixPA/FLUX.1-Fill-dev-GGUF) (about 10 GiB; 16 GiB system memory minimum; [non-commercial FLUX.1 Dev license](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md))
 - [FLUX.2 Klein](https://huggingface.co/unsloth/FLUX.2-klein-4B-GGUF)
 - [RORem mixed](https://huggingface.co/mayocream/RORem-mixed-GGUF)
 - [LaMa](https://huggingface.co/mayocream/lama-manga)

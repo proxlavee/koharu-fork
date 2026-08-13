@@ -184,9 +184,6 @@ fn remember_pipeline_profiles(config: &mut PipelineConfig) {
     if let koharu_pipeline::InpaintingModel::Flux2Klein(settings) = &config.inpainting {
         config.processor.flux2_klein = Some(settings.clone());
     }
-    if let koharu_pipeline::InpaintingModel::Flux1FillDev(settings) = &config.inpainting {
-        config.processor.flux1_fill_dev = Some(settings.clone());
-    }
     if let koharu_pipeline::InpaintingModel::RoremMixed(settings) = &config.inpainting {
         config.processor.rorem_mixed = Some(settings.clone());
     }
@@ -202,24 +199,4 @@ pub(crate) async fn get_preferences() -> std::result::Result<Preferences, Error>
 #[specta::specta]
 pub(crate) async fn get_translation_models() -> std::result::Result<Vec<Model>, Error> {
     Ok(koharu_translator::Translator::models().await?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn remembers_flux_fill_profile_when_preferences_are_saved() {
-        let settings = koharu_pipeline::Flux1FillDevConfig {
-            prompt: "Restore the illustration.".to_owned(),
-        };
-        let mut config = PipelineConfig {
-            inpainting: koharu_pipeline::InpaintingModel::Flux1FillDev(settings.clone()),
-            ..PipelineConfig::default()
-        };
-
-        remember_pipeline_profiles(&mut config);
-
-        assert_eq!(config.processor.flux1_fill_dev, Some(settings));
-    }
 }

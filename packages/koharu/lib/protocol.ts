@@ -184,10 +184,6 @@ export type Event = { type: "started"; run: RunId } | { type: "text_delta"; run:
 
 export type ExportFormat = "png" | "psd";
 
-export type Flux1FillDevConfig = {
-	prompt?: string,
-};
-
 export type Flux2KleinConfig = {
 	prompt?: string,
 };
@@ -264,8 +260,6 @@ export type GroupRole = "text";
 export type InpaintingModel = { model: "lama" } | { model: "aot-inpainting" } | {
 	model: "flux2-klein",
 } & Flux2KleinConfig | {
-	model: "flux1-fill-dev",
-} & Flux1FillDevConfig | {
 	model: "rorem-mixed",
 } & RoremMixedConfig;
 
@@ -406,7 +400,6 @@ export type Preferences = {
 export type ProcessorConfig = {
 	"koharu-layout-rfdetr-seg-2xl"?: KoharuLayoutRFDetrSeg2XLConfig | null,
 	"flux2-klein"?: Flux2KleinConfig | null,
-	"flux1-fill-dev"?: Flux1FillDevConfig | null,
 	"rorem-mixed"?: RoremMixedConfig | null,
 };
 
