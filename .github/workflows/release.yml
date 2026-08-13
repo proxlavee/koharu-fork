@@ -8,43 +8,16 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  prepare:
-    name: Create draft release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-      - name: Validate release tag
-        shell: bash
-        run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tag must be vMAJOR.MINOR.PATCH, got $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
-      - name: Generate release notes
-        shell: bash
-        run: |
-          bun git-cliff --current --strip all > release-notes-full.md
-          head -c 120000 release-notes-full.md > release-notes.md
-          printf '\n\nThis Windows installer is unsigned and may trigger Microsoft Defender SmartScreen.\n' >> release-notes.md
-      - name: Create or update draft release
-        uses: softprops/action-gh-release@v3
-        with:
-          name: ${{ github.ref_name }}
-          body_path: release-notes.md
-          draft: true
-
   release:
-    name: Windows
-    needs: prepare
+    name: Test, build, and release Windows
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
@@ -77,7 +50,18 @@ jobs:
             echo "Release tag must be vMAJOR.MINOR.PATCH, got $GITHUB_REF_NAME" >&2
             exit 1
           fi
+          manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "$version" != "$manifest_version" ]]; then
+            echo "Release tag version $version does not match Cargo workspace version $manifest_version" >&2
+            exit 1
+          fi
           printf 'APP_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+      - name: Generate release notes
+        shell: bash
+        run: |
+          bun git-cliff --current --strip all > release-notes-full.md
+          head -c 120000 release-notes-full.md > release-notes.md
+          printf '\n\nThis Windows installer is unsigned and may trigger Microsoft Defender SmartScreen.\n' >> release-notes.md
       - name: Run Rust tests
         run: cargo test --workspace --tests --locked
       - name: Run UI tests
@@ -96,19 +80,16 @@ jobs:
           --license LICENSE
           --output target/bundle/windows
           --version "${{ env.APP_VERSION }}"
-      - name: Upload Windows installer
+      - name: Smoke-test installed Windows application
+        shell: bash
+        run: >-
+          bash .github/scripts/windows-startup-smoke.sh
+          "target/bundle/windows/bundle/nsis/Koharu_${{ env.APP_VERSION }}_x64-setup.exe"
+      - name: Publish Windows release
         uses: softprops/action-gh-release@v3
         with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
           files: target/bundle/windows/bundle/nsis/Koharu_${{ env.APP_VERSION }}_x64-setup.exe
-          draft: true
-          fail_on_unmatched_files: true
-
-  publish:
-    name: Publish GitHub release
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Publish draft release
-        uses: softprops/action-gh-release@v3
-        with:
           draft: false
+          fail_on_unmatched_files: true

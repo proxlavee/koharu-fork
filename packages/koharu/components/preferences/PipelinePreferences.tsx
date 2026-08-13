@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next'
 
 import {
   defaultModel,
+  modelNotes,
   modelNames,
   modelOptions,
   replaceStage,
@@ -88,6 +89,11 @@ export function PipelinePreferences({
                     </SelectContent>
                   </Select>
                 </div>
+                {modelNotes[model.model] ? (
+                  <p className='max-w-72 text-[10px] leading-4 text-muted-foreground'>
+                    {modelNotes[model.model]}
+                  </p>
+                ) : null}
                 <ModelOptions
                   model={model}
                   onChange={(next) => onChange(replaceStage(value, stage, next))}

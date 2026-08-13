@@ -19,9 +19,9 @@ cargo run -p koharu-bundle -- \
   --ui packages/koharu/out \
   --license LICENSE \
   --output target/bundle/windows \
-  --version 0.64.2
+  --version 0.65.4
 ```
 
-Use `appimage` on Linux and `dmg` on macOS. On macOS, `tauri-bundler` signs and
-notarizes the application before it creates the DMG when Apple credentials are
-available.
+This repository's automation invokes only the `nsis` package on Windows. It does not
+publish AppImage, DMG, or other non-Windows application artifacts, and the
+Windows installer is intentionally unsigned.

@@ -14,29 +14,18 @@ env:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
-      - name: Install native test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            build-essential \
-            cmake \
-            ninja-build \
-            pkg-config \
-            libfontconfig-dev \
-            libssl-dev \
-            mesa-vulkan-drivers \
-            fonts-noto-cjk \
-            dbus-x11 \
-            gnome-keyring
+      - uses: ilammy/msvc-dev-cmd@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-x86_64-pc-windows-msvc
       - run: cargo test --workspace --tests --locked
 
   ui:
     name: UI
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2

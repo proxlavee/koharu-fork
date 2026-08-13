@@ -10,7 +10,11 @@ use image::{
     DynamicImage, GenericImageView as _, GrayImage, ImageBuffer, ImageFormat, Luma, Rgb, RgbImage,
     Rgba, RgbaImage,
 };
-use imageproc::region_labelling::{Connectivity, connected_components};
+use imageproc::{
+    distance_transform::Norm,
+    morphology::dilate,
+    region_labelling::{Connectivity, connected_components},
+};
 use koharu_ml::{
     aot_inpainting::AotInpainting,
     flux1_fill_dev::{Flux1FillDevInpaint, Flux1FillDevInpaintOptions},
@@ -288,7 +292,6 @@ impl Model {
                                 model.inference(
                                     &config.prompt,
                                     image,
-                                    None,
                                     &DynamicImage::ImageLuma8(mask.clone()),
                                     &Flux1FillDevInpaintOptions::default(),
                                 )
@@ -314,12 +317,18 @@ impl Model {
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
                             |image, mask| {
+                                let options = RoremMixedOptions {
+                                    // The shared pipeline mask has already been
+                                    // expanded in page space.
+                                    mask_dilation: 0,
+                                    ..RoremMixedOptions::default()
+                                };
                                 Ok(DynamicImage::ImageRgb8(model.inference(
                                     image,
                                     mask,
                                     &config.prompt,
                                     &config.negative_prompt,
-                                    &RoremMixedOptions::default(),
+                                    &options,
                                 )?))
                             },
                         )
@@ -534,6 +543,10 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
             }
         }
     }
+    if input.inpainting_mask.is_none() {
+        mask = expand_automatic_mask(&mask);
+        text_mask = expand_automatic_mask(&text_mask);
+    }
     if let Some(bounds) = input.region {
         for (x, y, pixel) in mask.enumerate_pixels_mut() {
             if f64::from(x + 1) <= bounds.x
@@ -560,8 +573,17 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
 
 const TILE_SIZE: u32 = 512;
 const TILE_CONTEXT: u32 = 128;
+// RORem's reference pipeline defaults to a 20-pixel square dilation kernel:
+// https://github.com/leeruibin/RORem/blob/891ab8a17bbcfb16a773c078cb256aae8cb30468/myutils/img_util.py#L29-L36
+// A ten-pixel L-infinity radius gives a conservative centered 21x21 footprint
+// and fixes the same detector-mask halo for LaMa, AOT, and FLUX.
+const AUTOMATIC_MASK_DILATION: u8 = 10;
 const UNIFORM_BACKGROUND_MIN_PIXELS: usize = 16;
 const FLAT_FILL_EDGE_MARGIN: f32 = 3.0;
+
+fn expand_automatic_mask(mask: &GrayImage) -> GrayImage {
+    dilate(mask, Norm::LInf, AUTOMATIC_MASK_DILATION)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InpaintTile {
@@ -579,7 +601,7 @@ struct MaskComponent {
 // BallonsTranslator avoids model inference for a text block when the non-text
 // pixels inside its balloon are nearly uniform, and otherwise sends an enlarged
 // block crop to the inpainter:
-// https://github.com/dmMaze/BallonsTranslator/blob/4bcc635c19f6c63a902872cf77b3d554e14ed1b7/ballontranslator/modules/inpaint/base.py#L168-L200
+// https://github.com/dmMaze/BallonsTranslator/blob/c02102e89b7deb52cd3c01468d3f93134475b4cd/ballontranslator/modules/inpaint/base.py#L143-L200
 // Koharu uses the detected bubble polygons as those blocks. Uniform bubbles are
 // filled first; only the remaining mask is split into bounded model crops.
 fn inpaint_tiled(
@@ -992,7 +1014,44 @@ mod tests {
         let prepared = prepare(&input).await.unwrap();
         assert_eq!(prepared.mask.get_pixel(3, 4), &Luma([255]));
         assert_eq!(prepared.mask.get_pixel(0, 0), &Luma([0]));
+        assert_eq!(prepared.mask.get_pixel(2, 4), &Luma([0]));
         assert!(prepared.text_mask.pixels().all(|pixel| pixel[0] == 0));
+    }
+
+    #[test]
+    fn automatic_mask_expansion_removes_high_contrast_text_halo() {
+        let mut image = RgbImage::from_pixel(96, 64, Rgb([0, 0, 0]));
+        for y in 20..44 {
+            for x in 20..76 {
+                image.put_pixel(x, y, Rgb([32, 24, 16]));
+            }
+        }
+        let mut detector_mask = GrayImage::new(96, 64);
+        for y in 26..38 {
+            for x in 26..70 {
+                image.put_pixel(x, y, Rgb([255, 255, 255]));
+                detector_mask.put_pixel(x, y, Luma([u8::MAX]));
+            }
+        }
+        let expanded = expand_automatic_mask(&detector_mask);
+
+        let output = inpaint_tiled(
+            &DynamicImage::ImageRgb8(image),
+            &expanded,
+            &expanded,
+            &[],
+            |tile, _| {
+                Ok(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+                    tile.width(),
+                    tile.height(),
+                    Rgb([0, 0, 0]),
+                )))
+            },
+        )
+        .unwrap()
+        .to_rgb8();
+
+        assert!(output.pixels().all(|pixel| pixel == &Rgb([0, 0, 0])));
     }
 
     fn rectangle_region([left, top, right, bottom]: [u32; 4]) -> FlatFillRegion {

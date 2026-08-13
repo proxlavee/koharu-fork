@@ -443,6 +443,27 @@ mod tests {
     }
 
     #[test]
+    fn serializes_flux_fill_selection_and_profile() {
+        let expected = "Restore the artwork behind the lettering.";
+        let config = PipelineConfig {
+            inpainting: InpaintingModel::Flux1FillDev(Flux1FillDevConfig {
+                prompt: expected.to_owned(),
+            }),
+            ..PipelineConfig::default()
+        };
+
+        let document = toml::to_string(&config).unwrap();
+        assert!(document.contains("[inpainting]\nmodel = \"flux1-fill-dev\""));
+        assert!(document.contains("[processor.flux1-fill-dev]"));
+
+        let restored = toml::from_str::<PipelineConfig>(&document).unwrap();
+        assert!(matches!(
+            restored.inpainting().unwrap(),
+            InpaintingModel::Flux1FillDev(config) if config.prompt == expected
+        ));
+    }
+
+    #[test]
     fn serializes_model_profiles_under_processor() {
         let config = PipelineConfig {
             detection: DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig {

@@ -4,27 +4,6 @@ use anyhow::{Result, ensure};
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{DynamicImage, GrayImage, Luma, RgbImage};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Flux1FillDevOptions {
-    pub height: Option<u32>,
-    pub width: Option<u32>,
-    pub num_inference_steps: i32,
-    pub seed: i64,
-    pub num_images_per_prompt: i32,
-}
-
-impl Default for Flux1FillDevOptions {
-    fn default() -> Self {
-        Self {
-            height: None,
-            width: None,
-            num_inference_steps: 4,
-            seed: -1,
-            num_images_per_prompt: 1,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flux1FillDevInpaintOptions {
     pub padding_mask_crop: Option<u32>,
@@ -37,8 +16,8 @@ impl Default for Flux1FillDevInpaintOptions {
     fn default() -> Self {
         Self {
             padding_mask_crop: None,
-            strength: 0.8,
-            num_inference_steps: 4,
+            strength: 1.0,
+            num_inference_steps: 50,
             seed: -1,
         }
     }
@@ -47,24 +26,6 @@ impl Default for Flux1FillDevInpaintOptions {
 pub(super) struct Flux1ImageProcessor;
 
 impl Flux1ImageProcessor {
-    pub(super) fn check_image_input(image: &DynamicImage) -> Result<()> {
-        ensure!(
-            image.width() >= 64 && image.height() >= 64,
-            "FLUX.1 reference images must be at least 64x64, got {}x{}",
-            image.width(),
-            image.height()
-        );
-        let long = image.width().max(image.height());
-        let short = image.width().min(image.height());
-        ensure!(
-            f64::from(long) / f64::from(short) <= 8.0,
-            "FLUX.1 reference image aspect ratio must not exceed 8:1, got {}x{}",
-            image.width(),
-            image.height()
-        );
-        Ok(())
-    }
-
     pub(super) fn _resize_to_target_area(image: &DynamicImage, target_area: u32) -> DynamicImage {
         let scale = (f64::from(target_area)
             / (f64::from(image.width()) * f64::from(image.height())))
@@ -247,5 +208,32 @@ impl Flux1ImageProcessor {
             }
         }
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgb;
+
+    #[test]
+    fn inpainting_defaults_match_flux_fill_dev() {
+        let options = Flux1FillDevInpaintOptions::default();
+        assert_eq!(options.padding_mask_crop, None);
+        assert_eq!(options.strength, 1.0);
+        assert_eq!(options.num_inference_steps, 50);
+        assert_eq!(options.seed, -1);
+    }
+
+    #[test]
+    fn overlay_preserves_unmasked_pixels_exactly() {
+        let mask = GrayImage::from_raw(2, 1, vec![0, 255]).unwrap();
+        let init = RgbImage::from_pixel(2, 1, Rgb([10, 20, 30]));
+        let generated = RgbImage::from_pixel(2, 1, Rgb([200, 210, 220]));
+
+        let output = Flux1ImageProcessor::apply_overlay(&mask, &init, generated, None).unwrap();
+
+        assert_eq!(output.get_pixel(0, 0), &Rgb([10, 20, 30]));
+        assert_eq!(output.get_pixel(1, 0), &Rgb([200, 210, 220]));
     }
 }

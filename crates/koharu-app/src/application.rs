@@ -1315,7 +1315,7 @@ impl koharu_pipeline::Committer for ApplicationCommitter {
         let commit = {
             let mut project = self.project.lock().await;
             let project = project.as_mut().context("no project is open")?;
-            let commit = project.session.commit(output.patch).await?;
+            let commit = commit_pipeline_output(project, output).await?;
             if commit.changes.from != commit.changes.to {
                 self.revisions.push(commit.revision);
             }
@@ -1326,6 +1326,22 @@ impl koharu_pipeline::Committer for ApplicationCommitter {
             .await?;
         Ok(commit.snapshot)
     }
+}
+
+async fn commit_pipeline_output(
+    project: &mut Project,
+    output: koharu_pipeline::StageOutput,
+) -> Result<koharu_scene::Commit> {
+    // Presentation synchronization deliberately happens outside the project
+    // lock. Rebase again at the locked commit boundary so edits made while a
+    // previous stage was being presented cannot leave the pipeline one
+    // revision behind the durable scene.
+    let current = project.snapshot();
+    let patch = output
+        .patch
+        .rebase_on(&current)
+        .with_context(|| format!("{} output inputs changed before commit", output.stage))?;
+    project.session.commit(patch).await.map_err(Into::into)
 }
 
 fn load_preferences() -> Result<Preferences> {
@@ -1805,6 +1821,94 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner().into()
+    }
+
+    #[test]
+    fn remembers_flux_fill_profile_when_preferences_are_saved() {
+        let settings = koharu_pipeline::Flux1FillDevConfig {
+            prompt: "Restore the illustration.".to_owned(),
+        };
+        let mut config = koharu_pipeline::PipelineConfig {
+            inpainting: koharu_pipeline::InpaintingModel::Flux1FillDev(settings.clone()),
+            ..koharu_pipeline::PipelineConfig::default()
+        };
+
+        remember_pipeline_profiles(&mut config);
+
+        assert_eq!(config.processor.flux1_fill_dev, Some(settings));
+    }
+
+    #[tokio::test]
+    async fn pipeline_commit_rebases_over_an_unrelated_interleaved_edit() {
+        let mut session = Session::memory().await.unwrap();
+        let mut entities = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 100.0, 100.0), At::End)?;
+                entities = Some((
+                    edit.add_entity(page, At::End)?,
+                    edit.add_entity(page, At::End)?,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let base = session.commit(create).await.unwrap().snapshot;
+        let (pipeline_entity, user_entity) = entities.unwrap();
+        let pipeline_patch = base
+            .patch(|edit| {
+                edit.set(
+                    pipeline_entity,
+                    &koharu_scene::Geometry::rectangle(0.0, 0.0, 10.0, 10.0),
+                )
+            })
+            .unwrap();
+        let user_patch = base
+            .patch(|edit| {
+                edit.set(
+                    user_entity,
+                    &koharu_scene::Geometry::rectangle(20.0, 20.0, 10.0, 10.0),
+                )
+            })
+            .unwrap();
+        session.commit(user_patch).await.unwrap();
+        let mut project = Project {
+            session,
+            name: "test".to_owned(),
+            active_page: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        };
+
+        let commit = commit_pipeline_output(
+            &mut project,
+            koharu_pipeline::StageOutput {
+                page: base.pages().next().unwrap().id(),
+                stage: koharu_pipeline::Stage::Inpainting,
+                patch: pipeline_patch,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            commit.revision,
+            base.revision().next().unwrap().next().unwrap()
+        );
+        assert!(
+            commit
+                .snapshot
+                .component::<koharu_scene::Geometry>(pipeline_entity)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            commit
+                .snapshot
+                .component::<koharu_scene::Geometry>(user_entity)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

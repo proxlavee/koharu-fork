@@ -92,7 +92,7 @@ impl Package for Diffusion {
             move |stage| async move {
                 let asset = self.asset();
                 let url = format!(
-                    "https://github.com/mayocream/koharu/releases/download/{RELEASE}/{asset}"
+                    "https://github.com/proxlavee/koharu-fork/releases/download/{RELEASE}/{asset}"
                 );
                 let archive = tempfile::Builder::new().suffix(".tar.gz").tempfile()?;
                 Transfer::new()?.fetch(&url, archive.path()).await?;

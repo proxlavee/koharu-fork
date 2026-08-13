@@ -3,7 +3,7 @@
 <p align="center">ML-powered manga translator, written in <b>Rust</b>.</p>
 
 <p align="center">
-<a href="https://github.com/mayocream/koharu/releases/latest" target="_blank"><img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/mayocream/koharu/total?style=for-the-badge&link=https%3A%2F%2Fgithub.com%2Fmayocream%2Fkoharu%2Freleases%2Flatest"></a>
+<a href="https://github.com/proxlavee/koharu-fork/releases/latest" target="_blank"><img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/proxlavee/koharu-fork/total?style=for-the-badge&link=https%3A%2F%2Fgithub.com%2Fproxlavee%2Fkoharu-fork%2Freleases%2Flatest"></a>
 </p>
 
 <p align="center">
@@ -41,23 +41,19 @@ Koharu introduces a local-first workflow for manga translation, utilizing the po
 
 ## GPU Acceleration
 
-Koharu supports CUDA, ROCm / HIP, Metal, and Vulkan. CPU fallback is always available when the accelerated path is unavailable or not worth the setup cost on your system.
+The 64-bit Windows build supports CUDA, ROCm / HIP, and Vulkan acceleration. CPU fallback is available when an accelerated path cannot be used.
 
 ### CUDA
 
-Koharu supports NVIDIA GPUs on Windows and Linux through CUDA. Ensure you have the latest NVIDIA driver installed.
+Koharu supports NVIDIA GPUs on Windows through CUDA. Ensure you have the latest NVIDIA driver installed.
 
 ### HIP / ROCm
 
 Koharu supports AMD GPUs on Windows through ROCm and HIP. Ensure you have the latest AMD driver installed.
 
-### Metal
-
-Koharu supports Metal on Apple Silicon Macs.
-
 ### Vulkan
 
-Koharu also supports Vulkan on Windows and Linux as an alternative to CUDA and HIP.
+Koharu also supports Vulkan on Windows as an alternative to CUDA and HIP.
 
 ## Machine Learning Models
 
@@ -85,6 +81,7 @@ These models recognize source text after detection.
 
 These models remove source lettering before translated text is rendered back onto the page.
 
+- [FLUX.1 Fill Dev](https://huggingface.co/YarvixPA/FLUX.1-Fill-dev-GGUF) (about 10 GiB; 16 GiB system memory minimum; [non-commercial FLUX.1 Dev license](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md))
 - [FLUX.2 Klein](https://huggingface.co/unsloth/FLUX.2-klein-4B-GGUF)
 - [RORem mixed](https://huggingface.co/mayocream/RORem-mixed-GGUF)
 - [LaMa](https://huggingface.co/mayocream/lama-manga)
@@ -122,25 +119,15 @@ Koharu supports any provider that implements the OpenAI-compatible API.
 
 ## Installation
 
-You can download the latest release of Koharu from the [releases page](https://github.com/mayocream/koharu/releases/latest).
+Download the latest 64-bit Windows installer from this repository's [releases page](https://github.com/proxlavee/koharu-fork/releases/latest).
 
-We provide prebuilt binaries for Windows, macOS, and Linux.
-
-### Homebrew
-
-On macOS, you can install Koharu with [Homebrew](https://brew.sh/):
-
-```bash
-brew install --cask koharu
-```
+The installer is not code-signed and may trigger Microsoft Defender SmartScreen. This repository does not publish macOS or Linux application binaries.
 
 ## Troubleshooting
 
 You can also set the `RUST_LOG` environment variable to `debug` or `trace` to see more verbose logs:
 
 ```bash
-# macOS / Linux
-RUST_LOG=debug koharu
 # Windows (PowerShell)
 $env:RUST_LOG="debug"; koharu.exe
 ```

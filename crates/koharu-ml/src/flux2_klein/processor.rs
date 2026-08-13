@@ -1,6 +1,8 @@
 //! FLUX.2 image preprocessing.
 //!
 //! https://github.com/huggingface/diffusers/blob/a37f6f8394ac2a7ee8360c3abea811efe54512b1/src/diffusers/pipelines/flux2/image_processor.py
+//! Comic inpainting defaults follow BallonsTranslator's FLUX.2 integration:
+//! https://github.com/dmMaze/BallonsTranslator/blob/c02102e89b7deb52cd3c01468d3f93134475b4cd/ballontranslator/modules/inpaint/inpaint_default.py#L493-L501
 
 use anyhow::{Result, ensure};
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
@@ -39,8 +41,8 @@ impl Default for Flux2KleinInpaintOptions {
     fn default() -> Self {
         Self {
             padding_mask_crop: None,
-            strength: 0.8,
-            num_inference_steps: 4,
+            strength: 1.0,
+            num_inference_steps: 8,
             seed: -1,
         }
     }
@@ -257,7 +259,15 @@ impl Flux2ImageProcessor {
 mod tests {
     use image::{GrayImage, Luma, Rgb, RgbImage};
 
-    use super::Flux2ImageProcessor;
+    use super::{Flux2ImageProcessor, Flux2KleinInpaintOptions};
+
+    #[test]
+    fn inpainting_defaults_match_the_comic_reference_pipeline() {
+        let options = Flux2KleinInpaintOptions::default();
+
+        assert_eq!(options.strength, 1.0);
+        assert_eq!(options.num_inference_steps, 8);
+    }
 
     #[test]
     fn overlay_without_a_crop_preserves_unmasked_pixels() {

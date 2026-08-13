@@ -1,4 +1,8 @@
-//! FLUX.1-Fill-dev generation and inpainting.
+//! FLUX.1 Fill Dev inpainting.
+//!
+//! Component and sampling behavior follows stable-diffusion.cpp at commit
+//! cc734292286f85f9c48305d94d7fd22f42838522:
+//! https://github.com/leejet/stable-diffusion.cpp/blob/cc734292286f85f9c48305d94d7fd22f42838522/docs/flux.md
 
 mod model;
 mod processor;
@@ -15,109 +19,20 @@ use self::{
     processor::Flux1ImageProcessor,
 };
 
-pub use self::processor::{Flux1FillDevInpaintOptions, Flux1FillDevOptions};
+pub use self::processor::Flux1FillDevInpaintOptions;
 
-model_repository!("YarvixPA/FLUX.1-Fill-dev-GGUF" @ "main" {
+model_repository!("YarvixPA/FLUX.1-Fill-dev-GGUF" @ "78b83f1da140a4dcd6466580516544e1f6effe3e" {
     TRANSFORMER_WEIGHTS = "flux1-fill-dev-Q4_K_S.gguf"
 });
-model_repository!("black-forest-labs/FLUX.1-schnell" @ "main" {
-    VAE_WEIGHTS = "ae.safetensors"
+model_repository!("city96/t5-v1_1-xxl-encoder-gguf" @ "005a6ea51a7d0b84d677b3e633bb52a8c85a83d9" {
+    T5XXL_WEIGHTS = "t5-v1_1-xxl-encoder-Q5_K_M.gguf"
 });
-model_repository!("unsloth/Qwen3-4B-GGUF" @ "22c9fc8a8c7700b76a1789366280a6a5a1ad1120" {
-    TEXT_ENCODER_WEIGHTS = "Qwen3-4B-Q4_K_M.gguf"
+model_repository!("comfyanonymous/flux_text_encoders" @ "6af2a98e3f615bdfa612fbd85da93d1ed5f69ef5" {
+    CLIP_L_WEIGHTS = "clip_l.safetensors"
 });
-
-#[derive(Debug)]
-pub struct Flux1FillDev {
-    model: Model,
-}
-
-impl Flux1FillDev {
-    pub async fn load(device: crate::Device) -> Result<Self> {
-        let (transformer, text_encoder, vae) = tokio::try_join!(
-            TRANSFORMER_WEIGHTS.resolve(),
-            TEXT_ENCODER_WEIGHTS.resolve(),
-            VAE_WEIGHTS.resolve(),
-        )
-        .context("failed to resolve FLUX.1 Fill Dev model assets")?;
-        let model = Model::new(
-            &device,
-            ModelPaths {
-                transformer,
-                text_encoder,
-                vae,
-            },
-        )?;
-        Ok(Self { model })
-    }
-
-    pub fn inference(
-        &self,
-        image: &[DynamicImage],
-        prompt: &str,
-        options: &Flux1FillDevOptions,
-    ) -> Result<Vec<RgbImage>> {
-        ensure!(
-            !prompt.contains('\0'),
-            "prompt contains an interior NUL byte"
-        );
-        ensure!(
-            options.num_inference_steps > 0,
-            "num_inference_steps must be greater than zero"
-        );
-        ensure!(
-            options.num_images_per_prompt > 0,
-            "num_images_per_prompt must be greater than zero"
-        );
-
-        let mut condition_images = Vec::with_capacity(image.len());
-        for image in image {
-            Flux1ImageProcessor::check_image_input(image)?;
-            let mut image = image.clone();
-            if u64::from(image.width()) * u64::from(image.height()) > 1024 * 1024 {
-                image = Flux1ImageProcessor::_resize_to_target_area(&image, 1024 * 1024);
-            }
-            let width = (image.width() / 16) * 16;
-            let height = (image.height() / 16) * 16;
-            ensure!(width > 0 && height > 0);
-            condition_images
-                .push(Flux1ImageProcessor::_resize_and_crop(&image, width, height)?.to_rgb8());
-        }
-
-        let height = options
-            .height
-            .or_else(|| condition_images.first().map(RgbImage::height))
-            .unwrap_or(1024);
-        let width = options
-            .width
-            .or_else(|| condition_images.first().map(RgbImage::width))
-            .unwrap_or(1024);
-        let height = (height / 16) * 16;
-        let width = (width / 16) * 16;
-        ensure!(width > 0 && height > 0);
-
-        self.model.forward(&ImageGenerationParams {
-            prompt: prompt.to_owned(),
-            width: i32::try_from(width)?,
-            height: i32::try_from(height)?,
-            reference_images: condition_images,
-            auto_resize_reference_images: false,
-            sample: SampleParams {
-                guidance: GuidanceParams {
-                    text_cfg: 1.0,
-                    ..GuidanceParams::default()
-                },
-                scheduler: Scheduler::Flux,
-                sample_method: SampleMethod::Euler,
-                sample_steps: options.num_inference_steps,
-                ..SampleParams::default()
-            },
-            seed: options.seed,
-            batch_count: options.num_images_per_prompt,
-            ..ImageGenerationParams::default()
-        })
-    }
-}
+model_repository!("Comfy-Org/Lumina_Image_2.0_Repackaged" @ "22e393d707f2d13e736b1a461c958644258cd9d9" {
+    VAE_WEIGHTS = "split_files/vae/ae.safetensors"
+});
 
 #[derive(Debug)]
 pub struct Flux1FillDevInpaint {
@@ -126,9 +41,10 @@ pub struct Flux1FillDevInpaint {
 
 impl Flux1FillDevInpaint {
     pub async fn load(device: crate::Device) -> Result<Self> {
-        let (transformer, text_encoder, vae) = tokio::try_join!(
+        let (transformer, clip_l, t5xxl, vae) = tokio::try_join!(
             TRANSFORMER_WEIGHTS.resolve(),
-            TEXT_ENCODER_WEIGHTS.resolve(),
+            CLIP_L_WEIGHTS.resolve(),
+            T5XXL_WEIGHTS.resolve(),
             VAE_WEIGHTS.resolve(),
         )
         .context("failed to resolve FLUX.1 Fill Dev model assets")?;
@@ -136,7 +52,8 @@ impl Flux1FillDevInpaint {
             &device,
             ModelPaths {
                 transformer,
-                text_encoder,
+                clip_l,
+                t5xxl,
                 vae,
             },
         )?;
@@ -147,7 +64,6 @@ impl Flux1FillDevInpaint {
         &self,
         prompt: &str,
         image: &DynamicImage,
-        image_reference: Option<&DynamicImage>,
         mask_image: &DynamicImage,
         options: &Flux1FillDevInpaintOptions,
     ) -> Result<DynamicImage> {
@@ -221,37 +137,6 @@ impl Flux1FillDevInpaint {
         };
         Flux1ImageProcessor::binarize(&mut native_mask);
 
-        let mut reference_images = vec![init_image.clone()];
-        if let Some(image_reference) = image_reference {
-            let mut image_reference = image_reference.clone();
-            if u64::from(image_reference.width()) * u64::from(image_reference.height())
-                > 1024 * 1024
-            {
-                image_reference =
-                    Flux1ImageProcessor::_resize_to_target_area(&image_reference, 1024 * 1024);
-            }
-            let reference_width = (image_reference.width() / 16) * 16;
-            let reference_height = (image_reference.height() / 16) * 16;
-            ensure!(reference_width > 0 && reference_height > 0);
-            reference_images.push(
-                Flux1ImageProcessor::_resize_and_crop(
-                    &image_reference,
-                    reference_width,
-                    reference_height,
-                )?
-                .to_rgb8(),
-            );
-        }
-
-        let strength = if options.strength >= 1.0 {
-            1.0
-        } else {
-            let effective_steps = options.num_inference_steps
-                - (options.num_inference_steps as f64 * (1.0 - options.strength)).floor() as usize;
-            let boundary = effective_steps as f32 / options.num_inference_steps as f32;
-            f32::from_bits(boundary.to_bits() - 1)
-        };
-
         let generated = self
             .model
             .forward(&ImageGenerationParams {
@@ -259,22 +144,11 @@ impl Flux1FillDevInpaint {
                 width: i32::try_from(width)?,
                 height: i32::try_from(height)?,
                 init_image: Some(init_image),
-                reference_images,
-                auto_resize_reference_images: false,
                 mask_image: Some(native_mask),
-                sample: SampleParams {
-                    guidance: GuidanceParams {
-                        text_cfg: 1.0,
-                        ..GuidanceParams::default()
-                    },
-                    scheduler: Scheduler::Flux,
-                    sample_method: SampleMethod::Euler,
-                    sample_steps: i32::try_from(options.num_inference_steps)?,
-                    ..SampleParams::default()
-                },
+                sample: sample_params(options)?,
                 seed: options.seed,
                 batch_count: 1,
-                strength,
+                strength: options.strength as f32,
                 ..ImageGenerationParams::default()
             })?
             .into_iter()
@@ -284,5 +158,72 @@ impl Flux1FillDevInpaint {
         let generated =
             Flux1ImageProcessor::apply_overlay(&mask_image, &image, generated, crop_coords)?;
         Ok(DynamicImage::ImageRgb8(generated))
+    }
+}
+
+fn sample_params(options: &Flux1FillDevInpaintOptions) -> Result<SampleParams> {
+    Ok(SampleParams {
+        guidance: GuidanceParams {
+            text_cfg: 1.0,
+            distilled_guidance: 30.0,
+            ..GuidanceParams::default()
+        },
+        scheduler: Scheduler::Flux,
+        sample_method: SampleMethod::Euler,
+        sample_steps: i32::try_from(options.num_inference_steps)?,
+        ..SampleParams::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use koharu_runtime::HuggingFaceFile;
+
+    #[test]
+    fn model_components_are_commit_pinned() {
+        assert_eq!(
+            TRANSFORMER_WEIGHTS,
+            HuggingFaceFile::pinned(
+                "YarvixPA/FLUX.1-Fill-dev-GGUF",
+                "78b83f1da140a4dcd6466580516544e1f6effe3e",
+                "flux1-fill-dev-Q4_K_S.gguf",
+            )
+        );
+        assert_eq!(
+            T5XXL_WEIGHTS,
+            HuggingFaceFile::pinned(
+                "city96/t5-v1_1-xxl-encoder-gguf",
+                "005a6ea51a7d0b84d677b3e633bb52a8c85a83d9",
+                "t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+            )
+        );
+        assert_eq!(
+            CLIP_L_WEIGHTS,
+            HuggingFaceFile::pinned(
+                "comfyanonymous/flux_text_encoders",
+                "6af2a98e3f615bdfa612fbd85da93d1ed5f69ef5",
+                "clip_l.safetensors",
+            )
+        );
+        assert_eq!(
+            VAE_WEIGHTS,
+            HuggingFaceFile::pinned(
+                "Comfy-Org/Lumina_Image_2.0_Repackaged",
+                "22e393d707f2d13e736b1a461c958644258cd9d9",
+                "split_files/vae/ae.safetensors",
+            )
+        );
+    }
+
+    #[test]
+    fn sampling_defaults_match_flux_fill_dev() {
+        let sample = sample_params(&Flux1FillDevInpaintOptions::default()).unwrap();
+
+        assert_eq!(sample.guidance.text_cfg, 1.0);
+        assert_eq!(sample.guidance.distilled_guidance, 30.0);
+        assert_eq!(sample.scheduler, Scheduler::Flux);
+        assert_eq!(sample.sample_method, SampleMethod::Euler);
+        assert_eq!(sample.sample_steps, 50);
     }
 }

@@ -764,6 +764,35 @@ describe('greenfield editor', () => {
     expect(screen.getByLabelText('Target language')).toHaveTextContent('English')
   })
 
+  it('shows the FLUX.1 Fill download, memory, and license requirements', () => {
+    installProject()
+    useKoharuStore.setState((state) => ({
+      settingsOpen: true,
+      preferences: {
+        ...state.preferences!,
+        pipeline: {
+          ...state.preferences!.pipeline,
+          inpainting: {
+            model: 'flux1-fill-dev',
+            prompt: 'Remove the text and reconstruct the background.',
+          },
+        },
+      },
+    }))
+    render(
+      <ThemeProvider attribute='class'>
+        <SettingsPage />
+      </ThemeProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pipeline' }))
+    expect(
+      screen.getByText(
+        'About 10 GiB to download · 16 GiB system memory minimum · non-commercial FLUX.1 Dev license',
+      ),
+    ).toBeInTheDocument()
+  })
+
   it('saves a newer OpenRouter selection after an in-flight provider save', async () => {
     installProject()
     const user = userEvent.setup()

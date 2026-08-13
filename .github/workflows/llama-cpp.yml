@@ -40,11 +40,7 @@ jobs:
           - backend: hip
             os: windows-2022
           - backend: vulkan
-            os: ubuntu-24.04
-          - backend: vulkan
             os: windows-2022
-          - backend: metal
-            os: macos-latest
 
     runs-on: ${{ matrix.os }}
     env:
@@ -111,18 +107,6 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install ninja --no-progress -y
 
-      - name: Install Vulkan build dependencies on Linux
-        if: matrix.backend == 'vulkan' && runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            cmake \
-            glslc \
-            libvulkan-dev \
-            ninja-build \
-            spirv-headers
-
       - name: Install Vulkan SDK on Windows
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
         shell: bash
@@ -157,9 +141,6 @@ jobs:
             vulkan)
               generator=(-G Ninja)
               ;;
-            metal)
-              backend_args+=("-DCMAKE_OSX_ARCHITECTURES=arm64")
-              ;;
           esac
 
           cmake -S .github/llama.cpp -B build "${generator[@]}" \
@@ -191,7 +172,7 @@ jobs:
   release:
     if: github.event_name != 'pull_request'
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     permissions:
       contents: write
 

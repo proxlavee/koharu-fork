@@ -5,13 +5,13 @@ description: Koharu のリリース版をインストールして起動します
 
 # Koharu のインストール
 
-Koharu 自体を変更する目的でなければ、リリース版を使用してください。現在は 64-bit Windows、64-bit Linux、Apple シリコン搭載 macOS 向けにビルドされています。
+Koharu 自体を変更する目的でなければ、リリース版を使用してください。この Repository は 64-bit Windows Installer のみを公開します。
 
 ## リリースを入手する
 
-[最新の GitHub リリース](https://github.com/mayocream/koharu/releases/latest)を開きます。Windows では NSIS Installer を実行し、Linux では AppImage を起動し、macOS では署名済み DMG を開いて Koharu を Applications にドラッグします。
+[最新の GitHub リリース](https://github.com/proxlavee/koharu-fork/releases/latest)を開き、NSIS Installer を実行します。この Installer はコード署名されていないため、Microsoft Defender SmartScreen が警告を表示する場合があります。この Repository は macOS または Linux の Application Binary を公開しません。
 
-リリースパッケージには固定した Chromium Embedded Framework ランタイムとリソースが含まれます。Linux では、ネイティブウィンドウシステム、グラフィックス、sandbox、CEF ランタイムの依存関係が正しく宣言されたディストリビューション向けパッケージを優先してください。Koharu は WebKitGTK やシステムブラウザーを必要としません。
+リリースパッケージには固定した Chromium Embedded Framework ランタイムとリソースが含まれます。Koharu はシステムブラウザーを必要としません。
 
 ## 初回起動
 
@@ -21,7 +21,7 @@ Koharu 自体を変更する目的でなければ、リリース版を使用し�
 
 ## 更新
 
-Koharu には現在、アプリ内アップデーターはありません。Koharu を終了してから GitHub Releases の新しい Package をインストールし、実行ファイル、ネイティブライブラリ、同梱 CEF Runtime のバージョンを揃えてください。
+Koharu はこの Repository の公開済み GitHub Release を確認し、対応する Windows Installer をアプリ内から起動できます。Koharu を終了し、GitHub Releases から新しい Package を手動でインストールすることもできます。
 
 次は[最初のプロジェクト](/ja-JP/getting-started/first-project/)を作成します。ハードウェア選択とキャッシュについては[ランタイム、モデル、ハードウェア](/ja-JP/getting-started/runtime-models-and-hardware/)を参照してください。
 

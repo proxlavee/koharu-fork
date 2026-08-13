@@ -5,13 +5,13 @@ description: 安装并启动 Koharu 发行版。
 
 # 安装 Koharu
 
-除非你准备修改 Koharu 本身，否则请使用发行版。当前发行版面向 64 位 Windows、64 位 Linux 和 Apple 芯片 macOS。
+除非你准备修改 Koharu 本身，否则请使用发行版。此仓库只发布 64 位 Windows 安装程序。
 
 ## 下载发行版
 
-打开[最新 GitHub Release](https://github.com/mayocream/koharu/releases/latest)。Windows 运行 NSIS Installer，Linux 启动 AppImage，macOS 则打开已签名的 DMG 并将 Koharu 拖入 Applications。
+打开[最新 GitHub Release](https://github.com/proxlavee/koharu-fork/releases/latest)并运行 NSIS 安装程序。安装程序未进行代码签名，Microsoft Defender SmartScreen 可能会显示警告。此仓库不发布 macOS 或 Linux 应用程序。
 
-发布包包含固定版本的 Chromium Embedded Framework 运行时及其资源。Linux 用户应优先使用对应发行版的软件包，以便正确声明原生窗口系统、图形、sandbox 与 CEF 运行库依赖。Koharu 不需要 WebKitGTK 或系统浏览器。
+发布包包含固定版本的 Chromium Embedded Framework 运行时及其资源。Koharu 不需要系统浏览器。
 
 ## 首次启动
 
@@ -21,7 +21,7 @@ description: 安装并启动 Koharu 发行版。
 
 ## 更新
 
-Koharu 目前不包含应用内更新器。请先关闭 Koharu，再安装 GitHub Releases 中的新 Package，以保持可执行文件、原生库与内置 CEF Runtime 版本一致。
+Koharu 会检查此仓库已发布的 GitHub Release，并可从应用内启动匹配的 Windows 安装程序。你也可以关闭 Koharu，再从 GitHub Releases 手动安装新版本。
 
 下一步请[翻译第一个项目](/zh-CN/getting-started/first-project/)。硬件选择与缓存行为见[运行时、模型与硬件](/zh-CN/getting-started/runtime-models-and-hardware/)。
 

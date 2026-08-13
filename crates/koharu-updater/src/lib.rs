@@ -23,8 +23,9 @@ use tempfile::TempPath;
 use tokio::io::AsyncWriteExt as _;
 use url::Url;
 
-const RELEASES_API: &str = "https://api.github.com/repos/mayocream/koharu/releases?per_page=100";
-const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/mayocream/koharu/releases/download";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/proxlavee/koharu-fork/releases?per_page=100";
+const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/proxlavee/koharu-fork/releases/download";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, thiserror::Error)]
@@ -516,6 +517,12 @@ mod tests {
         let name = package_name(&version).unwrap();
         assert!(name.contains("1.2.3"));
         assert!(!name.ends_with(".sig"));
+    }
+
+    #[test]
+    fn updater_uses_the_distribution_repository() {
+        assert!(RELEASES_API.contains("proxlavee/koharu-fork"));
+        assert!(RELEASE_DOWNLOAD_ROOT.contains("proxlavee/koharu-fork"));
     }
 
     #[test]

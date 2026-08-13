@@ -28,6 +28,11 @@ export const modelNames: Record<ModelName, string> = {
   'rorem-mixed': 'RORem Mixed',
 }
 
+export const modelNotes: Partial<Record<ModelName, string>> = {
+  'flux1-fill-dev':
+    'About 10 GiB to download · 16 GiB system memory minimum · non-commercial FLUX.1 Dev license',
+}
+
 export function defaultModel(model: ModelName): PipelineModel {
   switch (model) {
     case 'koharu-layout-rfdetr-seg-2xl':

@@ -5,13 +5,13 @@ description: Install and launch a Koharu release build.
 
 # Install Koharu
 
-Use a release build unless you intend to modify Koharu itself. Current releases are built for 64-bit Windows and Linux, and for Apple-silicon macOS.
+Use a release build unless you intend to modify Koharu itself. This repository publishes only a 64-bit Windows installer.
 
 ## Download a release
 
-Open the [latest GitHub release](https://github.com/mayocream/koharu/releases/latest). Run the NSIS installer on Windows, launch the AppImage on Linux, or open the signed DMG and drag Koharu to Applications on macOS.
+Open the [latest GitHub release](https://github.com/proxlavee/koharu-fork/releases/latest) and run the NSIS installer. The installer is not code-signed and may trigger Microsoft Defender SmartScreen. This repository does not publish macOS or Linux application binaries.
 
-Release packages include the pinned Chromium Embedded Framework runtime and its resources. On Linux, prefer the package produced for your distribution so its native window-system, graphics, sandbox, and CEF runtime dependencies are declared correctly. Koharu does not require WebKitGTK or a system browser.
+The release package includes the pinned Chromium Embedded Framework runtime and its resources. Koharu does not require a system browser.
 
 ## First launch
 
@@ -21,7 +21,7 @@ Downloads require access to GitHub release assets and, for model weights, Huggin
 
 ## Updates
 
-Koharu does not currently include an in-application updater. Close Koharu and install the newer package from GitHub Releases so the executable, native libraries, and bundled CEF runtime stay in sync.
+Koharu checks this repository's published GitHub releases and can launch the matching Windows installer from inside the application. You can also close Koharu and install the newer package manually from GitHub Releases.
 
 ## Next step
 
