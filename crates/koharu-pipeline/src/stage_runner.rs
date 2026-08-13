@@ -119,27 +119,29 @@ impl StageRunner {
                 model: model.to_owned(),
             },
         );
-        self.stages
-            .load(job.stage)
-            .await
-            .map_err(|error| AttemptFailure {
-                kind: ErrorKind::ModelLoad,
-                error,
-            })?;
+        let loaded = self.stages.load(job.stage).await;
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
+        loaded.map_err(|error| AttemptFailure {
+            kind: ErrorKind::ModelLoad,
+            error,
+        })?;
         progress::emit(
             job.progress.as_ref(),
             Progress::Running {
                 page: job.input.page(),
                 stage: job.stage,
                 model: model.to_owned(),
+                completed: 0,
+                total: 0,
             },
         );
-        self.stages
-            .process(job.stage, job.input.clone())
-            .await
+        let processed = self.stages.process(job.stage, job.input.clone()).await;
+        if job.stop.stopped() {
+            return Ok(StageOutcome::Stopped);
+        }
+        processed
             .map(|patch| {
                 if patch.is_empty() {
                     StageOutcome::Skipped

@@ -206,8 +206,9 @@ jobs:
         with:
           tag_name: stable-diffusion.cpp-${{ env.REF }}
           target_commitish: ${{ github.sha }}
-          name: stable-diffusion.cpp ${{ env.REF }}
-          body: Koharu runtime dependency.
-          make_latest: 'false'
+          name: Runtime dependency - stable-diffusion.cpp ${{ env.REF }} (Windows)
+          body: Build infrastructure for Koharu. This is not a Koharu application release.
+          prerelease: true
+          make_latest: false
           fail_on_unmatched_files: true
           files: release/*.tar.gz

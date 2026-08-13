@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -36,8 +40,20 @@ jobs:
     name: Windows
     needs: ensure-runtimes
     runs-on: windows-2022
+    outputs:
+      app-version: ${{ steps.app-version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      - name: Read application version
+        id: app-version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Cargo workspace version is not MAJOR.MINOR.PATCH: %s\n' "$version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
         with:
@@ -47,19 +63,30 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-      - run: bun install --frozen-lockfile
+      - uses: actions/cache@v6
+        with:
+          path: packages/koharu/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-
+      - name: Cache pinned Tauri CLI
+        id: tauri-cli-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri.exe
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: ${{ runner.os }}-cargo-tauri-${{ hashFiles('package.json') }}
+      - name: Install JavaScript dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install pinned Tauri CLI
+        if: steps.tauri-cli-cache.outputs.cache-hit != 'true'
+        run: bun run postinstall
+      - name: Verify pinned Tauri CLI
+        run: cargo tauri --version
       - name: Build unsigned Windows installer
         run: cargo tauri build --ci --no-sign --bundles nsis -- --locked
-      - name: Smoke-test installed Windows application
-        shell: bash
-        run: |
-          shopt -s nullglob
-          installers=(target/release/bundle/nsis/*-setup.exe)
-          if (( ${#installers[@]} != 1 )); then
-            printf 'Expected one NSIS installer, found %s\n' "${#installers[@]}" >&2
-            exit 1
-          fi
-          bash .github/scripts/windows-startup-smoke.sh "${installers[0]}"
       - uses: actions/upload-artifact@v7
         with:
           name: koharu-windows
@@ -67,10 +94,31 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  publish-test:
-    name: Publish Windows test prerelease
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  smoke:
+    name: Smoke installed Windows application
     needs: build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: koharu-windows
+          path: dist
+      - name: Install and launch packaged application
+        shell: bash
+        run: |
+          shopt -s nullglob
+          installers=(dist/*-setup.exe)
+          if (( ${#installers[@]} != 1 )); then
+            printf 'Expected one NSIS installer, found %s\n' "${#installers[@]}" >&2
+            exit 1
+          fi
+          bash .github/scripts/windows-startup-smoke.sh "${installers[0]}"
+
+  publish-test:
+    name: Publish versioned Windows preview
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, smoke]
     runs-on: windows-2022
     permissions:
       contents: write
@@ -82,11 +130,11 @@ jobs:
       - name: Publish test prerelease
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: test-build-${{ github.run_number }}
+          tag_name: windows-preview-${{ needs.build.outputs.app-version }}.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
-          name: Windows test build ${{ github.run_number }}
+          name: ${{ needs.build.outputs.app-version }} Windows preview ${{ github.run_number }}
           body: |
-            Automated unsigned Windows test build for `${{ github.sha }}`.
+            Automated unsigned Windows preview for Koharu ${{ needs.build.outputs.app-version }} at `${{ github.sha }}`.
 
             The installer passed the Windows build and installed-application startup smoke test. It may trigger Microsoft Defender SmartScreen.
           files: dist/*-setup.exe

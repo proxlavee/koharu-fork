@@ -18,6 +18,8 @@ pub enum Progress {
         page: EntityId,
         stage: Stage,
         model: String,
+        completed: usize,
+        total: usize,
     },
     Finished {
         page: EntityId,

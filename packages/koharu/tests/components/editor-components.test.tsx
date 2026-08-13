@@ -987,6 +987,7 @@ describe('greenfield editor', () => {
           id: 'job',
           completed: 1,
           total: 4,
+          progress: 0.375,
           page: 'page',
           stage: 'ocr',
           model: 'manga-ocr',
@@ -996,7 +997,7 @@ describe('greenfield editor', () => {
     })
     const stop = vi.spyOn(commands, 'stopJob').mockResolvedValue(null)
     render(<ActivityCenter />)
-    expect(screen.getByText('25%')).toBeInTheDocument()
+    expect(screen.getByText('38%')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
   })

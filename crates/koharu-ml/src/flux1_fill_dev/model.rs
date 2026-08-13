@@ -4,12 +4,23 @@
 //! at commit cc734292286f85f9c48305d94d7fd22f42838522:
 //! https://github.com/leejet/stable-diffusion.cpp/blob/cc734292286f85f9c48305d94d7fd22f42838522/docs/backend.md
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, anyhow, ensure};
-use koharu_diffusion::{Context, ContextParams, ImageGenerationParams, RgbImage, VaeFormat};
+use koharu_diffusion::{
+    CancelMode, Context, ContextParams, ImageGenerationParams, Progress, RgbImage, VaeFormat,
+    clear_progress_callback, set_progress_callback,
+};
 
-use crate::Backend;
+use crate::{Backend, InferenceControl, InferenceProgress};
 
 const VRAM_BUDGET_PERCENT: usize = 75;
 const MIB: usize = 1024 * 1024;
@@ -55,9 +66,104 @@ impl Model {
             .context
             .lock()
             .map_err(|_| anyhow!("FLUX.1 Fill Dev context lock was poisoned"))?;
+        context.cancel(CancelMode::Reset);
         context
             .generate_image(params)
             .context("FLUX.1 Fill Dev inference failed")
+    }
+
+    pub fn forward_with_control(
+        &self,
+        params: &ImageGenerationParams,
+        control: &InferenceControl,
+    ) -> Result<Vec<RgbImage>> {
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| anyhow!("FLUX.1 Fill Dev context lock was poisoned"))?;
+        context.cancel(CancelMode::Reset);
+
+        let progress_callback = NativeProgressCallback::install(control.clone())?;
+        let cancellation = CancellationMonitor::start(context.cancel_handle(), control.clone())?;
+        let result = context
+            .generate_image(params)
+            .context("FLUX.1 Fill Dev inference failed");
+        drop(cancellation);
+        context.cancel(CancelMode::Reset);
+        progress_callback.clear()?;
+        result
+    }
+}
+
+struct NativeProgressCallback {
+    active: bool,
+}
+
+impl NativeProgressCallback {
+    fn install(control: InferenceControl) -> Result<Self> {
+        set_progress_callback(move |Progress { step, steps, .. }| {
+            let total = usize::try_from(steps.max(0)).unwrap_or_default();
+            let completed = usize::try_from(step.max(0)).unwrap_or_default().min(total);
+            control.report(InferenceProgress { completed, total });
+        })
+        .context("failed to install FLUX.1 progress callback")?;
+        Ok(Self { active: true })
+    }
+
+    fn clear(mut self) -> Result<()> {
+        clear_progress_callback().context("failed to clear FLUX.1 progress callback")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for NativeProgressCallback {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = clear_progress_callback()
+        {
+            tracing::warn!(%error, "failed to clear FLUX.1 progress callback during cleanup");
+        }
+    }
+}
+
+struct CancellationMonitor {
+    finished: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CancellationMonitor {
+    fn start(cancel: koharu_diffusion::CancelHandle, control: InferenceControl) -> Result<Self> {
+        let finished = Arc::new(AtomicBool::new(false));
+        let monitor_finished = Arc::clone(&finished);
+        let thread = thread::Builder::new()
+            .name("flux1-cancellation".to_owned())
+            .spawn(move || {
+                while !monitor_finished.load(Ordering::Acquire) {
+                    if control.cancellation_requested() {
+                        cancel.cancel(CancelMode::All);
+                        return;
+                    }
+                    thread::park_timeout(Duration::from_millis(50));
+                }
+            })
+            .context("failed to start FLUX.1 cancellation monitor")?;
+        Ok(Self {
+            finished,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for CancellationMonitor {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            if thread.join().is_err() {
+                tracing::warn!("FLUX.1 cancellation monitor panicked");
+            }
+        }
     }
 }
 
@@ -87,12 +193,10 @@ fn context_plan(device: &crate::Device, paths: ModelPaths) -> ContextPlan {
         use_accelerator.then(|| format!("te=cpu,diffusion={backend},vae={backend}"));
     let max_vram = vram_budget(device).map(|budget| format!("{backend}={budget}"));
     let stream_layers = use_accelerator && max_vram.is_some();
-    let params_backends = use_accelerator.then(|| {
-        let diffusion = if stream_layers { "cpu" } else { &backend };
-        // Layer streaming requires diffusion parameters on CPU. Keeping the
-        // VAE on the accelerator avoids placing every component in host RAM.
-        format!("te=cpu,diffusion={diffusion},vae={backend}")
-    });
+    // Unspecified parameter backends follow their module runtime backend.
+    // Keeping diffusion parameters on CPU would transfer them for every layer
+    // and defeat max-VRAM residency and prefetching.
+    let params_backends = use_accelerator.then(|| "te=cpu".to_owned());
     ContextPlan {
         paths,
         use_accelerator,
@@ -157,10 +261,7 @@ mod tests {
         let plan = context_plan(&device, paths());
 
         assert_eq!(plan.backend, "te=cpu,diffusion=cuda0,vae=cuda0");
-        assert_eq!(
-            plan.params_backend.as_deref(),
-            Some("te=cpu,diffusion=cpu,vae=cuda0")
-        );
+        assert_eq!(plan.params_backend.as_deref(), Some("te=cpu"));
         assert_eq!(plan.max_vram.as_deref(), Some("cuda0=12.0"));
         assert!(plan.stream_layers);
         assert!(plan.use_accelerator);

@@ -23,6 +23,7 @@ macro_rules! model_repository {
 }
 
 mod backend;
+mod control;
 
 pub mod aot_inpainting;
 pub mod baberu_ocr;
@@ -46,6 +47,7 @@ pub mod rorem_mixed;
 pub mod speech_bubble_yolo11n;
 pub mod speech_bubble_yolov8m;
 
+pub use control::{InferenceControl, InferenceProgress};
 pub use koharu_diffusion as diffusion;
 pub use koharu_llama as llama;
 pub use koharu_runtime::{Backend, Device, DeviceType};

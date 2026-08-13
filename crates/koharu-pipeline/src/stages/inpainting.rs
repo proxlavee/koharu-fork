@@ -16,6 +16,7 @@ use imageproc::{
     region_labelling::{Connectivity, connected_components},
 };
 use koharu_ml::{
+    InferenceControl, InferenceProgress,
     aot_inpainting::AotInpainting,
     flux1_fill_dev::{Flux1FillDevInpaint, Flux1FillDevInpaintOptions},
     flux2_klein::{Flux2KleinInpaint, Flux2KleinInpaintOptions},
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use super::{ModelRef, StageInput, StageProcessor, finish, generation};
-use crate::{InpaintingModel, ModelCell};
+use crate::{InpaintingModel, ModelCell, Progress, progress};
 
 const PRODUCER: &str = "dev.koharu.pipeline.inpainting";
 
@@ -196,6 +197,9 @@ impl Model {
         let original = prepared.original.clone();
         let cleanup = prepared.cleanup.take();
         let cleanup_entity = prepared.cleanup_entity;
+        let stop = input.stop.clone();
+        let progress_sink = input.progress.clone();
+        let page = input.page;
         let (model_name, image) = match self {
             Self::LaMa(model) => {
                 let model = model.clone();
@@ -210,7 +214,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask| {
+                            |image, mask, _| {
                                 Ok(DynamicImage::ImageRgb8(model.inference(
                                     image,
                                     mask,
@@ -236,7 +240,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask| {
+                            |image, mask, _| {
                                 Ok(DynamicImage::ImageRgb8(model.inference(image, mask)?))
                             },
                         )
@@ -259,7 +263,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask| {
+                            |image, mask, _| {
                                 model.inference(
                                     &config.prompt,
                                     image,
@@ -288,12 +292,32 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask| {
-                                model.inference(
+                            |image, mask, tile| {
+                                let stop = stop.clone();
+                                let progress_sink = progress_sink.clone();
+                                let control = InferenceControl::new(
+                                    move || stop.stopped(),
+                                    move |native| {
+                                        let (completed, total) =
+                                            tile_inference_progress(tile, native);
+                                        progress::emit(
+                                            progress_sink.as_ref(),
+                                            Progress::Running {
+                                                page,
+                                                stage: crate::Stage::Inpainting,
+                                                model: "flux1-fill-dev".to_owned(),
+                                                completed,
+                                                total,
+                                            },
+                                        );
+                                    },
+                                );
+                                model.inference_with_control(
                                     &config.prompt,
                                     image,
                                     &DynamicImage::ImageLuma8(mask.clone()),
                                     &Flux1FillDevInpaintOptions::default(),
+                                    &control,
                                 )
                             },
                         )
@@ -316,7 +340,7 @@ impl Model {
                             &prepared.mask,
                             &prepared.text_mask,
                             &prepared.flat_fill_regions,
-                            |image, mask| {
+                            |image, mask, _| {
                                 let options = RoremMixedOptions {
                                     // The shared pipeline mask has already been
                                     // expanded in page space.
@@ -338,7 +362,6 @@ impl Model {
                 )
             }
         };
-        let page = input.page;
         let manual = input.inpainting_mask.is_some();
         let mut edit = if manual {
             input.scene.edit()
@@ -593,6 +616,12 @@ struct InpaintTile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InpaintTileProgress {
+    index: usize,
+    total: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MaskComponent {
     label: u32,
     bounds: [u32; 4],
@@ -609,7 +638,7 @@ fn inpaint_tiled(
     mask: &GrayImage,
     text_mask: &GrayImage,
     flat_fill_regions: &[FlatFillRegion],
-    mut inference: impl FnMut(&DynamicImage, &GrayImage) -> Result<DynamicImage>,
+    mut inference: impl FnMut(&DynamicImage, &GrayImage, InpaintTileProgress) -> Result<DynamicImage>,
 ) -> Result<DynamicImage> {
     ensure!(
         image.dimensions() == mask.dimensions() && mask.dimensions() == text_mask.dimensions(),
@@ -623,7 +652,7 @@ fn inpaint_tiled(
     let mut pending_mask = mask.clone();
     fill_uniform_regions(&mut output, &mut pending_mask, text_mask, flat_fill_regions);
     let (component_labels, tiles) = inpaint_tiles(&pending_mask);
-    for tile in &tiles {
+    for (index, tile) in tiles.iter().enumerate() {
         let [left, top, right, bottom] = tile.crop;
         let crop_width = right - left;
         let crop_height = bottom - top;
@@ -631,7 +660,14 @@ fn inpaint_tiled(
             image::imageops::crop_imm(&output, left, top, crop_width, crop_height).to_image();
         let crop_mask = crop_tile_mask(&pending_mask, tile);
 
-        let generated = inference(&DynamicImage::ImageRgb8(crop_image), &crop_mask)?;
+        let generated = inference(
+            &DynamicImage::ImageRgb8(crop_image),
+            &crop_mask,
+            InpaintTileProgress {
+                index,
+                total: tiles.len(),
+            },
+        )?;
         let generated = if generated.dimensions() == (crop_width, crop_height) {
             generated.to_rgb8()
         } else {
@@ -646,6 +682,16 @@ fn inpaint_tiled(
         composite_generated(&mut output, &component_labels, tile, &generated);
     }
     Ok(DynamicImage::ImageRgb8(output))
+}
+
+fn tile_inference_progress(tile: InpaintTileProgress, native: InferenceProgress) -> (usize, usize) {
+    let total = tile.total.saturating_mul(native.total);
+    let completed = tile
+        .index
+        .saturating_mul(native.total)
+        .saturating_add(native.completed.min(native.total))
+        .min(total);
+    (completed, total)
 }
 
 fn fill_uniform_regions(
@@ -1009,6 +1055,10 @@ mod tests {
                 page,
                 png: encode(&DynamicImage::ImageLuma8(transient)),
             }),
+            crate::stages::StageControl {
+                stop: crate::StopToken::default(),
+                progress: None,
+            },
         );
 
         let prepared = prepare(&input).await.unwrap();
@@ -1040,7 +1090,7 @@ mod tests {
             &expanded,
             &expanded,
             &[],
-            |tile, _| {
+            |tile, _, _| {
                 Ok(DynamicImage::ImageRgb8(RgbImage::from_pixel(
                     tile.width(),
                     tile.height(),
@@ -1052,6 +1102,30 @@ mod tests {
         .to_rgb8();
 
         assert!(output.pixels().all(|pixel| pixel == &Rgb([0, 0, 0])));
+    }
+
+    #[test]
+    fn tile_progress_accumulates_native_sampling_steps() {
+        assert_eq!(
+            tile_inference_progress(
+                InpaintTileProgress { index: 1, total: 3 },
+                InferenceProgress {
+                    completed: 25,
+                    total: 50,
+                },
+            ),
+            (75, 150)
+        );
+        assert_eq!(
+            tile_inference_progress(
+                InpaintTileProgress { index: 2, total: 3 },
+                InferenceProgress {
+                    completed: 60,
+                    total: 50,
+                },
+            ),
+            (150, 150)
+        );
     }
 
     fn rectangle_region([left, top, right, bottom]: [u32; 4]) -> FlatFillRegion {
@@ -1083,7 +1157,7 @@ mod tests {
             &mask,
             &mask,
             &[rectangle_region([0, 0, 96, 96])],
-            |_, _| {
+            |_, _, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
             },
@@ -1134,7 +1208,7 @@ mod tests {
                 rectangle_region([10, 10, 90, 90]),
                 rectangle_region([110, 10, 190, 90]),
             ],
-            |_, _| {
+            |_, _, _| {
                 calls += 1;
                 Ok(DynamicImage::new_rgb8(1, 1))
             },
@@ -1163,7 +1237,7 @@ mod tests {
             &mask,
             &mask,
             &[],
-            |tile, tile_mask| {
+            |tile, tile_mask, _| {
                 calls += 1;
                 assert_eq!(
                     tile_mask.pixels().filter(|pixel| pixel[0] >= 127).count(),
@@ -1239,7 +1313,7 @@ mod tests {
             &mask,
             &mask,
             &[],
-            |tile, _| {
+            |tile, _, _| {
                 calls += 1;
                 assert!(tile.width() <= TILE_CONTEXT * 2 + 1);
                 assert!(tile.height() <= TILE_CONTEXT * 2 + 1);

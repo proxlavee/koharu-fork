@@ -19,7 +19,7 @@ use crate::{
     scheduler::Scheduler,
     scope::NormalizedScope,
     stage_runner::{StageCompletion, StageJob, StageOutcome, StageRunner},
-    stages::StageInput,
+    stages::{StageControl, StageInput},
 };
 
 #[derive(Clone)]
@@ -228,6 +228,10 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .filter(|mask| stage == Stage::Inpainting && mask.page == page)
                     .cloned(),
+                StageControl {
+                    stop: self.stop.clone(),
+                    progress: self.progress.clone(),
+                },
             ),
             self.stop.clone(),
             self.progress.clone(),

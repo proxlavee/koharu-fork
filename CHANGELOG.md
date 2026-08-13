@@ -1,3 +1,36 @@
+## [0.66.3](https://github.com/mayocream/koharu/compare/0.66.2..0.66.3) - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- Put store in resource dir - ([9590631](https://github.com/mayocream/koharu/commit/959063121cf15330d41c8acd03f2ffab60a6a2ed))
+
+
+## [0.66.2](https://github.com/mayocream/koharu/compare/0.66.1..0.66.2) - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- Bundle CEF correctly - ([10d2ae8](https://github.com/mayocream/koharu/commit/10d2ae8fd88fa32bd9818471e03f902b000e9989))
+
+
+## [0.66.1](https://github.com/mayocream/koharu/compare/0.66.0..0.66.1) - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- Update dialog overflow - ([66ce7c6](https://github.com/mayocream/koharu/commit/66ce7c635ef4d8fbcfbe445c7fc929746063fa3a))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update sponsors ([#903](https://github.com/mayocream/koharu/issues/903)) - ([fe8075e](https://github.com/mayocream/koharu/commit/fe8075e9b67e9dca7275758149173a8b25f0e640))
+
+
+## [0.66.0](https://github.com/mayocream/koharu/compare/0.65.3..0.66.0) - 2026-08-13
+
+### ⛰️  Features
+
+- CEF OSR - ([9379006](https://github.com/mayocream/koharu/commit/937900683eea385a89e0e6e7fc0065cc757e1fa2))
+- Use CEF runtime - ([547106f](https://github.com/mayocream/koharu/commit/547106f17e8183046fb22572b532f6755eef02f7))
+
+
 ## [0.65.3](https://github.com/mayocream/koharu/compare/0.65.2..0.65.3) - 2026-08-13
 
 ### 🐛 Bug Fixes

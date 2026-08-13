@@ -84,7 +84,10 @@ function JobItem({ job }: { job: Job }) {
       />
     )
   }
-  const percent = progress(job.completed, job.total)
+  const percent =
+    job.progress !== null
+      ? Math.min(100, Math.max(0, Math.round(job.progress * 100)))
+      : progress(job.completed, job.total)
   return (
     <div className='border-b p-3 last:border-b-0'>
       <div className='grid grid-cols-[1rem_minmax(0,1fr)_2.25rem_1.5rem] items-start gap-x-2.5'>

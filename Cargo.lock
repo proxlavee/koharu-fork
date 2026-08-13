@@ -368,7 +368,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -379,7 +379,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1171,7 +1171,7 @@ checksum = "aa61aec073ec94791433ddf3df2323ff9d1711557c2a0eefb0f99cb4f8dca520"
 dependencies = [
  "semver",
  "serde",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -1563,7 +1563,7 @@ dependencies = [
  "cookie",
  "document-features",
  "idna",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "log",
  "serde",
  "serde_derive",
@@ -2110,7 +2110,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2269,7 +2269,7 @@ dependencies = [
  "cc",
  "memchr",
  "rustc_version",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "vswhom",
  "winreg",
 ]
@@ -2366,7 +2366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3263,7 +3263,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http 1.5.0",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -3912,12 +3912,12 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.11.4"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "serde",
  "serde_core",
 ]
@@ -4317,57 +4317,27 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "koharu"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
- "alphanumeric-sort",
- "anyhow",
- "async-trait",
- "base64 0.22.1",
  "clap",
  "console",
- "dirs",
- "futures",
- "image 0.25.10",
- "koharu-agent",
- "koharu-canvas",
- "koharu-ml",
- "koharu-pipeline",
- "koharu-psd",
- "koharu-renderer",
- "koharu-runtime",
- "koharu-scene",
- "koharu-secrets",
+ "koharu-app",
+ "koharu-desktop",
  "koharu-torch-sys",
- "koharu-translator",
- "open",
- "parking_lot",
- "rayon",
  "rfd",
- "schemars 1.2.2",
  "sentry",
- "serde",
  "serde_json",
- "specta",
- "specta-typescript",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "tauri-plugin-window-state",
- "tauri-specta",
- "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
- "vello",
- "walkdir",
- "webp",
 ]
 
 [[package]]
 name = "koharu-agent"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4387,8 +4357,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "koharu-app"
+version = "0.66.3"
+dependencies = [
+ "alphanumeric-sort",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "dirs",
+ "futures",
+ "image 0.25.10",
+ "koharu-agent",
+ "koharu-canvas",
+ "koharu-desktop",
+ "koharu-ml",
+ "koharu-pipeline",
+ "koharu-psd",
+ "koharu-renderer",
+ "koharu-runtime",
+ "koharu-scene",
+ "koharu-secrets",
+ "koharu-torch-sys",
+ "koharu-translator",
+ "open",
+ "parking_lot",
+ "rayon",
+ "rfd",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "specta",
+ "specta-typescript",
+ "tauri",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-window-state",
+ "tauri-specta",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+ "webp",
+]
+
+[[package]]
 name = "koharu-bindgen"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4401,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-canvas"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "criterion",
  "image 0.25.10",
@@ -4415,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-config"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "atomicwrites",
@@ -4423,13 +4438,30 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
 ]
 
 [[package]]
+name = "koharu-desktop"
+version = "0.66.3"
+dependencies = [
+ "anyhow",
+ "koharu-canvas",
+ "koharu-renderer",
+ "koharu-scene",
+ "parking_lot",
+ "serde",
+ "specta",
+ "tauri",
+ "tokio",
+ "tracing",
+ "vello",
+]
+
+[[package]]
 name = "koharu-diffusion"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "image 0.25.10",
  "koharu-diffusion-sys",
@@ -4439,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-diffusion-sys"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "koharu-bindgen",
@@ -4449,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-llama"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -4464,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-llama-sys"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "koharu-bindgen",
@@ -4474,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-ml"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4505,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-pipeline"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4527,14 +4559,14 @@ dependencies = [
  "strum",
  "sysinfo",
  "tokio",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "koharu-psd"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "image 0.25.10",
  "koharu-renderer",
@@ -4546,7 +4578,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-renderer"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4581,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-runtime"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4601,7 +4633,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "walkdir",
  "zip 8.6.0",
@@ -4609,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-scene"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "blake3",
  "bytes",
@@ -4631,7 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-secrets"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "keyring",
@@ -4643,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-storage"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "blake3",
  "bytes",
@@ -4663,7 +4695,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-torch"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "half",
@@ -4680,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-torch-sys"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "cmake",
@@ -4693,7 +4725,7 @@ dependencies = [
 
 [[package]]
 name = "koharu-translator"
-version = "0.65.4"
+version = "0.66.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4712,7 +4744,7 @@ dependencies = [
  "strum",
  "thiserror 2.0.20",
  "tokio",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "url",
 ]
@@ -4725,7 +4757,7 @@ checksum = "02cb977175687f33fa4afa0c95c112b987ea1443e5a51c8f8ff27dc618270cc2"
 dependencies = [
  "cssparser 0.29.6",
  "html5ever 0.29.1",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "selectors 0.24.0",
 ]
 
@@ -4920,7 +4952,7 @@ checksum = "207e72ede15e79f1e7a7f0e2683387da031c1931f6de650020afb80c571efb67"
 dependencies = [
  "anyhow",
  "derivre",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "rayon",
  "referencing",
  "regex-syntax",
@@ -5211,7 +5243,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.20",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5229,7 +5261,7 @@ dependencies = [
  "half",
  "hashbrown 0.16.1",
  "hexf-parse",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "libm",
  "log",
  "num-traits",
@@ -5394,7 +5426,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6130,7 +6162,7 @@ checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
 dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "serde",
 ]
 
@@ -6369,7 +6401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64 0.22.1",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "quick-xml",
  "serde",
  "time",
@@ -6562,7 +6594,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit 0.25.6+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -6752,7 +6784,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7431,7 +7463,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7490,7 +7522,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7589,7 +7621,7 @@ checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "chrono",
  "dyn-clone",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "ref-cast",
  "schemars_derive",
  "serde",
@@ -7915,7 +7947,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",
@@ -7975,7 +8007,7 @@ dependencies = [
  "chrono",
  "hex",
  "indexmap 1.9.3",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "jiff",
  "schemars 0.9.0",
  "schemars 1.2.2",
@@ -8249,7 +8281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8681,7 +8713,7 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 [[package]]
 name = "tauri"
 version = "2.11.5"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "anyhow",
  "bytes",
@@ -8732,7 +8764,7 @@ dependencies = [
 [[package]]
 name = "tauri-build"
 version = "2.6.3"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "anyhow",
  "cargo_toml",
@@ -8752,7 +8784,7 @@ dependencies = [
 [[package]]
 name = "tauri-codegen"
 version = "2.6.3"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "base64 0.22.1",
  "brotli",
@@ -8778,7 +8810,7 @@ dependencies = [
 [[package]]
 name = "tauri-macros"
 version = "2.6.3"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -8791,7 +8823,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin"
 version = "2.6.3"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "anyhow",
  "glob",
@@ -8855,7 +8887,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime"
 version = "2.11.3"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "cookie",
  "dpi",
@@ -8876,7 +8908,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-cef"
 version = "0.1.0"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "base64 0.22.1",
  "cef",
@@ -8912,7 +8944,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-wry"
 version = "2.11.4"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "gtk",
  "http 1.5.0",
@@ -8969,7 +9001,7 @@ dependencies = [
 [[package]]
 name = "tauri-utils"
 version = "2.9.3"
-source = "git+https://github.com/tauri-apps/tauri?rev=4af26a3f7f8b692d62cca549bbacd93f5ce90b41#4af26a3f7f8b692d62cca549bbacd93f5ce90b41"
+source = "git+https://github.com/mayocream/tauri?rev=9b8ba87f75b62431c6464dfba6070217c6ad2164#9b8ba87f75b62431c6464dfba6070217c6ad2164"
 dependencies = [
  "anyhow",
  "brotli",
@@ -8998,7 +9030,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
@@ -9013,7 +9045,7 @@ checksum = "cc65d45c68858bfe420dd29e834b5d15dbecf8a07a8a16cf4d532c7b1f69d4b6"
 dependencies = [
  "dunce",
  "embed-resource",
- "toml 1.1.0+spec-1.1.0",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -9026,7 +9058,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9346,26 +9378,11 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.12+spec-1.1.0"
+version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
 dependencies = [
- "indexmap 2.11.4",
- "serde_core",
- "serde_spanned 1.1.1",
- "toml_datetime 0.7.5+spec-1.1.0",
- "toml_parser",
- "toml_writer",
- "winnow 0.7.15",
-]
-
-[[package]]
-name = "toml"
-version = "1.1.0+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8195ca05e4eb728f4ba94f3e3291661320af739c4e43779cbdfae82ab239fcc"
-dependencies = [
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "serde_core",
  "serde_spanned 1.1.1",
  "toml_datetime 1.1.1+spec-1.1.0",
@@ -9385,15 +9402,6 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
@@ -9407,7 +9415,7 @@ version = "0.19.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b5bb770da30e5cbfde35a2d7b9b8a2c4b8ef89548a7a6aeab5c9a576e3e7421"
 dependencies = [
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "toml_datetime 0.6.3",
  "winnow 0.5.40",
 ]
@@ -9418,7 +9426,7 @@ version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "396e4d48bbb2b7554c944bde63101b5ae446cff6ec4a24227428f15eb72ef338"
 dependencies = [
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.3",
@@ -9427,11 +9435,11 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.6+spec-1.1.0"
+version = "0.25.13+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0db3bae107c9522f86d361697dee1d7386a2ddcf659d5aea5159819a21a3c4a7"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "winnow 1.0.4",
@@ -9607,7 +9615,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10326,7 +10334,7 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.16.1",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "log",
  "naga",
  "once_cell",
@@ -10492,7 +10500,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11215,12 +11223,6 @@ dependencies = [
 
 [[package]]
 name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
-
-[[package]]
-name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
@@ -11627,7 +11629,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hmac 0.13.0",
- "indexmap 2.11.4",
+ "indexmap 2.14.0",
  "lzma-rust2",
  "memchr",
  "pbkdf2 0.13.0",

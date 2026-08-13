@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - '[0-9]*.[0-9]*.[0-9]*'
 
 permissions:
   actions: write
@@ -17,9 +17,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Test, build, and release Windows
+  build:
+    name: Test and build Windows release
     runs-on: windows-2022
+    outputs:
+      app-version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -33,7 +35,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-x86_64-pc-windows-msvc
+          key: x86_64-pc-windows-msvc
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: actions/cache@v6
         with:
@@ -45,13 +47,29 @@ jobs:
           key: ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
           restore-keys: |
             ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-
-      - run: bun install --frozen-lockfile
+      - name: Cache pinned Tauri CLI
+        id: tauri-cli-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri.exe
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: ${{ runner.os }}-cargo-tauri-${{ hashFiles('package.json') }}
+      - name: Install JavaScript dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install pinned Tauri CLI
+        if: steps.tauri-cli-cache.outputs.cache-hit != 'true'
+        run: bun run postinstall
+      - name: Verify pinned Tauri CLI
+        run: cargo tauri --version
       - name: Validate release version
+        id: version
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$GITHUB_REF_NAME"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            printf 'Release tag must be vMAJOR.MINOR.PATCH, got %s\n' "$GITHUB_REF_NAME" >&2
+            printf 'Release tag must be MAJOR.MINOR.PATCH, got %s\n' "$GITHUB_REF_NAME" >&2
             exit 1
           fi
           manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
@@ -59,6 +77,7 @@ jobs:
             printf 'Release tag version %s does not match Cargo workspace version %s\n' "$version" "$manifest_version" >&2
             exit 1
           fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'APP_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
       - name: Generate release notes
         shell: bash
@@ -72,21 +91,62 @@ jobs:
         run: bun run --filter @koharu/app test
       - name: Build unsigned Windows installer
         run: cargo tauri build --ci --no-sign --bundles nsis -- --locked
-      - name: Validate and smoke-test installer
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: koharu-windows-release
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: koharu-release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 3
+
+  smoke:
+    name: Smoke installed Windows release
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: koharu-windows-release
+          path: dist
+      - name: Install and launch packaged application
         shell: bash
         run: |
           shopt -s nullglob
-          installers=(target/release/bundle/nsis/*-setup.exe)
+          installers=(dist/*-setup.exe)
           if (( ${#installers[@]} != 1 )); then
             printf 'Expected one NSIS installer, found %s\n' "${#installers[@]}" >&2
             exit 1
           fi
           bash .github/scripts/windows-startup-smoke.sh "${installers[0]}"
+
+  publish:
+    name: Publish versioned Windows release
+    needs: [build, smoke]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: koharu-windows-release
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: koharu-release-notes
+          path: release-meta
       - name: Publish Windows release
         uses: softprops/action-gh-release@v3
         with:
-          name: ${{ github.ref_name }}
-          body_path: release-notes.md
-          files: target/release/bundle/nsis/*-setup.exe
+          name: ${{ needs.build.outputs.app-version }}
+          body_path: release-meta/release-notes.md
+          files: dist/*-setup.exe
           draft: false
+          prerelease: false
+          make_latest: true
           fail_on_unmatched_files: true

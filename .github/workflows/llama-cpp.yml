@@ -184,8 +184,9 @@ jobs:
         with:
           tag_name: llama.cpp-${{ env.REF }}
           target_commitish: ${{ github.sha }}
-          name: llama.cpp ${{ env.REF }}
-          body: Koharu runtime dependency.
-          make_latest: 'false'
+          name: Runtime dependency - llama.cpp ${{ env.REF }} (Windows)
+          body: Build infrastructure for Koharu. This is not a Koharu application release.
+          prerelease: true
+          make_latest: false
           fail_on_unmatched_files: true
           files: release/*.tar.gz

@@ -14,6 +14,8 @@ use koharu_diffusion::{
     GuidanceParams, ImageGenerationParams, SampleMethod, SampleParams, Scheduler,
 };
 
+use crate::InferenceControl;
+
 use self::{
     model::{Model, ModelPaths},
     processor::Flux1ImageProcessor,
@@ -66,6 +68,28 @@ impl Flux1FillDevInpaint {
         image: &DynamicImage,
         mask_image: &DynamicImage,
         options: &Flux1FillDevInpaintOptions,
+    ) -> Result<DynamicImage> {
+        self.inference_inner(prompt, image, mask_image, options, None)
+    }
+
+    pub fn inference_with_control(
+        &self,
+        prompt: &str,
+        image: &DynamicImage,
+        mask_image: &DynamicImage,
+        options: &Flux1FillDevInpaintOptions,
+        control: &InferenceControl,
+    ) -> Result<DynamicImage> {
+        self.inference_inner(prompt, image, mask_image, options, Some(control))
+    }
+
+    fn inference_inner(
+        &self,
+        prompt: &str,
+        image: &DynamicImage,
+        mask_image: &DynamicImage,
+        options: &Flux1FillDevInpaintOptions,
+        control: Option<&InferenceControl>,
     ) -> Result<DynamicImage> {
         ensure!(
             image.width() == mask_image.width() && image.height() == mask_image.height(),
@@ -137,23 +161,25 @@ impl Flux1FillDevInpaint {
         };
         Flux1ImageProcessor::binarize(&mut native_mask);
 
-        let generated = self
-            .model
-            .forward(&ImageGenerationParams {
-                prompt: prompt.to_owned(),
-                width: i32::try_from(width)?,
-                height: i32::try_from(height)?,
-                init_image: Some(init_image),
-                mask_image: Some(native_mask),
-                sample: sample_params(options)?,
-                seed: options.seed,
-                batch_count: 1,
-                strength: options.strength as f32,
-                ..ImageGenerationParams::default()
-            })?
-            .into_iter()
-            .next()
-            .context("FLUX.1 Fill Dev returned no inpainted image")?;
+        let params = ImageGenerationParams {
+            prompt: prompt.to_owned(),
+            width: i32::try_from(width)?,
+            height: i32::try_from(height)?,
+            init_image: Some(init_image),
+            mask_image: Some(native_mask),
+            sample: sample_params(options)?,
+            seed: options.seed,
+            batch_count: 1,
+            strength: options.strength as f32,
+            ..ImageGenerationParams::default()
+        };
+        let generated = match control {
+            Some(control) => self.model.forward_with_control(&params, control),
+            None => self.model.forward(&params),
+        }?
+        .into_iter()
+        .next()
+        .context("FLUX.1 Fill Dev returned no inpainted image")?;
 
         let generated =
             Flux1ImageProcessor::apply_overlay(&mask_image, &image, generated, crop_coords)?;

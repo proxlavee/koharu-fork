@@ -18,7 +18,7 @@ use super::{
     canvas::{CanvasChannel, CanvasView},
     project::CurrentProject,
 };
-use crate::desktop::Desktop;
+use koharu_desktop::Desktop;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Type)]
 #[serde(transparent)]
@@ -51,6 +51,7 @@ pub struct Job {
     pub completed: usize,
     #[specta(type = f64)]
     pub total: usize,
+    pub progress: Option<f64>,
     pub page: Option<koharu_scene::EntityId>,
     pub stage: Option<koharu_pipeline::Stage>,
     pub model: Option<String>,
@@ -110,6 +111,7 @@ pub(crate) async fn process(
         state: JobState::Running,
         completed: 0,
         total: 0,
+        progress: None,
         page: None,
         stage: None,
         model: None,
@@ -136,33 +138,78 @@ pub(crate) async fn process(
                 Progress::Started { pages, stages } => {
                     let mut progress = progress.lock();
                     *progress = (0, pages.len().saturating_mul(stages.len()));
-                    Some((0, progress.1, None, None, None))
+                    Some((
+                        0,
+                        progress.1,
+                        aggregate_progress(0, progress.1, None),
+                        None,
+                        None,
+                        None,
+                    ))
                 }
                 Progress::Loading { page, stage, model } => {
                     let progress = progress.lock();
-                    Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
+                    Some((
+                        progress.0,
+                        progress.1,
+                        aggregate_progress(progress.0, progress.1, None),
+                        Some(page),
+                        Some(stage),
+                        Some(model),
+                    ))
+                }
+                Progress::Running {
+                    page,
+                    stage,
+                    model,
+                    completed,
+                    total,
+                } => {
+                    let progress = progress.lock();
+                    Some((
+                        progress.0,
+                        progress.1,
+                        aggregate_progress(progress.0, progress.1, Some((completed, total))),
+                        Some(page),
+                        Some(stage),
+                        Some(model),
+                    ))
                 }
                 Progress::Finished {
                     page, stage, model, ..
                 } => {
                     let mut progress = progress.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
-                    Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
+                    Some((
+                        progress.0,
+                        progress.1,
+                        aggregate_progress(progress.0, progress.1, None),
+                        Some(page),
+                        Some(stage),
+                        Some(model),
+                    ))
                 }
                 Progress::Skipped { page, stage } => {
                     let mut progress = progress.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
-                    Some((progress.0, progress.1, Some(page), Some(stage), None))
+                    Some((
+                        progress.0,
+                        progress.1,
+                        aggregate_progress(progress.0, progress.1, None),
+                        Some(page),
+                        Some(stage),
+                        None,
+                    ))
                 }
-                Progress::Running { .. } => None,
             };
-            if let Some((completed, total, page, stage, model)) = update {
+            if let Some((completed, total, progress, page, stage, model)) = update {
                 let job = {
                     let processing = progress_handle.state::<Processing>();
                     let mut jobs = processing.jobs.lock();
                     jobs.get_mut(&id).map(|job| {
                         job.completed = completed;
                         job.total = total;
+                        job.progress = progress;
                         job.page = page;
                         job.stage = stage;
                         job.model = model;
@@ -244,6 +291,9 @@ pub(crate) async fn process(
                     JobState::Finished
                 };
                 job.error = error;
+                if job.state == JobState::Finished {
+                    job.progress = Some(1.0);
+                }
                 job
             });
         if let Some(job) = job {
@@ -251,6 +301,34 @@ pub(crate) async fn process(
         }
     }));
     Ok(id)
+}
+
+fn aggregate_progress(
+    completed: usize,
+    total: usize,
+    stage: Option<(usize, usize)>,
+) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    let stage = stage
+        .filter(|(_, total)| *total > 0)
+        .map_or(0.0, |(completed, total)| {
+            completed.min(total) as f64 / total as f64
+        });
+    Some(((completed.min(total) as f64 + stage) / total as f64).min(1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_progress;
+
+    #[test]
+    fn native_stage_progress_advances_the_overall_job() {
+        assert_eq!(aggregate_progress(1, 2, Some((25, 50))), Some(0.75));
+        assert_eq!(aggregate_progress(0, 0, Some((25, 50))), None);
+        assert_eq!(aggregate_progress(2, 2, Some((50, 50))), Some(1.0));
+    }
 }
 
 #[tauri::command]
