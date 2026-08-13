@@ -18,10 +18,14 @@ license.workspace = true
 default = ["tauri/cef"]
 
 [dependencies]
+anyhow = { workspace = true }
 clap = { workspace = true }
 console = { workspace = true }
+dirs = { workspace = true }
 koharu-app = { workspace = true }
 koharu-desktop = { workspace = true }
+koharu-runtime = { workspace = true }
+koharu-torch = { workspace = true }
 koharu-torch-sys = { workspace = true }
 rfd = { workspace = true }
 sentry = { workspace = true }

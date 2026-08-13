@@ -116,8 +116,16 @@ jobs:
     name: Smoke installed Windows release
     needs: build
     runs-on: windows-2022
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+      - name: Restore installed runtime smoke cache
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/KoharuData/store
+          key: windows-runtime-smoke-v1-${{ hashFiles('Cargo.lock', 'crates/koharu-runtime/**', 'crates/koharu-torch/**', 'crates/koharu-torch-sys/**') }}
+          restore-keys: |
+            windows-runtime-smoke-v1-
       - uses: actions/download-artifact@v8
         with:
           name: koharu-windows-release

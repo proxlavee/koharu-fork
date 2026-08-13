@@ -101,8 +101,16 @@ jobs:
     name: Smoke installed Windows application
     needs: build
     runs-on: windows-2022
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+      - name: Restore installed runtime smoke cache
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/KoharuData/store
+          key: windows-runtime-smoke-v1-${{ hashFiles('Cargo.lock', 'crates/koharu-runtime/**', 'crates/koharu-torch/**', 'crates/koharu-torch-sys/**') }}
+          restore-keys: |
+            windows-runtime-smoke-v1-
       - uses: actions/download-artifact@v8
         with:
           name: koharu-windows
@@ -139,7 +147,7 @@ jobs:
           body: |
             Automated unsigned Windows preview for Koharu ${{ needs.build.outputs.app-version }} at `${{ github.sha }}`.
 
-            The installer passed the Windows build and installed-application startup smoke test. It may trigger Microsoft Defender SmartScreen.
+            The installer passed the Windows build, Torch runtime activation, and installed-application startup smoke tests. It may trigger Microsoft Defender SmartScreen.
           files: dist/*-setup.exe
           prerelease: true
           make_latest: false

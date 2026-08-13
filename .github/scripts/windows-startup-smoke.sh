@@ -47,6 +47,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+verify_torch_runtime() {
+  local report=$1
+  local report_windows
+  report_windows=$(cygpath -w "$report")
+  rm -f "$report"
+  if ! MSYS2_ARG_CONV_EXCL='*' "$install_dir/koharu.exe" \
+    --verify-torch-runtime "$report_windows"; then
+    printf 'Installed Koharu could not initialize its Torch runtime.\n' >&2
+    if [[ -f "$report" ]]; then
+      sed -n '1,240p' "$report" >&2
+    else
+      printf 'Koharu did not produce the expected runtime report at %s\n' "$report" >&2
+    fi
+    exit 1
+  fi
+  if [[ ! -f "$report" ]] || [[ $(head -n 1 "$report") != ready ]]; then
+    printf 'Installed Koharu produced an invalid Torch runtime report.\n' >&2
+    [[ ! -f "$report" ]] || sed -n '1,240p' "$report" >&2
+    exit 1
+  fi
+}
+
 launch_and_wait() {
   local log=$1
   "$install_dir/koharu.exe" >"$log" 2>&1 &
@@ -72,6 +94,7 @@ stop_app() {
   pid=
 }
 
+verify_torch_runtime "$runner_temp/koharu-torch-first.txt"
 launch_and_wait "$runner_temp/koharu-startup-first.log"
 if [[ ! -f "$persistent_marker" ]]; then
   printf 'Koharu did not migrate the legacy model store to %s\n' "$persistent_marker" >&2
@@ -88,6 +111,7 @@ if [[ ! -f "$persistent_marker" ]]; then
   printf 'Reinstalling Koharu removed the persistent model store\n' >&2
   exit 1
 fi
+verify_torch_runtime "$runner_temp/koharu-torch-reinstalled.txt"
 launch_and_wait "$runner_temp/koharu-startup-reinstalled.log"
 
-printf 'Installed Koharu remained running and preserved its model store across reinstall.\n'
+printf 'Installed Koharu loaded Torch, remained running, and preserved its model store across reinstall.\n'
