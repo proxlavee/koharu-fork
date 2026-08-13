@@ -480,6 +480,8 @@
     "yourProjects": "プロジェクト一覧"
   },
   "startup": {
+    "failureStatus": "初期化に失敗しました",
+    "failureTitle": "Koharu を起動できませんでした",
     "description": "ローカル AI ランタイムを読み込み、ワークスペースを準備しています。初回起動には少し時間がかかる場合があります。",
     "opening": "Koharuを起動中…",
     "status": "ローカルランタイムを初期化しています",
@@ -505,7 +507,6 @@
   },
   "updater": {
     "available": {
-      "description": "Koharu {{version}} をインストールできます。",
       "title": "アップデートが利用可能"
     },
     "close": "閉じる",

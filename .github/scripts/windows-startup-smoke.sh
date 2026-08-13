@@ -15,8 +15,9 @@ required=(
   "$install_dir/koharu-torch.dll"
   "$install_dir/libcef.dll"
   "$install_dir/chrome_elf.dll"
+  "$install_dir/icudtl.dat"
+  "$install_dir/v8_context_snapshot.bin"
   "$install_dir/resources.pak"
-  "$install_dir/resources/ui/index.html"
 )
 for path in "${required[@]}"; do
   if [[ ! -f "$path" ]]; then

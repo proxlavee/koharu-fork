@@ -1,6 +1,6 @@
 ---
 title: 安装 Koharu
-description: 安装并启动 Koharu 发行版。
+description: 安装发行版，完成首次启动并保持更新。
 ---
 
 # 安装 Koharu
@@ -21,7 +21,7 @@ description: 安装并启动 Koharu 发行版。
 
 ## 更新
 
-Koharu 会检查此仓库已发布的 GitHub Release，并可从应用内启动匹配的 Windows 安装程序。你也可以关闭 Koharu，再从 GitHub Releases 手动安装新版本。
+此未签名版本不启用 Tauri 的签名更新器。更新时，请关闭 Koharu，然后从此仓库的 GitHub Releases 页面运行较新的安装程序。
 
 下一步请[翻译第一个项目](/zh-CN/getting-started/first-project/)。硬件选择与缓存行为见[运行时、模型与硬件](/zh-CN/getting-started/runtime-models-and-hardware/)。
 

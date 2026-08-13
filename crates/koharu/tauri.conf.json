@@ -1,0 +1,43 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/4af26a3f7f8b692d62cca549bbacd93f5ce90b41/crates/tauri-schema-generator/schemas/config.schema.json",
+  "identifier": "Koharu",
+  "build": {
+    "devUrl": "http://localhost:3000",
+    "frontendDist": "../../packages/koharu/out",
+    "beforeDevCommand": "bun run --filter @koharu/app dev",
+    "beforeBuildCommand": "bun run --filter @koharu/app build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "label": "main",
+        "width": 1024,
+        "height": 768,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true,
+        "title": "Koharu",
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
+        "backgroundColor": "#00000000"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": false
+  }
+}

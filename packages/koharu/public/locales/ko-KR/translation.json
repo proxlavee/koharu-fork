@@ -480,6 +480,8 @@
     "yourProjects": "내 프로젝트"
   },
   "startup": {
+    "failureStatus": "초기화 실패",
+    "failureTitle": "Koharu를 시작할 수 없습니다",
     "description": "로컬 AI 런타임을 불러오고 작업 공간을 준비하고 있습니다. 처음 실행할 때는 잠시 걸릴 수 있습니다.",
     "opening": "Koharu 여는 중…",
     "status": "로컬 런타임 초기화 중",
@@ -505,12 +507,11 @@
   },
   "updater": {
     "available": {
-      "description": "Koharu {{version}} 업데이트를 설치할 수 있습니다.",
       "title": "업데이트 사용 가능"
     },
     "close": "닫기",
     "downloading": {
-      "subtitle": "Koharu {{version}}",
+      "subtitle": "코하루 {{version}}",
       "title": "업데이트 다운로드 중…"
     },
     "error": {

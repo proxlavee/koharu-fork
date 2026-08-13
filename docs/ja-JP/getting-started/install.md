@@ -1,6 +1,6 @@
 ---
 title: Koharu のインストール
-description: Koharu のリリース版をインストールして起動します。
+description: リリース版をインストールし、初回起動と更新を行います。
 ---
 
 # Koharu のインストール
@@ -21,7 +21,7 @@ Koharu 自体を変更する目的でなければ、リリース版を使用し�
 
 ## 更新
 
-Koharu はこの Repository の公開済み GitHub Release を確認し、対応する Windows Installer をアプリ内から起動できます。Koharu を終了し、GitHub Releases から新しい Package を手動でインストールすることもできます。
+この署名なしビルドでは、Tauri の署名付きアップデーターを有効にしていません。更新するには Koharu を終了し、この Repository の GitHub Releases から新しい Installer を実行してください。
 
 次は[最初のプロジェクト](/ja-JP/getting-started/first-project/)を作成します。ハードウェア選択とキャッシュについては[ランタイム、モデル、ハードウェア](/ja-JP/getting-started/runtime-models-and-hardware/)を参照してください。
 

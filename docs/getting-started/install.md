@@ -1,6 +1,6 @@
 ---
 title: Install Koharu
-description: Install and launch a Koharu release build.
+description: Install a release build, launch Koharu, and keep it updated.
 ---
 
 # Install Koharu
@@ -21,7 +21,7 @@ Downloads require access to GitHub release assets and, for model weights, Huggin
 
 ## Updates
 
-Koharu checks this repository's published GitHub releases and can launch the matching Windows installer from inside the application. You can also close Koharu and install the newer package manually from GitHub Releases.
+This unsigned build does not enable Tauri's signed updater. To update, close Koharu and run the newer installer from this repository's GitHub Releases page.
 
 ## Next step
 

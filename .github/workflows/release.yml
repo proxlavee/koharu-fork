@@ -24,12 +24,27 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+      - name: Verify downloadable Windows ML runtimes
+        shell: bash
+        run: |
+          base=https://github.com/proxlavee/koharu-fork/releases/download
+          assets=(
+            "$base/llama.cpp-b9982/llama-cuda-windows-2022.tar.gz"
+            "$base/llama.cpp-b9982/llama-hip-windows-2022.tar.gz"
+            "$base/llama.cpp-b9982/llama-vulkan-windows-2022.tar.gz"
+            "$base/stable-diffusion.cpp-master-769-cc73429/stable-diffusion-cuda-windows-2022.tar.gz"
+            "$base/stable-diffusion.cpp-master-769-cc73429/stable-diffusion-hip-windows-2022.tar.gz"
+            "$base/stable-diffusion.cpp-master-769-cc73429/stable-diffusion-vulkan-windows-2022.tar.gz"
+          )
+          for asset in "${assets[@]}"; do
+            curl.exe --fail --silent --show-error --location --head \
+              --retry 4 --retry-all-errors "$asset" >/dev/null
+          done
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-x86_64-pc-windows-msvc
       - uses: ilammy/msvc-dev-cmd@v1
-
       - uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
@@ -40,19 +55,18 @@ jobs:
           key: ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
           restore-keys: |
             ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-
-
       - run: bun install --frozen-lockfile
       - name: Validate release version
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tag must be vMAJOR.MINOR.PATCH, got $GITHUB_REF_NAME" >&2
+            printf 'Release tag must be vMAJOR.MINOR.PATCH, got %s\n' "$GITHUB_REF_NAME" >&2
             exit 1
           fi
           manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           if [[ "$version" != "$manifest_version" ]]; then
-            echo "Release tag version $version does not match Cargo workspace version $manifest_version" >&2
+            printf 'Release tag version %s does not match Cargo workspace version %s\n' "$version" "$manifest_version" >&2
             exit 1
           fi
           printf 'APP_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
@@ -66,30 +80,23 @@ jobs:
         run: cargo test --workspace --tests --locked
       - name: Run UI tests
         run: bun run --filter @koharu/app test
-      - run: bun run --filter @koharu/app build
-      - name: Build desktop application
-        run: cargo build -p koharu --release --locked --target x86_64-pc-windows-msvc
-      - name: Bundle Windows installer
-        run: >-
-          cargo run -p koharu-bundle --locked --
-          --package nsis
-          --target x86_64-pc-windows-msvc
-          --executable target/x86_64-pc-windows-msvc/release/koharu.exe
-          --libraries target/release/koharu-torch.dll
-          --ui packages/koharu/out
-          --license LICENSE
-          --output target/bundle/windows
-          --version "${{ env.APP_VERSION }}"
-      - name: Smoke-test installed Windows application
+      - name: Build unsigned Windows installer
+        run: cargo tauri build --ci --no-sign --bundles nsis -- --locked
+      - name: Validate and smoke-test installer
         shell: bash
-        run: >-
-          bash .github/scripts/windows-startup-smoke.sh
-          "target/bundle/windows/bundle/nsis/Koharu_${{ env.APP_VERSION }}_x64-setup.exe"
+        run: |
+          shopt -s nullglob
+          installers=(target/release/bundle/nsis/*-setup.exe)
+          if (( ${#installers[@]} != 1 )); then
+            printf 'Expected one NSIS installer, found %s\n' "${#installers[@]}" >&2
+            exit 1
+          fi
+          bash .github/scripts/windows-startup-smoke.sh "${installers[0]}"
       - name: Publish Windows release
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           body_path: release-notes.md
-          files: target/bundle/windows/bundle/nsis/Koharu_${{ env.APP_VERSION }}_x64-setup.exe
+          files: target/release/bundle/nsis/*-setup.exe
           draft: false
           fail_on_unmatched_files: true

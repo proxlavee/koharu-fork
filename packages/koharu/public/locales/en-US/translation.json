@@ -480,6 +480,8 @@
     "yourProjects": "Your projects"
   },
   "startup": {
+    "failureStatus": "Initialization failed",
+    "failureTitle": "Koharu could not start",
     "description": "Loading local AI runtimes and preparing the workspace. First launch can take a moment.",
     "opening": "Opening Koharu…",
     "status": "Initializing local runtimes",
@@ -505,7 +507,6 @@
   },
   "updater": {
     "available": {
-      "description": "Koharu {{version}} is ready to install.",
       "title": "Update available"
     },
     "close": "Close",

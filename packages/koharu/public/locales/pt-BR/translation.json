@@ -480,6 +480,8 @@
     "yourProjects": "Seus projetos"
   },
   "startup": {
+    "failureStatus": "Falha na inicialização",
+    "failureTitle": "Não foi possível iniciar o Koharu",
     "description": "Carregando os runtimes locais de IA e preparando o espaço de trabalho. A primeira inicialização pode levar alguns instantes.",
     "opening": "Abrindo o Koharu…",
     "status": "Inicializando runtimes locais",
@@ -505,7 +507,6 @@
   },
   "updater": {
     "available": {
-      "description": "O Koharu {{version}} está pronto para instalar.",
       "title": "Atualização disponível"
     },
     "close": "Fechar",

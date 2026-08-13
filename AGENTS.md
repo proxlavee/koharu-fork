@@ -4,6 +4,7 @@ Document only durable, repository-specific constraints here. Do not record curre
 
 ## Change Policy
 
+- Do not create commits or push branches or tags unless the user explicitly authorizes that Git action after the changes are ready for review.
 - Never add backward compatibility. When an API, schema, configuration, or ownership boundary changes, update every in-repository consumer and remove the replaced form.
 - Prefer a coherent ownership redesign over aliases, forwarding layers, compatibility parsers, or cosmetic renaming.
 - Keep responsibilities self-contained. Defaults and provider-specific behavior belong to the component that owns them rather than a central list of special cases.

@@ -480,6 +480,8 @@
     "yourProjects": "Tus proyectos"
   },
   "startup": {
+    "failureStatus": "Error de inicialización",
+    "failureTitle": "Koharu no pudo iniciarse",
     "description": "Cargando los entornos locales de IA y preparando el espacio de trabajo. El primer inicio puede tardar un momento.",
     "opening": "Abriendo Koharu…",
     "status": "Inicializando entornos locales",
@@ -505,7 +507,6 @@
   },
   "updater": {
     "available": {
-      "description": "Koharu {{version}} está listo para instalarse.",
       "title": "Actualización disponible"
     },
     "close": "Cerrar",

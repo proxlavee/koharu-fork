@@ -34,4 +34,5 @@ jobs:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
       - run: bun install --frozen-lockfile
-      - run: bun run --filter @koharu/app test
+      - name: Run headless Vitest suite
+        run: bun run --filter @koharu/app test

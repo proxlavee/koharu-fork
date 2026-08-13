@@ -480,6 +480,8 @@
     "yourProjects": "你的專案"
   },
   "startup": {
+    "failureStatus": "初始化失敗",
+    "failureTitle": "Koharu 無法啟動",
     "description": "正在載入本機 AI 執行環境並準備工作區。首次啟動可能需要一些時間。",
     "opening": "正在開啟 Koharu…",
     "status": "正在初始化本機執行環境",
@@ -505,7 +507,6 @@
   },
   "updater": {
     "available": {
-      "description": "Koharu {{version}} 已可安裝。",
       "title": "有可用更新"
     },
     "close": "關閉",

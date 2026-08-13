@@ -480,6 +480,8 @@
     "yourProjects": "Projeleriniz"
   },
   "startup": {
+    "failureStatus": "Başlatma başarısız",
+    "failureTitle": "Koharu başlatılamadı",
     "description": "Yerel yapay zekâ çalışma zamanları yükleniyor ve çalışma alanı hazırlanıyor. İlk açılış biraz sürebilir.",
     "opening": "Koharu açılıyor…",
     "status": "Yerel çalışma zamanları başlatılıyor",
@@ -505,7 +507,6 @@
   },
   "updater": {
     "available": {
-      "description": "Koharu {{version}} yüklenmeye hazır.",
       "title": "Güncelleme mevcut"
     },
     "close": "Kapat",
