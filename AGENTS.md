@@ -46,6 +46,8 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Optimize for fast development and iteration. By default, run the smallest relevant check or focused test once using the debug profile.
 - Do not run full test suites, repeatedly rerun unchanged tests or builds, or build and test profiles other than debug unless the user explicitly requests it.
 - Run end-to-end tests only when the user explicitly asks for them.
+- Treat compile, bundle, install, and launch as separate contracts for desktop runtime, native dependency, and packaging changes. Verify feature and configuration propagation at every boundary, inspect a clean installed payload, and gate publication on launching that installed artifact; never infer a later boundary from an earlier one passing.
+- When upstream alignment is in scope, fetch and review upstream again immediately before final validation instead of relying on an earlier snapshot.
 
 ## Desktop UI Debugging
 
