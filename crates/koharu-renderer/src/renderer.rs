@@ -56,11 +56,6 @@ const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
 const MINIMUM_FONT_SIZE: f32 = 9.0;
-// Keep automatically translated text near the source's detected glyph scale.
-// manga-image-translator uses 0.7 as its default downscale constraint and notes
-// that further balloon-area shrinking commonly makes text too small.
-// https://github.com/zyddnys/manga-image-translator/blob/95227a2bb0fd306cd4f0c104d57284026f991b3a/manga_translator/rendering/text_render_eng.py#L336-L353
-const MINIMUM_DETECTED_FONT_RATIO: f32 = 0.7;
 
 #[derive(Clone)]
 pub struct Renderer {
@@ -870,7 +865,10 @@ impl Traversal<'_> {
                 .and_then(|value| value.font_style)
                 .map(Into::into),
             font_size: typography.as_ref().and_then(|value| value.size),
-            minimum_font_size: resolve_minimum_font_size(typography.as_ref()),
+            // A detected source size is a ceiling, not a readability floor. The
+            // translated string can be substantially longer than the source, so
+            // forcing a percentage of that size makes narrow regions overflow.
+            minimum_font_size: MINIMUM_FONT_SIZE,
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
@@ -1517,14 +1515,6 @@ fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
     })
 }
 
-fn resolve_minimum_font_size(typography: Option<&Typography>) -> f32 {
-    typography
-        .filter(|typography| typography.auto_fit && !matches!(&typography.origin, Origin::User))
-        .and_then(|typography| typography.size)
-        .map(|font_size| (font_size * MINIMUM_DETECTED_FONT_RATIO).max(MINIMUM_FONT_SIZE))
-        .unwrap_or(MINIMUM_FONT_SIZE)
-}
-
 struct CachedNode {
     node: Arc<RetainedNode>,
     last_used: u64,
@@ -1918,14 +1908,6 @@ mod tests {
                 .unwrap()
                 .sizing,
             StrokeSizing::Absolute
-        );
-        assert_eq!(
-            resolve_minimum_font_size(Some(&typography(generated, true))),
-            16.8
-        );
-        assert_eq!(
-            resolve_minimum_font_size(Some(&typography(Origin::User, true))),
-            MINIMUM_FONT_SIZE
         );
     }
 

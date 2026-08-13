@@ -497,7 +497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automatic_size_preserves_free_text_default_and_balloon_extent() {
+    fn detected_size_caps_growth_without_preventing_region_fit() {
         let descriptor = TextNodeDescriptor {
             entity: EntityId::new(),
             text: "Hi".to_owned(),
@@ -534,6 +534,10 @@ mod tests {
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
         assert_eq!(maximum_font_size(&descriptor, bounds, true), 6.0);
         assert_eq!(font_size_limits(&descriptor, bounds, true), (9.0, 9.0));
+
+        let mut large_source = descriptor;
+        large_source.font_size = Some(30.0);
+        assert_eq!(font_size_limits(&large_source, bounds, true), (9.0, 30.0));
     }
 
     #[test]
