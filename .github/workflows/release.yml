@@ -88,7 +88,23 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          bun git-cliff --current --strip all > release-notes-full.md
+          previous=
+          while IFS= read -r candidate; do
+            if [[ "$candidate" != "$GITHUB_REF_NAME" ]]; then
+              previous=$candidate
+              break
+            fi
+          done < <(git tag --merged "$GITHUB_REF_NAME" --list '[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname)
+
+          if [[ -n "$previous" ]]; then
+            range="$previous..$GITHUB_REF_NAME"
+          elif git merge-base --is-ancestor v0.64.2-flux-fill-dev "$GITHUB_REF_NAME"; then
+            range="v0.64.2-flux-fill-dev..$GITHUB_REF_NAME"
+          else
+            range="$GITHUB_REF_NAME"
+          fi
+          printf 'Generating release notes for %s\n' "$range"
+          bun git-cliff --strip all "$range" > release-notes-full.md
           head -c 120000 release-notes-full.md > release-notes.md
           printf '\n\nThis Windows installer is unsigned and may trigger Microsoft Defender SmartScreen.\n' >> release-notes.md
       - name: Run Rust tests
