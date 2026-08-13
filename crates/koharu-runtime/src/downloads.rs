@@ -1,7 +1,8 @@
 use std::sync::{
-    Arc, LazyLock,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use futures::TryStreamExt;
@@ -9,19 +10,23 @@ use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::broadcast,
+    sync::{Semaphore, broadcast},
     task::JoinSet,
 };
 
 use crate::network::{DownloadClient, download_client};
 
 const EVENT_CAPACITY: usize = 256;
+const MAX_CONCURRENT_PARTS: usize = 8;
+const MAX_PARTS_PER_TRANSFER: usize = 4;
 const MIN_PART_SIZE: u64 = 8 * 1024 * 1024;
 const MAX_PART_SIZE: u64 = 64 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static EVENTS: LazyLock<broadcast::Sender<Event>> =
     LazyLock::new(|| broadcast::channel(EVENT_CAPACITY).0);
+static PART_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_PARTS);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Event {
@@ -52,6 +57,79 @@ pub fn subscribe() -> broadcast::Receiver<Event> {
 
 pub(crate) struct Transfer {
     client: DownloadClient,
+}
+
+struct ProgressReporter {
+    id: u64,
+    name: String,
+    total: u64,
+    completed: AtomicU64,
+    state: Mutex<ProgressState>,
+}
+
+#[derive(Default)]
+struct ProgressState {
+    last_completed: u64,
+    last_published: Option<Instant>,
+}
+
+impl ProgressReporter {
+    fn new(id: u64, name: &str, total: u64) -> Self {
+        Self {
+            id,
+            name: name.to_owned(),
+            total,
+            completed: AtomicU64::new(0),
+            state: Mutex::new(ProgressState::default()),
+        }
+    }
+
+    fn advance(&self, amount: u64) {
+        let completed = self.completed.fetch_add(amount, Ordering::Relaxed) + amount;
+        self.report(completed, false);
+    }
+
+    fn completed(&self) -> u64 {
+        self.completed.load(Ordering::Relaxed)
+    }
+
+    fn finish(&self) {
+        self.report(self.completed(), true);
+    }
+
+    fn report(&self, completed: u64, force: bool) {
+        let publish_now = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .should_publish(completed, self.total, Instant::now(), force);
+        if publish_now {
+            publish(Event::Progress {
+                id: self.id,
+                name: self.name.clone(),
+                completed,
+                total: self.total,
+            });
+        }
+    }
+}
+
+impl ProgressState {
+    fn should_publish(&mut self, completed: u64, total: u64, now: Instant, force: bool) -> bool {
+        if completed <= self.last_completed {
+            return false;
+        }
+        let complete = total > 0 && completed >= total;
+        let due = self
+            .last_published
+            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_INTERVAL);
+        if !force && !complete && !due {
+            return false;
+        }
+        self.last_completed = completed;
+        self.last_published = Some(now);
+        true
+    }
 }
 
 impl Transfer {
@@ -141,25 +219,21 @@ impl Transfer {
             .error_for_status()?;
         let total = total.or(response.content_length()).unwrap_or(0);
         let mut file = tokio::fs::File::create(destination).await?;
-        let mut completed = 0;
+        let progress = ProgressReporter::new(id, name, total);
         let mut body = response.bytes_stream();
         while let Some(bytes) = body.try_next().await? {
             file.write_all(&bytes).await?;
-            completed += bytes.len() as u64;
-            publish(Event::Progress {
-                id,
-                name: name.to_owned(),
-                completed,
-                total,
-            });
+            progress.advance(bytes.len() as u64);
         }
         file.flush().await?;
+        let completed = progress.completed();
         if total > 0 {
             ensure!(
                 completed == total,
                 "{url} ended after {completed} of {total} bytes"
             );
         }
+        progress.finish();
         Ok(())
     }
 
@@ -178,12 +252,12 @@ impl Transfer {
 
         let concurrency = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(8)
-            .clamp(4, 32);
+            .unwrap_or(MAX_PARTS_PER_TRANSFER)
+            .clamp(2, MAX_PARTS_PER_TRANSFER);
         let part_size = total
             .div_ceil((concurrency * 4) as u64)
             .clamp(MIN_PART_SIZE, MAX_PART_SIZE);
-        let completed = Arc::new(AtomicU64::new(0));
+        let progress = Arc::new(ProgressReporter::new(id, name, total));
         let mut tasks = JoinSet::new();
 
         for start in (0..total).step_by(part_size as usize) {
@@ -201,35 +275,33 @@ impl Transfer {
                 destination.to_owned(),
                 start,
                 end,
-                total,
-                completed.clone(),
-                id,
-                name.to_owned(),
+                progress.clone(),
             ));
         }
         while let Some(result) = tasks.join_next().await {
             result.context("download task failed")??;
         }
         ensure!(
-            completed.load(Ordering::Relaxed) == total,
+            progress.completed() == total,
             "{url} download was incomplete"
         );
+        progress.finish();
         Ok(())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn fetch_part(
     client: DownloadClient,
     url: String,
     destination: std::path::PathBuf,
     start: u64,
     end: u64,
-    total: u64,
-    completed: Arc<AtomicU64>,
-    id: u64,
-    name: String,
+    progress: Arc<ProgressReporter>,
 ) -> Result<()> {
+    let _permit = PART_PERMITS
+        .acquire()
+        .await
+        .context("download part limiter closed")?;
     let response = client
         .get(&url)
         .header(header::RANGE, format!("bytes={start}-{end}"))
@@ -245,33 +317,34 @@ async fn fetch_part(
         .get(header::CONTENT_RANGE)
         .context("partial response omitted Content-Range")?
         .to_str()?;
-    let expected_range = format!("bytes {start}-{end}/{total}");
+    let expected_range = format!("bytes {start}-{end}/{}", progress.total);
     ensure!(
         actual_range == expected_range,
         "{url} returned Content-Range {actual_range}, expected {expected_range}"
     );
     let expected = end - start + 1;
-    let bytes = response.bytes().await?;
-    ensure!(
-        bytes.len() as u64 == expected,
-        "{url} returned {} bytes for a {expected}-byte range",
-        bytes.len()
-    );
-
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(destination)
         .await?;
     file.seek(std::io::SeekFrom::Start(start)).await?;
-    file.write_all(&bytes).await?;
+    let mut received = 0;
+    let mut body = response.bytes_stream();
+    while let Some(bytes) = body.try_next().await? {
+        let amount = bytes.len() as u64;
+        ensure!(
+            received + amount <= expected,
+            "{url} returned more than {expected} bytes for range {start}-{end}"
+        );
+        file.write_all(&bytes).await?;
+        received += amount;
+        progress.advance(amount);
+    }
     file.flush().await?;
-    let completed = completed.fetch_add(expected, Ordering::Relaxed) + expected;
-    publish(Event::Progress {
-        id,
-        name,
-        completed,
-        total,
-    });
+    ensure!(
+        received == expected,
+        "{url} returned {received} bytes for a {expected}-byte range"
+    );
     Ok(())
 }
 
@@ -310,5 +383,18 @@ mod tests {
         let event = Event::Finished { id: 42 };
         publish(event.clone());
         assert_eq!(receiver.try_recv().unwrap(), event);
+    }
+
+    #[test]
+    fn progress_updates_are_throttled_without_hiding_completion() {
+        let started = Instant::now();
+        let mut state = ProgressState::default();
+
+        assert!(state.should_publish(1, 100, started, false));
+        assert!(!state.should_publish(2, 100, started + PROGRESS_INTERVAL / 2, false));
+        assert!(state.should_publish(3, 100, started + PROGRESS_INTERVAL, false));
+        assert!(!state.should_publish(2, 100, started + PROGRESS_INTERVAL * 2, false));
+        assert!(state.should_publish(100, 100, started + PROGRESS_INTERVAL, false));
+        assert!(!state.should_publish(100, 100, started + PROGRESS_INTERVAL * 2, true));
     }
 }
