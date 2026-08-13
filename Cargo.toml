@@ -76,8 +76,8 @@ blake3 = "1.8"
 dunce = "1.0.5"
 rayon = "1.12"
 rust-embed = { version = "8.12", features = ["interpolate-folder-path"] }
-# disables `esaxx_fast` feature which is conflicting with `ort`
-tokenizers = { version = "0.23", features = ["onig"] }
+# Keep `esaxx_fast` disabled: its C++ build forces the static MSVC CRT, while ORT uses the dynamic CRT.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 strum = { version = "0.28", features = ["derive"] }
 sysinfo = { version = "0.39.6", features = ["system"] }
 zip = { version = "8.6", features = ["deflate"] }
