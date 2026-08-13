@@ -23,6 +23,16 @@ pub(super) struct ModelPaths {
 }
 
 #[derive(Debug)]
+struct ContextPlan {
+    paths: ModelPaths,
+    use_accelerator: bool,
+    max_vram: Option<String>,
+    stream_layers: bool,
+    backend: String,
+    params_backend: Option<String>,
+}
+
+#[derive(Debug)]
 pub(super) struct Model {
     context: Mutex<Context>,
 }
@@ -52,6 +62,25 @@ impl Model {
 }
 
 fn context_params(device: &crate::Device, paths: ModelPaths) -> ContextParams {
+    let plan = context_plan(device, paths);
+    ContextParams {
+        diffusion_model_path: Some(plan.paths.transformer),
+        clip_l_path: Some(plan.paths.clip_l),
+        t5xxl_path: Some(plan.paths.t5xxl),
+        vae_path: Some(plan.paths.vae),
+        enable_mmap: true,
+        flash_attention: plan.use_accelerator,
+        diffusion_flash_attention: plan.use_accelerator,
+        vae_format: VaeFormat::Flux,
+        max_vram: plan.max_vram,
+        stream_layers: plan.stream_layers,
+        backend: Some(plan.backend),
+        params_backend: plan.params_backend,
+        ..ContextParams::default()
+    }
+}
+
+fn context_plan(device: &crate::Device, paths: ModelPaths) -> ContextPlan {
     let use_accelerator = device.backend != Backend::Cpu;
     let backend = device.name.to_ascii_lowercase();
     let module_backends =
@@ -64,20 +93,13 @@ fn context_params(device: &crate::Device, paths: ModelPaths) -> ContextParams {
         // VAE on the accelerator avoids placing every component in host RAM.
         format!("te=cpu,diffusion={diffusion},vae={backend}")
     });
-    ContextParams {
-        diffusion_model_path: Some(paths.transformer),
-        clip_l_path: Some(paths.clip_l),
-        t5xxl_path: Some(paths.t5xxl),
-        vae_path: Some(paths.vae),
-        enable_mmap: true,
-        flash_attention: use_accelerator,
-        diffusion_flash_attention: use_accelerator,
-        vae_format: VaeFormat::Flux,
+    ContextPlan {
+        paths,
+        use_accelerator,
         max_vram,
         stream_layers,
-        backend: module_backends.or_else(|| Some("cpu".to_owned())),
+        backend: module_backends.unwrap_or_else(|| "cpu".to_owned()),
         params_backend: params_backends,
-        ..ContextParams::default()
     }
 }
 
@@ -115,24 +137,16 @@ mod tests {
     }
 
     #[test]
-    fn maps_flux_components_to_native_context_fields() {
-        let params = context_params(&crate::Device::cpu(), paths());
+    fn maps_flux_components_to_the_context_plan() {
+        let plan = context_plan(&crate::Device::cpu(), paths());
 
         assert_eq!(
-            params.diffusion_model_path.as_deref(),
-            Some(Path::new("transformer.gguf"))
+            plan.paths.transformer.as_path(),
+            Path::new("transformer.gguf")
         );
-        assert_eq!(
-            params.clip_l_path.as_deref(),
-            Some(Path::new("clip_l.safetensors"))
-        );
-        assert_eq!(params.t5xxl_path.as_deref(), Some(Path::new("t5xxl.gguf")));
-        assert!(params.llm_path.is_none());
-        assert_eq!(
-            params.vae_path.as_deref(),
-            Some(Path::new("ae.safetensors"))
-        );
-        assert_eq!(params.vae_format, VaeFormat::Flux);
+        assert_eq!(plan.paths.clip_l.as_path(), Path::new("clip_l.safetensors"));
+        assert_eq!(plan.paths.t5xxl.as_path(), Path::new("t5xxl.gguf"));
+        assert_eq!(plan.paths.vae.as_path(), Path::new("ae.safetensors"));
     }
 
     #[test]
@@ -140,27 +154,26 @@ mod tests {
         let mut device = crate::Device::cuda(0);
         device.memory_total = 16 * GIB;
 
-        let params = context_params(&device, paths());
+        let plan = context_plan(&device, paths());
 
+        assert_eq!(plan.backend, "te=cpu,diffusion=cuda0,vae=cuda0");
         assert_eq!(
-            params.backend.as_deref(),
-            Some("te=cpu,diffusion=cuda0,vae=cuda0")
-        );
-        assert_eq!(
-            params.params_backend.as_deref(),
+            plan.params_backend.as_deref(),
             Some("te=cpu,diffusion=cpu,vae=cuda0")
         );
-        assert_eq!(params.max_vram.as_deref(), Some("cuda0=12.0"));
-        assert!(params.stream_layers);
+        assert_eq!(plan.max_vram.as_deref(), Some("cuda0=12.0"));
+        assert!(plan.stream_layers);
+        assert!(plan.use_accelerator);
     }
 
     #[test]
     fn cpu_context_does_not_enable_accelerator_streaming() {
-        let params = context_params(&crate::Device::cpu(), paths());
+        let plan = context_plan(&crate::Device::cpu(), paths());
 
-        assert_eq!(params.backend.as_deref(), Some("cpu"));
-        assert!(params.params_backend.is_none());
-        assert!(params.max_vram.is_none());
-        assert!(!params.stream_layers);
+        assert_eq!(plan.backend, "cpu");
+        assert!(plan.params_backend.is_none());
+        assert!(plan.max_vram.is_none());
+        assert!(!plan.stream_layers);
+        assert!(!plan.use_accelerator);
     }
 }
