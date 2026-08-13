@@ -36,7 +36,12 @@ const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
 const ANGLE_SEARCH_HALF_STEPS: i32 = 90;
 const ANGLE_SEARCH_STEP_DEGREES: f64 = 0.5;
-const TYPOGRAPHY_SAMPLE_MARGIN: f32 = 2.0;
+// Decorative title backings can extend beyond a detector's tight box. Sample
+// far enough past them to distinguish the backing from the page artwork, while
+// preserving the same physical context across source resolutions.
+const TYPOGRAPHY_SAMPLE_MARGIN_PER_1024_PX: f32 = 8.0;
+const MIN_TYPOGRAPHY_SAMPLE_MARGIN: f32 = 4.0;
+const MAX_TYPOGRAPHY_SAMPLE_MARGIN: f32 = 64.0;
 const COLOR_SNAP_DARK_LUMINANCE: u32 = 64 * 256;
 const COLOR_SNAP_LIGHT_LUMINANCE: u32 = 191 * 256;
 const COLOR_CLUSTER_MIN_DISTANCE_SQUARED: u32 = 32 * 32;
@@ -667,20 +672,21 @@ fn infer_typography(
     let mask = &detection.mask;
     let width = image.width().min(mask.width);
     let height = image.height().min(mask.height);
+    let sample_margin = typography_sample_margin(width, height);
     let [bbox_left, bbox_top, bbox_right, bbox_bottom] = detection.bbox;
     let [left, top, right, bottom] = mask_window(
         [
-            bbox_left - TYPOGRAPHY_SAMPLE_MARGIN,
-            bbox_top - TYPOGRAPHY_SAMPLE_MARGIN,
-            bbox_right + TYPOGRAPHY_SAMPLE_MARGIN,
-            bbox_bottom + TYPOGRAPHY_SAMPLE_MARGIN,
+            bbox_left - sample_margin,
+            bbox_top - sample_margin,
+            bbox_right + sample_margin,
+            bbox_bottom + sample_margin,
         ],
         width,
         height,
     )?;
     let local_width = right - left + 2;
     let local_height = bottom - top + 2;
-    let background_margin = TYPOGRAPHY_SAMPLE_MARGIN.ceil() as u32;
+    let background_margin = sample_margin.ceil() as u32;
     let mut points = Vec::new();
     let mut pixels = Vec::new();
     let mut background = Vec::new();
@@ -735,6 +741,11 @@ fn infer_typography(
             WritingMode::Horizontal
         },
     })
+}
+
+fn typography_sample_margin(width: u32, height: u32) -> f32 {
+    (width.max(height) as f32 / 1024.0 * TYPOGRAPHY_SAMPLE_MARGIN_PER_1024_PX)
+        .clamp(MIN_TYPOGRAPHY_SAMPLE_MARGIN, MAX_TYPOGRAPHY_SAMPLE_MARGIN)
 }
 
 fn mask_window([left, top, right, bottom]: [f32; 4], width: u32, height: u32) -> Option<[u32; 4]> {
@@ -2150,6 +2161,42 @@ mod tests {
         )
     }
 
+    fn outlined_text_on_backing_beyond_tight_bounds() -> (RgbImage, KoharuLayoutDetection) {
+        let width = 1024;
+        let height = 128;
+        let [backing_left, backing_top, backing_right, backing_bottom] = [197, 49, 827, 79];
+        let mut image = RgbImage::from_pixel(width, height, Rgb([96, 96, 96]));
+        let mut pixels = vec![0; width as usize * height as usize];
+        for y in backing_top..backing_bottom {
+            for x in backing_left..backing_right {
+                pixels[y as usize * width as usize + x as usize] = u8::MAX;
+                image.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        for glyph_left in [220, 370, 520, 670] {
+            for y in 56..72 {
+                for x in glyph_left..glyph_left + 100 {
+                    image.put_pixel(x, y, Rgb([0, 0, 0]));
+                }
+            }
+        }
+        (
+            image,
+            KoharuLayoutDetection {
+                label_id: 0,
+                label: "text".to_owned(),
+                score: 1.0,
+                bbox: [200.0, 52.0, 824.0, 76.0],
+                area: pixels.iter().filter(|value| **value != 0).count() as u32,
+                mask: KoharuLayoutMask {
+                    width,
+                    height,
+                    pixels,
+                },
+            },
+        )
+    }
+
     #[tokio::test]
     async fn detected_typography_preserves_the_measured_outline() {
         let mut session = Session::memory().await.unwrap();
@@ -2494,6 +2541,17 @@ mod tests {
         assert_eq!(inferred.color, [0, 0, 0]);
         assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
         assert_eq!(inferred.stroke_width, Some(3.0));
+    }
+
+    #[test]
+    fn outlined_title_samples_past_its_backing_shape() {
+        let (image, detection) = outlined_text_on_backing_beyond_tight_bounds();
+
+        let inferred = infer_typography(&image, &detection).unwrap();
+
+        assert_eq!(inferred.color, [0, 0, 0]);
+        assert_eq!(inferred.stroke_color, Some([255, 255, 255]));
+        assert!(inferred.stroke_width.is_some_and(|width| width >= 4.0));
     }
 
     #[test]

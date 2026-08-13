@@ -18,6 +18,11 @@ use crate::{
     script::is_chinese_or_japanese_text,
 };
 
+// Detection measures a source outline in page pixels, but translated text may
+// auto-fit much smaller. Keep inferred outlines subordinate to the final glyphs;
+// explicit user-authored widths remain absolute.
+const MAX_INFERRED_STROKE_FONT_RATIO: f32 = 0.25;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextNodeDescriptor {
     pub(crate) entity: koharu_scene::EntityId,
@@ -64,6 +69,21 @@ pub(crate) struct RenderedTextMetadata {
 pub(crate) struct StrokeOptions {
     pub color: [u8; 4],
     pub width_px: f32,
+    pub scale_with_font: bool,
+}
+
+impl StrokeOptions {
+    fn for_font_size(self, font_size: f32) -> Self {
+        if !self.scale_with_font {
+            return self;
+        }
+        Self {
+            width_px: self
+                .width_px
+                .min((font_size * MAX_INFERRED_STROKE_FONT_RATIO).max(0.0)),
+            ..self
+        }
+    }
 }
 
 /// Paint options used when recording one laid-out text run into a Vello scene.
@@ -256,7 +276,10 @@ impl TextRenderer {
             ..TextRenderOptions::default()
         };
         let mut scene = Scene::new();
-        if let Some(stroke) = descriptor.stroke {
+        if let Some(stroke) = descriptor
+            .stroke
+            .map(|stroke| stroke.for_font_size(layout.font_size))
+        {
             options.stroke = Some(stroke);
         }
         self.render(
@@ -289,7 +312,7 @@ impl TextRenderer {
             width: layout.width,
             height: layout.height,
         };
-        let stroke_padding = descriptor
+        let stroke_padding = options
             .stroke
             .map_or(0.0, |stroke| stroke.width_px.max(0.0));
         Ok(RenderedTextNode {
@@ -477,5 +500,21 @@ mod tests {
 
         assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
         assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+    }
+
+    #[test]
+    fn inferred_strokes_scale_with_auto_fitted_text_but_user_strokes_do_not() {
+        let inferred = StrokeOptions {
+            color: [255; 4],
+            width_px: 10.0,
+            scale_with_font: true,
+        };
+        let user = StrokeOptions {
+            scale_with_font: false,
+            ..inferred
+        };
+
+        assert_eq!(inferred.for_font_size(12.0).width_px, 3.0);
+        assert_eq!(user.for_font_size(12.0).width_px, 10.0);
     }
 }

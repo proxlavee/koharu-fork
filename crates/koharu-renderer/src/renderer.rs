@@ -1501,6 +1501,7 @@ fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
     Some(StrokeOptions {
         color: typography.stroke_color.unwrap_or([u8::MAX; 4]),
         width_px,
+        scale_with_font: typography.auto_fit && !matches!(&typography.origin, Origin::User),
     })
 }
 
@@ -1855,6 +1856,43 @@ mod tests {
         assert_eq!(
             resolve_alignment(None, WritingMode::Horizontal, false),
             TextAlign::Center
+        );
+    }
+
+    #[test]
+    fn only_generated_auto_fit_strokes_follow_the_fitted_font_size() {
+        let typography = |origin: Origin, auto_fit: bool| Typography {
+            origin,
+            preferred_font: None,
+            font_weight: None,
+            font_style: None,
+            size: (!auto_fit).then_some(24.0),
+            auto_fit,
+            color: None,
+            stroke_color: Some([255; 4]),
+            stroke_width: Some(10.0),
+            alignment: None,
+            writing_mode: None,
+            extensions: BTreeMap::new(),
+        };
+        let generated = Origin::Generated(koharu_scene::Generation::new(
+            koharu_scene::ProducerId::new("dev.koharu.test").unwrap(),
+        ));
+
+        assert!(
+            resolve_stroke(Some(&typography(generated.clone(), true)))
+                .unwrap()
+                .scale_with_font
+        );
+        assert!(
+            !resolve_stroke(Some(&typography(generated, false)))
+                .unwrap()
+                .scale_with_font
+        );
+        assert!(
+            !resolve_stroke(Some(&typography(Origin::User, true)))
+                .unwrap()
+                .scale_with_font
         );
     }
 
