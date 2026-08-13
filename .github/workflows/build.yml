@@ -13,37 +13,38 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-2022]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    name: Windows
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
       - uses: ilammy/msvc-dev-cmd@v1
-        if: startsWith(matrix.os, 'windows')
+
       - uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
-      - run: bun install
-      - uses: actions/cache@v6
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @koharu/app build
+      - name: Build desktop application
+        run: cargo build -p koharu --release --locked --target x86_64-pc-windows-msvc
+      - name: Bundle Windows installer
+        run: >-
+          cargo run -p koharu-bundle --locked --
+          --package nsis
+          --target x86_64-pc-windows-msvc
+          --executable target/x86_64-pc-windows-msvc/release/koharu.exe
+          --libraries target/release/koharu-torch.dll
+          --ui packages/koharu/out
+          --license LICENSE
+          --output target/bundle/windows
+          --version "0.0.${{ github.run_number }}"
+
+      - uses: actions/upload-artifact@v7
         with:
-          path: ${{ github.workspace }}/packages/koharu/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('**/bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
-          restore-keys: |
-            ${{ runner.os }}-nextjs-${{ hashFiles('**/bun.lock') }}-
-      - run: bun tauri build --no-bundle
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: koharu-${{ matrix.os }}
-          path: |
-            target/release/koharu*
-            target/release/koharu-torch.dll
-            target/release/libkoharu-torch.so
-            target/release/libkoharu-torch.dylib
+          name: koharu-windows
+          path: target/bundle/windows/bundle/nsis/*.exe
           retention-days: 3

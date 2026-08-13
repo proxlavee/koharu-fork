@@ -3,80 +3,112 @@ name: Release
 on:
   push:
     tags:
-      - '*'
+      - 'v*.*.*'
 
 permissions:
   contents: write
-  id-token: write
-  packages: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: 'windows-2022'
-            args: ''
-
-    runs-on: ${{ matrix.platform }}
+  prepare:
+    name: Create draft release
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
-
       - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be vMAJOR.MINOR.PATCH, got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+      - name: Generate release notes
+        shell: bash
+        run: |
+          bun git-cliff --current --strip all > release-notes-full.md
+          head -c 120000 release-notes-full.md > release-notes.md
+          printf '\n\nThis Windows installer is unsigned and may trigger Microsoft Defender SmartScreen.\n' >> release-notes.md
+      - name: Create or update draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: true
+
+  release:
+    name: Windows
+    needs: prepare
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: oven-sh/setup-bun@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+      - uses: ilammy/msvc-dev-cmd@v1
 
       - uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
-
-      - name: Install dependencies
-        run: bun install
-
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
       - uses: actions/cache@v6
         with:
-          path: ${{ github.workspace }}/packages/koharu/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('**/bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
+          path: packages/koharu/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
           restore-keys: |
-            ${{ runner.os }}-nextjs-${{ hashFiles('**/bun.lock') }}-
+            ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run headless Rust tests
-        run: cargo test --workspace --tests
-
-      - name: Run headless Vitest suite
-        run: bun run --filter @koharu/app test
-
-      - name: Generate release changelog
-        id: release_notes
+      - run: bun install --frozen-lockfile
+      - name: Validate release version
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          {
-            echo 'release_body<<EOF'
-            bun git-cliff --current --strip all | head -c 120000
-            echo ""
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-
-
-
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be vMAJOR.MINOR.PATCH, got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          printf 'APP_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+      - name: Run Rust tests
+        run: cargo test --workspace --tests --locked
+      - name: Run UI tests
+        run: bun run --filter @koharu/app test
+      - run: bun run --filter @koharu/app build
+      - name: Build desktop application
+        run: cargo build -p koharu --release --locked --target x86_64-pc-windows-msvc
+      - name: Bundle Windows installer
+        run: >-
+          cargo run -p koharu-bundle --locked --
+          --package nsis
+          --target x86_64-pc-windows-msvc
+          --executable target/x86_64-pc-windows-msvc/release/koharu.exe
+          --libraries target/release/koharu-torch.dll
+          --ui packages/koharu/out
+          --license LICENSE
+          --output target/bundle/windows
+          --version "${{ env.APP_VERSION }}"
+      - name: Upload Windows installer
+        uses: softprops/action-gh-release@v3
         with:
-          tauriScript: npx @tauri-apps/cli
-          tagName: ${{ github.ref_name }}
-          releaseName: ${{ github.ref_name }}
-          releaseBody: ${{ steps.release_notes.outputs.release_body }}
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
+          files: target/bundle/windows/bundle/nsis/Koharu_${{ env.APP_VERSION }}_x64-setup.exe
+          draft: true
+          fail_on_unmatched_files: true
+
+  publish:
+    name: Publish GitHub release
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false

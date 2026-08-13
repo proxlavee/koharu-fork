@@ -1,11 +1,11 @@
 'use client'
 
-import { relaunch } from '@tauri-apps/plugin-process'
-import { check, type Update } from '@tauri-apps/plugin-updater'
 import { Download, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Trans, useTranslation } from 'react-i18next'
+import { useTranslation } from 'react-i18next'
 
+import { subscribeAppEvents } from '@/lib/events'
+import { commands, type UpdateInfo } from '@/lib/protocol'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -21,9 +21,9 @@ import { Progress } from '@koharu/ui/components/progress'
 import { ScrollArea } from '@koharu/ui/components/scroll-area'
 
 type UpdateState =
-  | { kind: 'available'; update: Update }
-  | { kind: 'downloading'; update: Update; downloaded: number; total: number | null }
-  | { kind: 'error'; update: Update; message: string }
+  | { kind: 'available'; update: UpdateInfo }
+  | { kind: 'downloading'; update: UpdateInfo; downloaded: number; total: number | null }
+  | { kind: 'error'; update: UpdateInfo; message: string }
 
 export function Updater() {
   const { t } = useTranslation()
@@ -31,69 +31,62 @@ export function Updater() {
 
   useEffect(() => {
     let active = true
-    void check()
+    void commands
+      .checkUpdate()
       .then((update) => {
-        if (active && update) {
-          setState({ kind: 'available', update })
-        } else if (update) {
-          void update.close()
-        }
+        if (active && update) setState({ kind: 'available', update })
       })
       .catch(() => undefined)
+    const stopProgress = subscribeAppEvents((event) => {
+      if (!active || event.type !== 'update_progress') return
+      setState((current) => {
+        if (current?.kind !== 'downloading' || current.update.version !== event.progress.version) {
+          return current
+        }
+        return {
+          ...current,
+          downloaded: event.progress.downloaded,
+          total: event.progress.total,
+        }
+      })
+    })
     return () => {
       active = false
+      stopProgress()
     }
   }, [])
 
-  const install = (update: Update) => {
-    let downloaded = 0
-    let total: number | null = null
-    setState({ kind: 'downloading', update, downloaded, total })
-    void update
-      .downloadAndInstall((event) => {
-        if (event.event === 'Started') {
-          downloaded = 0
-          total = event.data.contentLength ?? null
-        } else if (event.event === 'Progress') {
-          downloaded += event.data.chunkLength
-        }
-        setState({ kind: 'downloading', update, downloaded, total })
+  const install = (update: UpdateInfo) => {
+    setState({ kind: 'downloading', update, downloaded: 0, total: null })
+    void commands.installUpdate(update.version).catch((error: unknown) => {
+      setState({
+        kind: 'error',
+        update,
+        message: error instanceof Error ? error.message : String(error),
       })
-      .then(() => relaunch())
-      .catch((error: unknown) => {
-        setState({
-          kind: 'error',
-          update,
-          message: error instanceof Error ? error.message : String(error),
-        })
-      })
+    })
   }
 
   if (!state) return null
 
   const downloading = state.kind === 'downloading'
   const percent =
-    downloading && state.total
-      ? Math.min(100, (state.downloaded / state.total) * 100)
-      : null
+    downloading && state.total ? Math.min(100, (state.downloaded / state.total) * 100) : null
 
   return (
     <AlertDialog
       open
       onOpenChange={(open) => {
-        if (!open && !downloading) {
-          void state.update.close()
-          setState(null)
-        }
+        if (!open && !downloading) setState(null)
       }}
     >
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogMedia>
             {state.kind === 'error' ? (
-              <RefreshCw className='size-5' />
+              <RefreshCw className='size-5' aria-hidden />
             ) : (
-              <Download className='size-5' />
+              <Download className='size-5' aria-hidden />
             )}
           </AlertDialogMedia>
           <AlertDialogTitle>
@@ -103,18 +96,12 @@ export function Updater() {
                 ? t('updater.downloading.title')
                 : t('updater.error.title')}
           </AlertDialogTitle>
-          <AlertDialogDescription>
-            {state.kind === 'available' ? (
-              <Trans
-                i18nKey='updater.available.description'
-                values={{ version: state.update.version }}
-                components={{ strong: <strong className='font-medium text-foreground' /> }}
-              />
-            ) : state.kind === 'downloading' ? (
-              t('updater.downloading.subtitle', { version: state.update.version })
-            ) : (
-              t('updater.error.description')
-            )}
+          <AlertDialogDescription aria-live='polite'>
+            {state.kind === 'available'
+              ? t('updater.available.description', { version: state.update.version })
+              : state.kind === 'downloading'
+                ? t('updater.downloading.subtitle', { version: state.update.version })
+                : t('updater.error.description')}
           </AlertDialogDescription>
         </AlertDialogHeader>
 
@@ -128,7 +115,7 @@ export function Updater() {
         )}
         {state.kind === 'downloading' && (
           <Progress value={percent} aria-label={t('updater.downloading.title')}>
-            <span className='ml-auto text-xs tabular-nums text-muted-foreground'>
+            <span className='ml-auto text-xs text-muted-foreground tabular-nums'>
               {percent === null ? '…' : `${Math.round(percent)}%`}
             </span>
           </Progress>
