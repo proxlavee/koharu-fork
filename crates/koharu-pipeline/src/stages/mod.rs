@@ -12,9 +12,7 @@ use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
 pub use inpainting::{Flux1FillDevConfig, Flux2KleinConfig, RoremMixedConfig};
 
-use crate::{
-    Bounds, ImageCache, InpaintingMask, ModelCell, PipelineConfig, ProgressSink, Stage, StopToken,
-};
+use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, ProgressSink, Stage, StopToken};
 
 #[derive(Clone)]
 pub(crate) struct StageInput {
@@ -71,45 +69,10 @@ impl StageInput {
     }
 }
 
-trait ModelState: Send + Sync {
-    fn loaded(&self) -> bool;
-    fn unload(&self) -> bool;
-    fn touch(&self, sequence: u64);
-    fn last_used(&self) -> u64;
-}
-
-impl<M: Send> ModelState for ModelCell<M> {
-    fn loaded(&self) -> bool {
-        ModelCell::loaded(self)
-    }
-
-    fn unload(&self) -> bool {
-        ModelCell::unload(self)
-    }
-
-    fn touch(&self, sequence: u64) {
-        ModelCell::touch(self, sequence);
-    }
-
-    fn last_used(&self) -> u64 {
-        ModelCell::last_used(self)
-    }
-}
-
-struct ModelRef<'a> {
-    name: &'static str,
-    state: &'a dyn ModelState,
-}
-
-impl<'a> ModelRef<'a> {
-    fn new(name: &'static str, state: &'a dyn ModelState) -> Self {
-        Self { name, state }
-    }
-}
-
 #[async_trait]
 trait StageProcessor: Send + Sync {
-    fn model(&self) -> ModelRef<'_>;
+    fn model(&self) -> &'static str;
+    fn unload(&self) -> bool;
     async fn load(&self) -> Result<()>;
     async fn process(&self, input: StageInput) -> Result<Patch>;
 }
@@ -145,7 +108,7 @@ impl Stages {
     }
 
     pub(crate) fn model(&self, stage: Stage) -> &'static str {
-        self.processor(stage).model().name
+        self.processor(stage).model()
     }
 
     pub(crate) async fn load(&self, stage: Stage) -> Result<()> {
@@ -156,20 +119,8 @@ impl Stages {
         self.processor(stage).process(input).await
     }
 
-    pub(crate) fn loaded(&self, stage: Stage) -> bool {
-        self.processor(stage).model().state.loaded()
-    }
-
     pub(crate) fn unload(&self, stage: Stage) -> bool {
-        self.processor(stage).model().state.unload()
-    }
-
-    pub(crate) fn touch(&self, stage: Stage, sequence: u64) {
-        self.processor(stage).model().state.touch(sequence);
-    }
-
-    pub(crate) fn last_used(&self, stage: Stage) -> u64 {
-        self.processor(stage).model().state.last_used()
+        self.processor(stage).unload()
     }
 }
 

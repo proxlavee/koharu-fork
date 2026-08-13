@@ -474,7 +474,6 @@ mod tests {
             translation: TranslationConfig::default(),
             inpainting: InpaintingModel::Flux2Klein(Flux2KleinConfig {
                 prompt: "Keep the line art.".to_owned(),
-                ..Default::default()
             }),
             processor: ProcessorConfig::default(),
         };
