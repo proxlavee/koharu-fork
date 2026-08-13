@@ -12,6 +12,11 @@ keywords.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Tauri's bundler resolves CEF from app-level features; workspace inheritance alone
+# compiles CEF but leaves its runtime files out of Windows installers.
+default = ["tauri/cef"]
+
 [dependencies]
 alphanumeric-sort = { workspace = true }
 anyhow = { workspace = true }

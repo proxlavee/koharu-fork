@@ -126,7 +126,6 @@ pollster = "0.4"
 vello = "0.9"
 winit = "0.30.12"
 tauri = { version = "=2.11.5", default-features = false, features = [
-    "cef",
     "compression",
     "dbus",
     "dynamic-acl",
