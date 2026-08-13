@@ -209,13 +209,31 @@ fn merge_directory(source: &Path, destination: &Path) -> Result<()> {
                 continue;
             }
             if std::fs::rename(&source, &destination).is_err() {
-                std::fs::copy(&source, &destination).with_context(|| {
+                let parent = destination.parent().with_context(|| {
                     format!(
-                        "failed to copy {} to {}",
+                        "runtime store file has no parent: {}",
+                        destination.display()
+                    )
+                })?;
+                let stage = tempfile::NamedTempFile::new_in(parent)
+                    .with_context(|| format!("failed to stage {}", destination.display()))?
+                    .into_temp_path();
+                std::fs::copy(&source, &stage).with_context(|| {
+                    format!(
+                        "failed to stage {} for {}",
                         source.display(),
                         destination.display()
                     )
                 })?;
+                match stage.persist(&destination) {
+                    Ok(_) => {}
+                    Err(error) if destination.is_file() => drop(error.path),
+                    Err(error) => {
+                        return Err(error.error).with_context(|| {
+                            format!("failed to publish {}", destination.display())
+                        });
+                    }
+                }
                 std::fs::remove_file(&source)
                     .with_context(|| format!("failed to remove {}", source.display()))?;
             }
