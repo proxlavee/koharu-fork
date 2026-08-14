@@ -350,17 +350,89 @@ impl TextRenderer {
     }
 }
 
+fn content_aware_maximum_font_size(
+    descriptor: &TextNodeDescriptor,
+    bounds: LayoutBox,
+) -> f32 {
+    let text = descriptor.text.trim();
+    if text.is_empty() || bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return 24.0;
+    }
+
+    let w = bounds.width;
+    let h = bounds.height;
+
+    if descriptor.writing_mode.is_vertical() {
+        return h.max(24.0);
+    }
+
+    // Effective width-units per character. CJK chars are ~1.0 em wide, Latin ~0.55 em, spaces ~0.25 em.
+    let mut eff_char_width_sum = 0.0f32;
+    let mut max_word_em = 0.0f32;
+    let mut current_word_em = 0.0f32;
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            eff_char_width_sum += 0.25;
+            max_word_em = max_word_em.max(current_word_em);
+            current_word_em = 0.0;
+        } else if is_cjk_char(c) {
+            eff_char_width_sum += 1.0;
+            // CJK text can break between almost any character or Jieba word boundary.
+            // Treat each CJK character as its own breakable unit or small 2-char token.
+            max_word_em = max_word_em.max(current_word_em);
+            current_word_em = 1.0;
+        } else {
+            eff_char_width_sum += 0.55;
+            current_word_em += 0.55;
+        }
+    }
+    max_word_em = max_word_em.max(current_word_em).max(0.55);
+
+    let total_em = eff_char_width_sum.max(0.55);
+    let ar = (w / h).clamp(0.2, 5.0);
+
+    // Estimate lines L needed to fit text into container aspect ratio
+    let est_lines = (total_em / (ar * 1.8)).sqrt().clamp(1.0, 10.0);
+
+    // Area-based estimate: text area ~ total_em * font_size * (1.2 * font_size) <= fill_ratio * W * H
+    let area = w * h;
+    let fill_ratio = 0.50f32;
+    let s_area = (area * fill_ratio / (total_em * 1.2)).sqrt();
+
+    // For single short words/phrases (<= 8 char ems), cap line height fraction to 40% of container height
+    let s_height = if total_em <= 8.0 {
+        h * 0.40
+    } else {
+        h / (est_lines * 1.2 + 0.2)
+    };
+
+    // Word-width estimate: longest unbreakable word must fit in bubble width
+    let s_word = w / (max_word_em * 1.05);
+
+    let s_content = s_area.min(s_height).min(s_word);
+    let s_max = s_content.min(w.max(h));
+
+    s_max.max(descriptor.minimum_font_size).max(12.0)
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |
+        '\u{3400}'..='\u{4DBF}' |
+        '\u{3040}'..='\u{309F}' |
+        '\u{30A0}'..='\u{30FF}' |
+        '\u{AC00}'..='\u{D7AF}'
+    )
+}
+
 fn automatic_maximum(
     descriptor: &TextNodeDescriptor,
     bounds: LayoutBox,
     is_bubble_text: bool,
 ) -> f32 {
     if is_bubble_text {
-        if descriptor.writing_mode.is_vertical() {
-            bounds.height
-        } else {
-            bounds.width
-        }
+        content_aware_maximum_font_size(descriptor, bounds)
     } else {
         24.0
     }
@@ -371,9 +443,16 @@ fn maximum_font_size(
     bounds: LayoutBox,
     is_bubble_text: bool,
 ) -> f32 {
-    descriptor
-        .font_size
-        .unwrap_or_else(|| automatic_maximum(descriptor, bounds, is_bubble_text))
+    if descriptor.auto_fit && is_bubble_text {
+        let content_max = content_aware_maximum_font_size(descriptor, bounds);
+        descriptor
+            .font_size
+            .map_or(content_max, |fs| fs.min(content_max))
+    } else {
+        descriptor
+            .font_size
+            .unwrap_or_else(|| automatic_maximum(descriptor, bounds, is_bubble_text))
+    }
 }
 
 fn font_size_limits(
@@ -531,13 +610,55 @@ mod tests {
         };
 
         assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
-        assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds, true), 48.0);
         assert_eq!(maximum_font_size(&descriptor, bounds, true), 6.0);
         assert_eq!(font_size_limits(&descriptor, bounds, true), (9.0, 9.0));
 
         let mut large_source = descriptor;
         large_source.font_size = Some(30.0);
         assert_eq!(font_size_limits(&large_source, bounds, true), (9.0, 30.0));
+    }
+
+    #[test]
+    fn content_aware_maximum_font_size_prevents_oversized_short_texts() {
+        let descriptor = TextNodeDescriptor {
+            entity: EntityId::new(),
+            text: "Hello".to_owned(),
+            language: None,
+            width: 200.0,
+            height: 100.0,
+            balloon_contour: Some(vec![(0.0, 0.0), (200.0, 0.0), (200.0, 100.0), (0.0, 100.0)]),
+            flow_contour: None,
+            preferred_font: Some("Arial".to_owned()),
+            font_families: vec!["Arial".to_owned()],
+            font_weight: None,
+            font_style: None,
+            font_size: None,
+            minimum_font_size: 9.0,
+            auto_fit: true,
+            alignment: TextAlign::Center,
+            writing_mode: WritingMode::Horizontal,
+            foreground_color: [0, 0, 0, 255],
+            stroke: None,
+            line_height: 1.2,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
+            text_inset: [8.0; 4],
+            point_text: false,
+        };
+        let bounds = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 100.0,
+        };
+
+        let max_font_size = content_aware_maximum_font_size(&descriptor, bounds);
+        // "Hello" is 5 characters in a 200x100 bubble.
+        // Old logic gave max = width = 200.0.
+        // Content aware caps height-based (100 * 0.4 = 40.0) and area-based.
+        assert!(max_font_size <= 45.0, "expected reasonable font size for 'Hello', got {max_font_size}");
+        assert!(max_font_size >= 12.0, "expected font size above readable floor, got {max_font_size}");
     }
 
     #[test]

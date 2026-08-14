@@ -849,6 +849,11 @@ impl Traversal<'_> {
             dependencies.insert(RenderDependency::Font(family.clone()));
         }
         let is_bubble = balloon_contour.is_some();
+        let inset_val = if is_bubble {
+            (frame.bounds.width.min(frame.bounds.height) * 0.05).clamp(4.0, 16.0)
+        } else {
+            4.0
+        };
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -880,7 +885,7 @@ impl Traversal<'_> {
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
-            text_inset: [4.0; 4],
+            text_inset: [inset_val; 4],
             point_text: !is_bubble && layout.kind == TextLayoutKind::Point,
         };
         Ok(Some(LayerDraft {
