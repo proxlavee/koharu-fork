@@ -206,7 +206,7 @@ impl TextRenderer {
                 entity: descriptor.entity,
                 source,
             })?;
-        let (minimum, maximum) = font_size_limits(descriptor, bounds, is_bubble_text);
+        let (minimum, maximum) = font_size_limits(descriptor, bounds);
         let mut layout = TextLayout::new(&fonts[0])
             .with_fallback_fonts(&fonts[1..])
             .with_writing_mode(descriptor.writing_mode)
@@ -423,41 +423,22 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
-fn automatic_maximum(
-    descriptor: &TextNodeDescriptor,
-    bounds: LayoutBox,
-    is_bubble_text: bool,
-) -> f32 {
-    if is_bubble_text {
-        content_aware_maximum_font_size(descriptor, bounds)
-    } else {
-        24.0
-    }
-}
-
 fn maximum_font_size(
     descriptor: &TextNodeDescriptor,
     bounds: LayoutBox,
-    is_bubble_text: bool,
 ) -> f32 {
-    if descriptor.auto_fit && is_bubble_text {
-        let content_max = content_aware_maximum_font_size(descriptor, bounds);
-        descriptor
-            .font_size
-            .map_or(content_max, |fs| fs.min(content_max))
+    if descriptor.auto_fit {
+        content_aware_maximum_font_size(descriptor, bounds)
     } else {
-        descriptor
-            .font_size
-            .unwrap_or_else(|| automatic_maximum(descriptor, bounds, is_bubble_text))
+        descriptor.font_size.unwrap_or(24.0)
     }
 }
 
 fn font_size_limits(
     descriptor: &TextNodeDescriptor,
     bounds: LayoutBox,
-    is_bubble_text: bool,
 ) -> (f32, f32) {
-    let maximum = maximum_font_size(descriptor, bounds, is_bubble_text);
+    let maximum = maximum_font_size(descriptor, bounds);
     let maximum = if descriptor.auto_fit {
         maximum.max(descriptor.minimum_font_size)
     } else {
@@ -586,7 +567,7 @@ mod tests {
             font_families: vec!["Arial".to_owned()],
             font_weight: None,
             font_style: None,
-            font_size: Some(6.0),
+            font_size: None,
             minimum_font_size: 9.0,
             auto_fit: true,
             alignment: TextAlign::Center,
@@ -606,14 +587,9 @@ mod tests {
             height: 120.0,
         };
 
-        assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
-        assert_eq!(automatic_maximum(&descriptor, bounds, true), 48.0);
-        assert_eq!(maximum_font_size(&descriptor, bounds, true), 6.0);
-        assert_eq!(font_size_limits(&descriptor, bounds, true), (9.0, 9.0));
-
-        let mut large_source = descriptor;
-        large_source.font_size = Some(30.0);
-        assert_eq!(font_size_limits(&large_source, bounds, true), (9.0, 30.0));
+        let max_font_size = maximum_font_size(&descriptor, bounds);
+        assert!(max_font_size >= 12.0 && max_font_size <= 60.0);
+        assert_eq!(font_size_limits(&descriptor, bounds), (9.0, max_font_size));
     }
 
     #[test]
