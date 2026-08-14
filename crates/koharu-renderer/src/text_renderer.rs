@@ -350,10 +350,7 @@ impl TextRenderer {
     }
 }
 
-fn content_aware_maximum_font_size(
-    descriptor: &TextNodeDescriptor,
-    bounds: LayoutBox,
-) -> f32 {
+fn content_aware_maximum_font_size(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> f32 {
     let text = descriptor.text.trim();
     if text.is_empty() || bounds.width <= 0.0 || bounds.height <= 0.0 {
         return 24.0;
@@ -657,8 +654,14 @@ mod tests {
         // "Hello" is 5 characters in a 200x100 bubble.
         // Old logic gave max = width = 200.0.
         // Content aware caps height-based (100 * 0.4 = 40.0) and area-based.
-        assert!(max_font_size <= 45.0, "expected reasonable font size for 'Hello', got {max_font_size}");
-        assert!(max_font_size >= 12.0, "expected font size above readable floor, got {max_font_size}");
+        assert!(
+            max_font_size <= 45.0,
+            "expected reasonable font size for 'Hello', got {max_font_size}"
+        );
+        assert!(
+            max_font_size >= 12.0,
+            "expected font size above readable floor, got {max_font_size}"
+        );
     }
 
     #[test]
