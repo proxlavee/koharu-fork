@@ -18,7 +18,6 @@ clap = { workspace = true }
 console = { workspace = true }
 dirs = { workspace = true }
 koharu-app = { workspace = true }
-koharu-desktop = { workspace = true }
 koharu-runtime = { workspace = true }
 koharu-torch = { workspace = true }
 koharu-torch-sys = { workspace = true }
@@ -36,3 +35,11 @@ windows = { workspace = true, features = ["Win32_System_Console"] }
 
 [build-dependencies]
 tauri-build = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = [
+    "koharu-torch-sys",
+    "serde_json",
+    "tauri-build",
+    "tauri-plugin-opener",
+]
