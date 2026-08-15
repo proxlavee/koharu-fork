@@ -23,14 +23,11 @@ pub(crate) struct GeometryFrame {
 }
 
 pub(crate) fn contour(geometry: &Geometry, frame: GeometryFrame) -> Vec<(f32, f32)> {
-    if geometry.points.len() > MAX_CONTOUR_POINTS {
-        return Vec::new();
-    }
     let bounds = frame.bounds;
     let center_x = bounds.x + bounds.width * 0.5;
     let center_y = bounds.y + bounds.height * 0.5;
     let (sin, cos) = (-frame.angle_degrees.to_radians()).sin_cos();
-    geometry
+    let mut points: Vec<(f32, f32)> = geometry
         .points
         .iter()
         .map(|point| {
@@ -41,7 +38,47 @@ pub(crate) fn contour(geometry: &Geometry, frame: GeometryFrame) -> Vec<(f32, f3
                 x * sin + y * cos + center_y - bounds.y,
             )
         })
-        .collect()
+        .collect();
+    // A densely-traced segmentation mask can produce far more vertices than the
+    // contour engine is willing to walk. Dropping the contour silently makes the
+    // renderer fall back to a bounding-box ellipse, discarding the bubble's real
+    // shape exactly when it is most irregular. Simplify the polygon first — the
+    // transform above is rigid, so Douglas-Peucker distances are preserved — and
+    // only treat the geometry as unusable when simplification cannot recover a
+    // usable vertex count.
+    if points.len() > MAX_CONTOUR_POINTS {
+        points = simplify_closed_to_budget(points, MAX_CONTOUR_POINTS);
+    }
+    points
+}
+
+/// Simplify a closed polygon until it has at most `budget` vertices.
+///
+/// Starts at a tolerance scaled to the polygon's own extent and doubles it until
+/// the simplified vertex count fits, so lightly-traced contours keep nearly all
+/// their detail while densely-traced ones collapse to their load-bearing corners.
+fn simplify_closed_to_budget(polygon: Vec<(f32, f32)>, budget: usize) -> Vec<(f32, f32)> {
+    if polygon.len() <= budget || polygon.len() < 3 {
+        return polygon;
+    }
+    let Some((min_x, max_x, min_y, max_y)) = polygon_bounds(&polygon) else {
+        return polygon;
+    };
+    let scale = (max_x - min_x).max(max_y - min_y).max(1.0);
+    let mut tolerance = scale * 0.0025;
+    for _ in 0..24 {
+        let indices = simplify_closed_indices(&polygon, tolerance);
+        let simplified: Vec<(f32, f32)> = indices.into_iter().map(|i| polygon[i]).collect();
+        if simplified.len() <= budget && simplified.len() >= 3 {
+            return simplified;
+        }
+        tolerance *= 2.0;
+    }
+    // Even aggressive simplification could not fit the budget. Return the most
+    // aggressive attempt rather than an empty contour so the renderer still
+    // receives the bubble's coarse shape instead of falling back to an ellipse.
+    let indices = simplify_closed_indices(&polygon, tolerance);
+    indices.into_iter().map(|i| polygon[i]).collect()
 }
 
 pub(crate) fn point_in_frame(frame: GeometryFrame, x: f32, y: f32) -> (f32, f32) {
@@ -1134,5 +1171,79 @@ mod tests {
             let end = polygon[(index + 1) % polygon.len()];
             (start == first && end == second) || (start == second && end == first)
         })
+    }
+
+    #[test]
+    fn contour_simplifies_dense_geometry_instead_of_dropping_it() {
+        // A circle traced at one-vertex-per-pixel produces thousands of points.
+        // The old behavior returned an empty contour, forcing an ellipse fallback.
+        let radius = 240.0_f64;
+        let samples = MAX_CONTOUR_POINTS + 512;
+        let mut points = Vec::with_capacity(samples);
+        for index in 0..samples {
+            let angle = 2.0 * std::f64::consts::PI * index as f64 / samples as f64;
+            points.push(Point {
+                x: 300.0 + radius * angle.cos(),
+                y: 300.0 + radius * angle.sin(),
+            });
+        }
+        let geometry = Geometry {
+            origin: Origin::User,
+            points,
+        };
+        let frame = GeometryFrame {
+            bounds: LayoutBox {
+                x: 60.0,
+                y: 60.0,
+                width: 480.0,
+                height: 480.0,
+            },
+            angle_degrees: 0.0,
+        };
+
+        let contour = contour(&geometry, frame);
+
+        // The contour survives instead of being silently dropped...
+        assert!(!contour.is_empty());
+        // ...and is brought under the cap so the rest of the engine can walk it.
+        assert!(contour.len() <= MAX_CONTOUR_POINTS);
+        assert!(contour.len() >= 3);
+        // The simplified polygon still describes the same disk: every retained
+        // vertex lies on the original circle, and the bounding box is preserved.
+        for &(x, y) in &contour {
+            let dx = x - (300.0 - 60.0);
+            let dy = y - (300.0 - 60.0);
+            assert!(
+                (dx.hypot(dy) - radius as f32).abs() < 1.5,
+                "simplified vertex {x},{y} drifted off the source circle"
+            );
+        }
+        let (min_x, max_x, min_y, max_y) = polygon_bounds(&contour).expect("non-empty contour");
+        assert!((max_x - min_x - 2.0 * radius as f32).abs() < 6.0);
+        assert!((max_y - min_y - 2.0 * radius as f32).abs() < 6.0);
+    }
+
+    #[test]
+    fn contour_preserves_small_polygons_below_the_cap_unchanged() {
+        let geometry = Geometry {
+            origin: Origin::User,
+            points: vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 100.0, y: 0.0 },
+                Point { x: 100.0, y: 80.0 },
+                Point { x: 0.0, y: 80.0 },
+            ],
+        };
+        let frame = GeometryFrame {
+            bounds: LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 80.0,
+            },
+            angle_degrees: 0.0,
+        };
+        let contour = contour(&geometry, frame);
+        assert_eq!(contour.len(), 4);
     }
 }

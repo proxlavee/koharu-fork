@@ -89,24 +89,6 @@ impl ImageCache {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_entry_larger_than_the_budget_is_not_cached() {
-        let blob = BlobId::for_bytes(b"oversized");
-        let image = Arc::new(DecodedImage {
-            width: 2,
-            height: 1,
-            pixels: Arc::from([0_u8; 8]),
-        });
-        let mut cache = ImageCache::with_limit(4);
-        cache.insert(blob, image);
-        assert!(cache.get(blob).is_none());
-        assert_eq!(cache.bytes, 0);
-    }
-}
 
 pub(crate) fn decode(
     blob: BlobId,
@@ -132,4 +114,23 @@ pub(crate) fn decode(
             pixels: Arc::from(decoded.into_raw()),
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_larger_than_the_budget_is_not_cached() {
+        let blob = BlobId::for_bytes(b"oversized");
+        let image = Arc::new(DecodedImage {
+            width: 2,
+            height: 1,
+            pixels: Arc::from([0_u8; 8]),
+        });
+        let mut cache = ImageCache::with_limit(4);
+        cache.insert(blob, image);
+        assert!(cache.get(blob).is_none());
+        assert_eq!(cache.bytes, 0);
+    }
 }

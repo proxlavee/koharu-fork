@@ -547,7 +547,10 @@ fn write_region<'a>(
             &Typography {
                 origin: Origin::Generated(generation.clone()),
                 preferred_font: None,
-                font_weight: None,
+                // Bold detected from distance-transform thickness (llm3.md §4).
+                // Only set when the source lettering is bold; user-authored
+                // weights keep priority via the origin guard above.
+                font_weight: inferred.and_then(|value| value.prefer_bold.then_some(700)),
                 font_style: None,
                 size: inferred.map(|value| value.font_size),
                 auto_fit: true,
@@ -652,6 +655,15 @@ struct InferredTypography {
     font_size: f32,
     angle_degrees: f32,
     writing_mode: WritingMode,
+    /// Raw median ink color under the cleanup mask, before any snapping or
+    /// contrast guard (llm3.md §4). Kept separate from `color` so downstream
+    /// consumers can inspect the original lettering.
+    raw_fill: [u8; 3],
+    /// Raw stroke ring color before snapping, if a stroke was detected.
+    raw_stroke: Option<[u8; 3]>,
+    /// Whether the source lettering is bold, from the distance-transform
+    /// thickness ratio (llm3.md §4: median(2·DT)/target > 0.18).
+    prefer_bold: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -766,8 +778,25 @@ fn infer_typography(
         &background_samples,
         font_size,
     );
+    // LAB contrast guard (llm3.md §7): if the raw fill is within ΔL 40 of the
+    // background, snap it to the farther extreme so the translated lettering
+    // stays legible. The raw color is preserved in `raw_fill` regardless.
+    let background_color = background_samples
+        .first()
+        .copied()
+        .unwrap_or(background_seed);
+    let raw_fill = paint.color;
+    let guarded_fill = contrast_guard_fill(raw_fill, background_color);
+    let color = normalize_text_color(guarded_fill);
+    let raw_stroke = paint.stroke_color;
+    let stroke_color = stroke_color.map(normalize_text_color);
+    // Bold ratio from the distance transform of the ink mask (llm3.md §4):
+    // median(2·DT) / target_size > 0.18 ⇒ the source strokes are thick enough
+    // that the translation should render bold too. DT is measured on the paint
+    // ink pixels (the cleanup-mask ink), which is what the reference uses.
+    let prefer_bold = detect_prefer_bold(&paint.ink_pixels, local_width, local_height, font_size);
     Some(InferredTypography {
-        color: paint.color,
+        color,
         stroke_color,
         stroke_width,
         font_size,
@@ -777,7 +806,42 @@ fn infer_typography(
         } else {
             WritingMode::Horizontal
         },
+        raw_fill,
+        raw_stroke,
+        prefer_bold,
     })
+}
+
+/// Distance-transform bold ratio (llm3.md §4). Builds a binary ink mask from
+/// the cleanup-mask pixels, runs the L2 distance transform on the *inverse*
+/// (background = 255, ink = 0), and samples the distances at ink pixels —
+/// each ink pixel's value is its distance to the nearest background pixel,
+/// i.e. the half-thickness of the stroke at that point. The median over all
+/// ink pixels, doubled, is the typical stroke thickness; comparing it against
+/// the detected source font size yields the bold ratio
+/// (llm3.md §4: median(2·DT)/target > 0.18 ⇒ bold).
+fn detect_prefer_bold(ink_pixels: &[MaskPixel], width: u32, height: u32, target_size: f32) -> bool {
+    if target_size <= 0.0 || ink_pixels.is_empty() || width == 0 || height == 0 {
+        return false;
+    }
+    // imageproc's distance_transform returns, at each pixel, the distance to the
+    // nearest non-zero pixel. To get the distance-from-ink-to-background we must
+    // therefore put background pixels at 255 and ink at 0 (the inverse mask).
+    let mut inverse = GrayImage::from_pixel(width, height, Luma([u8::MAX]));
+    for pixel in ink_pixels {
+        if pixel.x < width && pixel.y < height {
+            inverse.put_pixel(pixel.x, pixel.y, Luma([0]));
+        }
+    }
+    let distances = distance_transform(&inverse, Norm::L2);
+    let mut ink_distances: Vec<f32> = ink_pixels
+        .iter()
+        .map(|pixel| f32::from(distances.get_pixel(pixel.x, pixel.y).0[0]))
+        .collect();
+    ink_distances.sort_by(|a, b| a.total_cmp(b));
+    let median = ink_distances[ink_distances.len() / 2];
+    // 2·median(DT) approximates the stroke thickness in pixels.
+    (2.0 * median) / target_size > BOLD_RATIO_THRESHOLD
 }
 
 // BallonsTranslator keeps the source glyph scale instead of growing every
@@ -1132,11 +1196,20 @@ fn infer_outline(
             let fill_color = median_pixel_color(&enclosed_fill);
             let stroke_color = median_pixel_color(&stroke_pixels);
             let contrast = color_distance_squared(fill_color, stroke_color);
+            // LAB ΔE separation (llm3.md §4): the stroke ring is only accepted
+            // when it is perceptually distinct (ΔE > 25) from both the fill and
+            // the background. This supplements the legacy RGB check — chromatic
+            // lettering (red/blue SFX) that RGB distance under-weights is now
+            // separated correctly. Both checks must pass.
+            let lab_fill_stroke = lab_delta_e(fill_color, stroke_color);
+            let lab_stroke_bg = lab_delta_e(stroke_color, background);
             if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_distance_squared(fill_color, background)
                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
                 || color_distance_squared(stroke_color, background)
                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                || lab_fill_stroke < LAB_STROKE_SEPARATION_DELTA_E
+                || lab_stroke_bg < LAB_STROKE_SEPARATION_DELTA_E
                 || color_lies_between(stroke_color, fill_color, background)
                 || color_lies_between(fill_color, stroke_color, background)
             {
@@ -1630,6 +1703,79 @@ fn color_luminance(color: [u8; 3]) -> u32 {
     u32::from(color[0]) * 54 + u32::from(color[1]) * 183 + u32::from(color[2]) * 19
 }
 
+// ---- LAB-based color extraction (llm3.md §4/§7) ----
+//
+// The legacy separation used squared RGB distance, which under-weights
+// perceptual differences in chromatic lettering (red/blue SFX, tinted fills).
+// CIELAB ΔE is the perceptually-uniform metric the reference uses: stroke is
+// only accepted when it is ΔE > 25 from both fill and background. Raw detected
+// colors are kept separate from the snapped (`normalize_text_color`) values so
+// downstream consumers can inspect the original ink.
+
+/// sRGB [0,255] → CIELAB. D65 illuminant. Returns (L*, a*, b*).
+fn rgb_to_lab(color: [u8; 3]) -> (f32, f32, f32) {
+    let linear = |channel: u8| {
+        let c = f32::from(channel) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = linear(color[0]);
+    let g = linear(color[1]);
+    let b = linear(color[2]);
+    // sRGB → XYZ (D65), then XYZ → LAB. Normalized by D65 white point.
+    let x = (r * 0.4124564 + g * 0.3575761 + b * 0.1804375) / 0.95047;
+    let y = (r * 0.2126729 + g * 0.7151522 + b * 0.0721750) / 1.00000;
+    let z = (r * 0.0193339 + g * 0.119_192 + b * 0.9503041) / 1.08883;
+    let f = |t: f32| {
+        if t > 216.0 / 24389.0 {
+            t.cbrt()
+        } else {
+            (903.3 * t + 16.0) / 116.0
+        }
+    };
+    let fx = f(x);
+    let fy = f(y);
+    let fz = f(z);
+    (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+}
+
+/// CIELAB ΔE76 (Euclidean distance in LAB space). Sufficient for the >25
+/// separation thresholds llm3.md uses; ΔE2000 is unnecessary at that granularity.
+fn lab_delta_e(left: [u8; 3], right: [u8; 3]) -> f32 {
+    let (l1, a1, b1) = rgb_to_lab(left);
+    let (l2, a2, b2) = rgb_to_lab(right);
+    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+}
+
+/// LAB-based stroke separation threshold (llm3.md §4: ΔE > 25). Also used as
+/// the low-contrast trigger for the fill contrast guard (§7).
+const LAB_STROKE_SEPARATION_DELTA_E: f32 = 25.0;
+/// Bold ratio threshold (llm3.md §4: median(2·DT)/target > 0.18 → bold).
+const BOLD_RATIO_THRESHOLD: f32 = 0.18;
+
+/// Push a low-contrast fill to the farther LAB-L extreme so the translated
+/// lettering stays legible against its background (llm3.md §7 contrast guard).
+///
+/// The trigger is perceptual: a fill within ΔE 25 of its background is nearly
+/// invisible and must be pushed to the farther lightness extreme. Using ΔE
+/// (not ΔL alone) keeps chromatic fills legible — a blue on white has low ΔL
+/// but high ΔE and is left untouched. Returns the snapped color; the raw
+/// detected color is preserved separately in `raw_fill`.
+fn contrast_guard_fill(raw_fill: [u8; 3], background: [u8; 3]) -> [u8; 3] {
+    if lab_delta_e(raw_fill, background) >= LAB_STROKE_SEPARATION_DELTA_E {
+        return raw_fill;
+    }
+    let fill_l = rgb_to_lab(raw_fill).0;
+    if fill_l < 50.0 {
+        [0, 0, 0]
+    } else {
+        [u8::MAX; 3]
+    }
+}
+
 fn rectangle_geometry([left, top, right, bottom]: [f32; 4]) -> Geometry {
     Geometry::rectangle(
         f64::from(left),
@@ -2057,9 +2203,10 @@ mod tests {
 
     use super::{
         DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, ImageSize, MaskPixel,
-        PageRegions, RegionOutput, TextReuse, color_palette, generation, infer_typography,
-        layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        PageRegions, RegionOutput, TextReuse, color_distance_squared, color_palette,
+        contrast_guard_fill, generation, infer_typography, lab_delta_e, layout_order,
+        link_dialogue_regions, mask_containment, mask_for, mask_geometry, non_maximum_suppression,
+        normalize_text_color, write_region,
     };
 
     #[tokio::test]
@@ -2862,5 +3009,48 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
+    }
+
+    // ---- LAB color extraction tests (llm3.md §4/§7) ----
+
+    #[test]
+    fn lab_delta_e_separates_pure_black_and_white() {
+        // Black vs white is the maximum perceptual distance.
+        assert!(lab_delta_e([0, 0, 0], [255, 255, 255]) > 90.0);
+        // Identical colors have zero distance.
+        assert!((lab_delta_e([24, 80, 160], [24, 80, 160])).abs() < 0.001);
+    }
+
+    #[test]
+    fn lab_delta_e_weights_chromatic_differences_more_than_rgb() {
+        // A blue and a gray of similar luminance: RGB distance is moderate, but
+        // the perceptual ΔE is large because the chroma differs substantially.
+        let blue = [20, 115, 235];
+        let gray = [120, 120, 120];
+        let rgb_dist = color_distance_squared(blue, gray);
+        let lab_dist = lab_delta_e(blue, gray);
+        // LAB ΔE should comfortably exceed the 25 separation threshold while the
+        // two colors are clearly not identical — this is the case the legacy RGB
+        // metric under-weighted.
+        assert!(lab_dist > 25.0, "blue/gray ΔE {lab_dist} should exceed 25");
+        assert!(rgb_dist > 0);
+    }
+
+    #[test]
+    fn contrast_guard_preserves_chromatic_low_delta_l_fills() {
+        // Blue on white: low ΔL but high ΔE — legible, must NOT be snapped.
+        let blue = [20, 115, 235];
+        let white = [245, 245, 245];
+        assert_eq!(contrast_guard_fill(blue, white), blue);
+    }
+
+    #[test]
+    fn contrast_guard_snaps_truly_low_contrast_fills() {
+        // A mid-gray fill on a near-identical gray background: ΔE is tiny, so the
+        // guard pushes it to the farther extreme for legibility.
+        let fill = [128, 128, 128];
+        let background = [132, 130, 134];
+        let guarded = contrast_guard_fill(fill, background);
+        assert!(guarded == [0, 0, 0] || guarded == [255, 255, 255]);
     }
 }

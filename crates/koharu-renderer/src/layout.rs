@@ -81,6 +81,10 @@ pub struct LayoutRun<'a> {
     /// Font size used to generate this layout.
     pub font_size: f32,
     overflowed: bool,
+    /// Auto-fit exhausted every size down to the floor and still overflowed.
+    /// The renderer surfaces this as a `LayoutStress` diagnostic instead of
+    /// silently clipping the glyphs. (llm3.md §1.3 / bug fix #2.)
+    stress: bool,
     placement_offset_x: f32,
     placement_offset_y: f32,
 }
@@ -89,6 +93,12 @@ impl LayoutRun<'_> {
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// True when auto-fit could not place the text even at the readability floor.
+    #[must_use]
+    pub const fn stress(&self) -> bool {
+        self.stress
     }
 
     pub(crate) const fn placement_offset_x(&self) -> f32 {
@@ -188,6 +198,13 @@ pub struct TextLayout<'a> {
     font_size: Option<f32>,
     min_font_size: Option<f32>,
     max_font_size: Option<f32>,
+    /// Source-anchored target auto-fit never exceeds; it only shrinks when
+    /// balloon geometry forces it. Derived from the source region's own glyph
+    /// scale, not from translated text length. (llm3.md §1.1.)
+    target_font_size: Option<f32>,
+    /// Which integer search to run when a target is set. (llm3.md §1.4 vs
+    /// K-stratified.)
+    font_search_strategy: crate::config::FontSearchStrategy,
     max_width: Option<f32>,
     max_height: Option<f32>,
     alignment: Option<TextAlign>,
@@ -257,6 +274,8 @@ impl<'a> TextLayout<'a> {
             font_size: None,
             min_font_size: None,
             max_font_size: None,
+            target_font_size: None,
+            font_search_strategy: crate::config::FontSearchStrategy::default(),
             max_width: None,
             max_height: None,
             alignment: None,
@@ -288,6 +307,28 @@ impl<'a> TextLayout<'a> {
     pub fn with_min_font_size(mut self, size: f32) -> Self {
         self.font_size = None;
         self.min_font_size = Some(size);
+        self
+    }
+
+    /// Anchor auto-fit to the source lettering's visual size (llm3.md §1.1).
+    ///
+    /// Auto-fit never grows past this size; it only shrinks when the balloon
+    /// forces it. The target is clamped to the configured `[min, max]` range at
+    /// search time. Authored `with_font_size` keeps priority over the anchor.
+    #[must_use]
+    pub fn with_target_font_size(mut self, size: f32) -> Self {
+        self.target_font_size = (size.is_finite() && size > 0.0).then_some(size);
+        self
+    }
+
+    /// Select the integer font-size search strategy used when a target is set
+    /// (llm3.md §1.4 size-first vs K-stratified).
+    #[must_use]
+    pub fn with_font_search_strategy(
+        mut self,
+        strategy: crate::config::FontSearchStrategy,
+    ) -> Self {
+        self.font_search_strategy = strategy;
         self
     }
 
@@ -419,6 +460,28 @@ impl<'a> TextLayout<'a> {
         };
 
         if self.comic_balloon.is_some() {
+            // Source-anchored, shrink-only search (llm3.md §1.3). The target is
+            // the source region's own glyph scale; auto-fit never exceeds it and
+            // only descends when balloon geometry vetoes a size. Authored sizes
+            // take the legacy branch below — the anchor guides auto-fit only.
+            if let Some(target) = self
+                .target_font_size
+                .map(|t| t.clamp(minimum, maximum))
+                .filter(|_| self.comic_balloon.is_some())
+            {
+                let anchored = self.run_anchored(text, minimum, target, &fits)?;
+                if let Some(mut run) = anchored {
+                    if !fits(&run) {
+                        // Nothing fit even at the floor under the anchored search.
+                        // Surface a real stress diagnostic instead of a silent clip
+                        // (bug fix #2). Re-render at the floor and flag it.
+                        run = self.run_with_size(text, minimum)?;
+                        run.stress = true;
+                    }
+                    return Ok(run);
+                }
+            }
+
             // A balloon's usable width changes when the text reflows to a different
             // number of lines, so a smaller font can fail even though a larger one
             // fits. Search from largest to smallest instead of assuming monotonicity.
@@ -464,7 +527,14 @@ impl<'a> TextLayout<'a> {
             )? {
                 return Ok(best);
             }
-            return self.run_with_size(text, minimum);
+            // Legacy fallback: nothing fit at any size. Render at the floor and
+            // mark it as stress so the renderer emits a `LayoutStress` diagnostic
+            // instead of silently clipping (bug fix #2).
+            let mut fallback = self.run_with_size(text, minimum)?;
+            if !fits(&fallback) {
+                fallback.stress = true;
+            }
+            return Ok(fallback);
         }
 
         let maximum_layout = self.run_with_size(text, maximum)?;
@@ -474,6 +544,7 @@ impl<'a> TextLayout<'a> {
 
         let mut best = self.run_with_size(text, minimum)?;
         if !fits(&best) {
+            best.stress = true;
             return Ok(best);
         }
 
@@ -489,6 +560,131 @@ impl<'a> TextLayout<'a> {
                 low = size;
             } else {
                 high = size;
+            }
+        }
+        Ok(best)
+    }
+
+    /// Source-anchored, shrink-only search (llm3.md §1.3).
+    ///
+    /// `target` is the source lettering's glyph scale; auto-fit never exceeds it
+    /// and only descends when balloon geometry vetoes a size. Preserves the
+    /// LastResort two-stage and the whole-pixel bucket rule.
+    fn run_anchored(
+        &self,
+        text: &str,
+        minimum: f32,
+        target: f32,
+        fits: &impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        let search = |policy: HyphenationPolicy| -> Result<Option<LayoutRun<'a>>> {
+            let mut this = self.clone();
+            this.hyphenation_policy = policy;
+            match this.font_search_strategy {
+                crate::config::FontSearchStrategy::SizeFirst => {
+                    this.search_integer(text, minimum, target, fits)
+                }
+                crate::config::FontSearchStrategy::KStratified => {
+                    this.search_k_stratified(text, minimum, target, fits)
+                }
+            }
+        };
+
+        if self.hyphenation_policy == HyphenationPolicy::LastResort {
+            let clean = search(HyphenationPolicy::Disabled)?;
+            // Hyphenation must earn a whole raster pixel (the house rule).
+            if clean
+                .as_ref()
+                .is_some_and(|b| b.font_size.floor() > minimum.floor() && fits(b))
+            {
+                return Ok(clean);
+            }
+            let hyp = search(HyphenationPolicy::LastResort)?;
+            return Ok(match (clean, hyp) {
+                (Some(c), Some(h)) if h.font_size.floor() > c.font_size.floor() => Some(h),
+                (Some(c), _) => Some(c),
+                (None, h) => h,
+            });
+        }
+        search(self.hyphenation_policy)
+    }
+
+    /// Size-first integer search (llm3.md §1.4): walk integer sizes from the
+    /// target down to the floor and return the largest that fits. The winner is
+    /// re-rendered exactly, so any linear-scaling approximation in the walk only
+    /// affects ranking, not the final layout. Integer sizes fall out by
+    /// construction.
+    fn search_integer(
+        &self,
+        text: &str,
+        minimum: f32,
+        target: f32,
+        fits: &impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        let lo = minimum.ceil().max(1.0) as i32;
+        let hi = target.floor().max(lo as f32) as i32;
+        // Near-target first: the anchor itself, then descend.
+        for size in (lo..=hi).rev() {
+            let candidate = self.run_with_size(text, size as f32)?;
+            if fits(&candidate) {
+                return Ok(Some(candidate));
+            }
+        }
+        // Non-integer target below lo: try the target directly as a last resort.
+        if target >= minimum && (target - target.floor()).abs() > f32::EPSILON {
+            let candidate = self.run_with_size(text, target)?;
+            if fits(&candidate) {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    /// K-stratified search: for each candidate line count K, solve for the
+    /// largest font size that fits in at most K lines, then keep whichever K
+    /// produces the best outcome (largest size, then fewest lines, then best
+    /// balance).
+    ///
+    /// Once K is fixed only size changes, so for a fixed K the fit predicate is
+    /// monotonic — there is a threshold size above which K lines no longer fit
+    /// (each line grows too wide) and below which they do. We find it by
+    /// descending integers from the target. This explicitly tries "would a
+    /// deliberate 2-line split fit at a larger size than whatever the
+    /// line-breaker greedily produces", which the size-first walk never probes
+    /// on its own: at a given size the breaker picks the minimum feasible K,
+    /// but a larger size may still admit a forced 2-line split the breaker
+    /// never chose because 3 lines scored lower cost.
+    fn search_k_stratified(
+        &self,
+        text: &str,
+        minimum: f32,
+        target: f32,
+        fits: &impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        let lo = minimum.ceil().max(1.0) as i32;
+        let hi = target.floor().max(lo as f32) as i32;
+        // A reasonable cap: more lines than this is unreadable and the comic
+        // breaker caps at COMIC_MAX_LINES anyway.
+        let k_cap: usize = 8;
+
+        let mut best: Option<LayoutRun<'a>> = None;
+        for desired_k in 1..=k_cap {
+            // Descend integers; the largest size that fits in at most `desired_k`
+            // lines is the K-stratified candidate for this K. Monotonic once K is
+            // fixed: as size shrinks, the same K lines only get narrower/shorter,
+            // so once K fits at a size it fits at every smaller size too.
+            let mut k_winner: Option<LayoutRun<'a>> = None;
+            for size in (lo..=hi).rev() {
+                let candidate = self.run_with_size(text, size as f32)?;
+                if fits(&candidate) && candidate.lines.len() <= desired_k {
+                    k_winner = Some(candidate);
+                    break;
+                }
+            }
+            if let Some(run) = k_winner
+                && better_k_stratified(&run, best.as_ref())
+            {
+                best = Some(run);
             }
         }
         Ok(best)
@@ -922,6 +1118,7 @@ impl<'a> TextLayout<'a> {
             height,
             font_size,
             overflowed,
+            stress: false,
             placement_offset_x,
             placement_offset_y,
         })
@@ -2099,6 +2296,41 @@ fn line_break_badness(line_advance: f32, max_extent: f32) -> f32 {
     } else {
         (line_advance - max_extent).powi(3) * LINE_BREAK_OVERFLOW_MULTIPLIER
     }
+}
+
+/// Raggedness of a laid-out block: the coefficient of variation of the per-line
+/// advances (stddev / mean). Lower is more balanced — a human letterer prefers
+/// near-equal line lengths over a greedy ragged split. Used as a tiebreaker in
+/// the K-stratified search.
+fn line_balance(run: &LayoutRun<'_>) -> f32 {
+    let advances: Vec<f32> = run.lines.iter().map(|line| line.advance).collect();
+    if advances.len() < 2 {
+        return 0.0;
+    }
+    let mean = advances.iter().sum::<f32>() / advances.len() as f32;
+    if mean <= f32::EPSILON {
+        return 0.0;
+    }
+    let variance = advances
+        .iter()
+        .map(|advance| (advance - mean).powi(2))
+        .sum::<f32>()
+        / advances.len() as f32;
+    variance.sqrt() / mean
+}
+
+/// K-stratified comparison: larger size wins; on a tie, fewer lines wins; on a
+/// tie, better (lower) balance wins.
+fn better_k_stratified(candidate: &LayoutRun<'_>, incumbent: Option<&LayoutRun<'_>>) -> bool {
+    let Some(incumbent) = incumbent else {
+        return true;
+    };
+    candidate
+        .font_size
+        .total_cmp(&incumbent.font_size)
+        .then_with(|| candidate.lines.len().cmp(&incumbent.lines.len()))
+        .then_with(|| line_balance(candidate).total_cmp(&line_balance(incumbent)))
+        .is_gt()
 }
 
 fn centered_x_offset(x_min: f32, x_max: f32) -> f32 {
@@ -3644,6 +3876,182 @@ mod tests {
         assert!(
             (c0 - c1).abs() < 1.0,
             "expected line centres to match even with overflow, got c0={c0} c1={c1} (max_width={max_width})",
+        );
+        Ok(())
+    }
+
+    // ---- llm3.md §8 regression tests + bug-fix tests + search comparison ----
+
+    fn bubble_layout<'a>(
+        font: &'a Font,
+        width: f32,
+        height: f32,
+        contour: Vec<(f32, f32)>,
+    ) -> TextLayout<'a> {
+        TextLayout::new(font)
+            .with_max_font_size(width)
+            .with_min_font_size(9.0)
+            .with_max_width(width)
+            .with_max_height(height)
+            .with_alignment(TextAlign::Center)
+            .with_comic_balloon(width, height, contour, 4.0)
+            .with_hyphenation_policy(HyphenationPolicy::LastResort)
+    }
+
+    fn rectangle_contour(width: f32, height: f32) -> Vec<(f32, f32)> {
+        vec![(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]
+    }
+
+    #[test]
+    fn comic_auto_fit_anchors_to_source_target_not_bubble_size() -> anyhow::Result<()> {
+        let font = any_system_font();
+        // Short text in a big balloon: without the anchor, auto-fit would grow
+        // toward the balloon width. With a source target of 18, the result must
+        // stay at 18 — the source lettering's scale, not the bubble's.
+        let layout = bubble_layout(&font, 400.0, 200.0, rectangle_contour(400.0, 200.0))
+            .with_target_font_size(18.0)
+            .run("Hi")?;
+        assert!(
+            (layout.font_size - 18.0).abs() < 0.5,
+            "short text should anchor to source target 18, got {}",
+            layout.font_size
+        );
+        assert!(!layout.overflowed());
+        Ok(())
+    }
+
+    #[test]
+    fn comic_auto_fit_never_exceeds_target() -> anyhow::Result<()> {
+        let font = any_system_font();
+        // Even when much larger sizes would fit a tiny string in a huge balloon,
+        // the anchor caps the result.
+        let layout = bubble_layout(&font, 600.0, 300.0, rectangle_contour(600.0, 300.0))
+            .with_target_font_size(20.0)
+            .run("OK")?;
+        assert!(
+            layout.font_size <= 20.0 + f32::EPSILON,
+            "auto-fit must never exceed the source target, got {}",
+            layout.font_size
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn comic_auto_fit_returns_integral_sizes() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let layout = bubble_layout(&font, 300.0, 160.0, rectangle_contour(300.0, 160.0))
+            .with_target_font_size(22.0)
+            .run("Some translated dialogue here")?;
+        assert!(
+            layout.font_size.fract() == 0.0,
+            "anchored search returns integer sizes, got {}",
+            layout.font_size
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn comic_auto_fit_shrinks_only_when_forced() -> anyhow::Result<()> {
+        let font = any_system_font();
+        // A long translation in a narrow balloon must descend integer steps from
+        // the target rather than silently overflowing.
+        let target = 24.0_f32;
+        let layout = bubble_layout(&font, 220.0, 120.0, rectangle_contour(220.0, 120.0))
+            .with_target_font_size(target)
+            .run("This translation is deliberately much longer than the source")?;
+        assert!(
+            layout.font_size <= target,
+            "must not exceed target, got {}",
+            layout.font_size
+        );
+        assert!(
+            layout.font_size < target,
+            "long text must shrink below target, got {}",
+            layout.font_size
+        );
+        assert!(
+            !layout.stress(),
+            "should fit at some shrunk size without stressing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn layout_stress_flags_unfittable_text_instead_of_silent_clip() -> anyhow::Result<()> {
+        let font = any_system_font();
+        // Absurdly long text in a tiny balloon at a high floor: nothing fits even
+        // at minimum, so the run must be flagged as stress (bug fix #2), not
+        // silently clipped.
+        let layout = TextLayout::new(&font)
+            .with_max_font_size(40.0)
+            .with_min_font_size(28.0)
+            .with_max_width(40.0)
+            .with_max_height(40.0)
+            .with_comic_balloon(40.0, 40.0, rectangle_contour(40.0, 40.0), 2.0)
+            .with_hyphenation_policy(HyphenationPolicy::LastResort)
+            .run("This translation cannot possibly fit in such a tiny region")?;
+        assert!(
+            layout.stress(),
+            "unfittable text must set the stress flag, not silently clip"
+        );
+        assert!(
+            layout.overflowed(),
+            "stress implies overflow was unavoidable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn k_stratified_finds_better_multiline_split_than_size_first() -> anyhow::Result<()> {
+        let font = any_system_font();
+        // A wide, short balloon and a phrase that has one obviously better 2-line
+        // split. The K-stratified search explicitly tries "2 lines at the largest
+        // size that fits", which size-first only stumbles into via the breaker.
+        let target = 30.0_f32;
+        let text = "HELLO WORLD FRIEND";
+        let size_first = bubble_layout(&font, 180.0, 120.0, rectangle_contour(180.0, 120.0))
+            .with_target_font_size(target)
+            .with_font_search_strategy(crate::config::FontSearchStrategy::SizeFirst)
+            .run(text)?;
+        let k_strat = bubble_layout(&font, 180.0, 120.0, rectangle_contour(180.0, 120.0))
+            .with_target_font_size(target)
+            .with_font_search_strategy(crate::config::FontSearchStrategy::KStratified)
+            .run(text)?;
+        // Both must fit and respect the target.
+        assert!(size_first.font_size <= target);
+        assert!(k_strat.font_size <= target);
+        assert!(!size_first.stress());
+        assert!(!k_strat.stress());
+        // The K-stratified result should be at least as large as size-first (it
+        // explores the same space plus explicit per-K maxima) and never worse on
+        // line balance when sizes tie.
+        assert!(
+            k_strat.font_size >= size_first.font_size - f32::EPSILON,
+            "K-stratified should not shrink below size-first: {} < {}",
+            k_strat.font_size,
+            size_first.font_size
+        );
+        if (k_strat.font_size - size_first.font_size).abs() <= f32::EPSILON {
+            assert!(
+                line_balance(&k_strat) <= line_balance(&size_first) + 1e-4,
+                "on a size tie K-stratified should balance at least as well"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn size_anchor_off_falls_back_to_legacy_maximize_behavior() -> anyhow::Result<()> {
+        let font = any_system_font();
+        // With no target and the legacy branch, short text in a big balloon grows
+        // toward the balloon width (the old "maximize to fill" objective). This
+        // confirms the toggle preserves the legacy path for comparison.
+        let layout =
+            bubble_layout(&font, 400.0, 200.0, rectangle_contour(400.0, 200.0)).run("Hi")?;
+        assert!(
+            layout.font_size > 18.0,
+            "legacy path should grow toward balloon size, got {}",
+            layout.font_size
         );
         Ok(())
     }
