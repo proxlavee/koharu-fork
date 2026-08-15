@@ -76,6 +76,16 @@ impl Diffusion {
     fn complete(self, path: &Path) -> bool {
         path.join(self.library()).is_file()
     }
+
+    fn fallbacks(self) -> Vec<Self> {
+        match self {
+            Self::WindowsCuda => vec![Self::WindowsHip, Self::WindowsVulkan],
+            Self::WindowsHip => vec![Self::WindowsVulkan],
+            Self::WindowsVulkan => Vec::new(),
+            Self::LinuxVulkan => Vec::new(),
+            Self::MacosMetal => Vec::new(),
+        }
+    }
 }
 
 impl sealed::Sealed for Diffusion {}
@@ -145,7 +155,36 @@ impl RuntimePackage for Diffusion {
     }
 
     async fn activate(self) -> Result<()> {
+        let mut last_error = None;
+        let mut candidates = std::iter::once(self).chain(self.fallbacks()).collect::<Vec<_>>();
+        while let Some(package) = candidates.pop() {
+            match package.activate_inner().await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("diffusion activation candidates cannot be empty"))
+    }
+}
+
+impl Diffusion {
+    async fn activate_inner(self) -> Result<()> {
         let root = self.install().await?;
         loader::load(root.join(self.library()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Diffusion;
+
+    #[test]
+    fn windows_cuda_falls_back_to_hip_then_vulkan() {
+        assert_eq!(
+            Diffusion::WindowsCuda.fallbacks(),
+            vec![Diffusion::WindowsHip, Diffusion::WindowsVulkan]
+        );
+        assert_eq!(Diffusion::WindowsHip.fallbacks(), vec![Diffusion::WindowsVulkan]);
+        assert!(Diffusion::WindowsVulkan.fallbacks().is_empty());
     }
 }

@@ -76,6 +76,16 @@ impl Llama {
     fn complete(self, path: &Path) -> bool {
         self.libraries().all(|name| path.join(name).is_file())
     }
+
+    fn fallbacks(self) -> Vec<Self> {
+        match self {
+            Self::WindowsCuda => vec![Self::WindowsHip, Self::WindowsVulkan],
+            Self::WindowsHip => vec![Self::WindowsVulkan],
+            Self::WindowsVulkan => Vec::new(),
+            Self::LinuxVulkan => Vec::new(),
+            Self::MacosMetal => Vec::new(),
+        }
+    }
 }
 
 impl sealed::Sealed for Llama {}
@@ -145,11 +155,40 @@ impl RuntimePackage for Llama {
     }
 
     async fn activate(self) -> Result<()> {
+        let mut last_error = None;
+        let mut candidates = std::iter::once(self).chain(self.fallbacks()).collect::<Vec<_>>();
+        while let Some(package) = candidates.pop() {
+            match package.activate_inner().await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("llama activation candidates cannot be empty"))
+    }
+}
+
+impl Llama {
+    async fn activate_inner(self) -> Result<()> {
         let root = self.install().await?;
         for library in self.libraries() {
             loader::load(root.join(library))
                 .with_context(|| format!("failed to activate llama library {library}"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Llama;
+
+    #[test]
+    fn windows_cuda_falls_back_to_hip_then_vulkan() {
+        assert_eq!(
+            Llama::WindowsCuda.fallbacks(),
+            vec![Llama::WindowsHip, Llama::WindowsVulkan]
+        );
+        assert_eq!(Llama::WindowsHip.fallbacks(), vec![Llama::WindowsVulkan]);
+        assert!(Llama::WindowsVulkan.fallbacks().is_empty());
     }
 }
