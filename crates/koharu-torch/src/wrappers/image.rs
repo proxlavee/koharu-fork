@@ -32,8 +32,7 @@ pub fn save_hwc<T: AsRef<Path>>(t: &Tensor, path: T) -> Result<(), TchError> {
 pub fn resize_hwc(t: &Tensor, out_w: i64, out_h: i64) -> Result<Tensor, TchError> {
     let out_w = image_dimension(out_w, "width")?;
     let out_h = image_dimension(out_h, "height")?;
-    let c_tensor =
-        unsafe_torch_err!(koharu_torch_sys::at_resize_image(t.c_tensor, out_w, out_h));
+    let c_tensor = unsafe_torch_err!(koharu_torch_sys::at_resize_image(t.c_tensor, out_w, out_h));
     Ok(Tensor { c_tensor })
 }
 
