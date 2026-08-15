@@ -156,7 +156,9 @@ impl RuntimePackage for Llama {
 
     async fn activate(self) -> Result<()> {
         let mut last_error = None;
-        let mut candidates = std::iter::once(self).chain(self.fallbacks()).collect::<Vec<_>>();
+        let mut candidates = std::iter::once(self)
+            .chain(self.fallbacks())
+            .collect::<Vec<_>>();
         while let Some(package) = candidates.pop() {
             match package.activate_inner().await {
                 Ok(()) => return Ok(()),
@@ -188,7 +190,10 @@ mod tests {
             Llama::WindowsCuda.fallbacks(),
             vec![Llama::WindowsHip, Llama::WindowsVulkan]
         );
-        assert_eq!(Llama::WindowsHip.fallbacks(), vec![Llama::WindowsVulkan]);
+        assert_eq!(
+            Llama::WindowsHip.fallbacks(),
+            vec![Llama::WindowsVulkan]
+        );
         assert!(Llama::WindowsVulkan.fallbacks().is_empty());
     }
 }

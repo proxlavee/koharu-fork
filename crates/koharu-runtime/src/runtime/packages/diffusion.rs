@@ -156,7 +156,9 @@ impl RuntimePackage for Diffusion {
 
     async fn activate(self) -> Result<()> {
         let mut last_error = None;
-        let mut candidates = std::iter::once(self).chain(self.fallbacks()).collect::<Vec<_>>();
+        let mut candidates = std::iter::once(self)
+            .chain(self.fallbacks())
+            .collect::<Vec<_>>();
         while let Some(package) = candidates.pop() {
             match package.activate_inner().await {
                 Ok(()) => return Ok(()),
@@ -184,7 +186,10 @@ mod tests {
             Diffusion::WindowsCuda.fallbacks(),
             vec![Diffusion::WindowsHip, Diffusion::WindowsVulkan]
         );
-        assert_eq!(Diffusion::WindowsHip.fallbacks(), vec![Diffusion::WindowsVulkan]);
+        assert_eq!(
+            Diffusion::WindowsHip.fallbacks(),
+            vec![Diffusion::WindowsVulkan]
+        );
         assert!(Diffusion::WindowsVulkan.fallbacks().is_empty());
     }
 }
