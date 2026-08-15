@@ -9,7 +9,8 @@ pub struct Mesh {
 }
 
 pub fn build_cdt(polygon: &[(f64, f64)]) -> Mesh {
-    let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> = ConstrainedDelaunayTriangulation::new();
+    let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> =
+        ConstrainedDelaunayTriangulation::new();
     let mut vertex_handles = Vec::new();
 
     for &(x, y) in polygon {
@@ -38,7 +39,10 @@ pub fn build_cdt(polygon: &[(f64, f64)]) -> Mesh {
         triangles.push([idx0, idx1, idx2]);
     }
 
-    Mesh { vertices, triangles }
+    Mesh {
+        vertices,
+        triangles,
+    }
 }
 
 pub fn cotangent_laplacian(mesh: &Mesh) -> CsrMatrix<f64> {
@@ -74,11 +78,7 @@ fn cotangent(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
     let ac = (c.0 - a.0, c.1 - a.1);
     let dot = ab.0 * ac.0 + ab.1 * ac.1;
     let cross = ab.0 * ac.1 - ab.1 * ac.0;
-    if cross.abs() < 1e-6 {
-        0.0
-    } else {
-        dot / cross
-    }
+    if cross.abs() < 1e-6 { 0.0 } else { dot / cross }
 }
 
 pub fn solve_poisson(mesh: &Mesh, boundary_indices: &[usize]) -> DVector<f64> {
@@ -113,7 +113,9 @@ fn solve_cg(a: &CsrMatrix<f64>, b: &DVector<f64>, max_iter: usize, tol: f64) -> 
     let mut p = r.clone();
     let mut rs_old = r.dot(&r);
 
-    if rs_old < 1e-12 { return x; }
+    if rs_old < 1e-12 {
+        return x;
+    }
     for _ in 0..max_iter {
         let ap = a * &p;
         let alpha = rs_old / p.dot(&ap);
@@ -153,7 +155,11 @@ pub fn boundary_indices(mesh: &Mesh, polygon: &[(f64, f64)]) -> Vec<usize> {
     indices
 }
 
-pub fn harmonic_streamlines(mesh: &Mesh, boundary_top: &[usize], boundary_bottom: &[usize]) -> DVector<f64> {
+pub fn harmonic_streamlines(
+    mesh: &Mesh,
+    boundary_top: &[usize],
+    boundary_bottom: &[usize],
+) -> DVector<f64> {
     let mut a = cotangent_laplacian(mesh);
     let n = mesh.vertices.len();
     let mut b = DVector::zeros(n);
@@ -197,7 +203,7 @@ pub fn map_layout_to_field(spine: &[(f64, f64)]) -> (f64, f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use crate::field::{build_cdt, solve_poisson, boundary_indices, extract_medial_axis};
+    use crate::field::{boundary_indices, build_cdt, extract_medial_axis, solve_poisson};
 
     #[test]
     fn test_poisson_optical_center() {

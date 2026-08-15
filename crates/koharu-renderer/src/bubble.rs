@@ -1,7 +1,9 @@
 //! Bubble-aware layout bounds derived from explicit scene relations.
 
+use crate::field::{
+    boundary_indices, build_cdt, extract_medial_axis, map_layout_to_field, solve_poisson,
+};
 use koharu_scene::Geometry;
-use crate::field::{build_cdt, solve_poisson, boundary_indices, extract_medial_axis, map_layout_to_field};
 
 const MAX_CONTOUR_POINTS: usize = 1_024;
 
@@ -1141,7 +1143,9 @@ mod tests {
 #[allow(dead_code)]
 fn solve_bubble_fields(polygon: &[(f32, f32)]) {
     let mut poly_f64 = Vec::new();
-    for &(px, py) in polygon { poly_f64.push((px as f64, py as f64)); }
+    for &(px, py) in polygon {
+        poly_f64.push((px as f64, py as f64));
+    }
     let mesh = build_cdt(&poly_f64);
     let bounds_idx = boundary_indices(&mesh, &poly_f64);
     let poisson = solve_poisson(&mesh, &bounds_idx);

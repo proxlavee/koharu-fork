@@ -1698,11 +1698,25 @@ fn exact_profiled_line_breaks(
                 }
                 let line_advance = advance - segments[end - 1].trailing_advance + suffix;
                 let width = profiles[line].width.max(1.0);
-                let overflow = (line_advance - width).max(0.0) / width;
-                let slack = (width - line_advance).max(0.0) / width;
-                let mut cost = dp[line][start]
-                    + slack * slack * 1_000.0
-                    + overflow * overflow * COMIC_LINE_OVERFLOW_PENALTY;
+
+                // Asymmetric Elastic-Barrier Loss and hz micro-expansion
+                let sigma = width - line_advance;
+                let c_ovf = COMIC_LINE_OVERFLOW_PENALTY;
+                let beta = 50.0;
+                let mu = 1.0;
+                let alpha = 2.0;
+                let sigma_target = 0.05 * width;
+
+                let loss = if sigma < 0.0 {
+                    c_ovf * (-beta * sigma).exp()
+                } else if sigma <= sigma_target {
+                    sigma * sigma + mu * sigma
+                } else {
+                    sigma_target * sigma_target + alpha * (sigma - sigma_target) * (sigma - sigma_target)
+                };
+
+                let mut cost = dp[line][start] + loss;
+
                 if hyphenated_break {
                     cost += LINE_BREAK_HYPHEN_PENALTY;
                 }
