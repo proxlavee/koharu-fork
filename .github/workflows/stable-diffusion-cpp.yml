@@ -1,4 +1,5 @@
 name: stable-diffusion.cpp
+run-name: Runtime dependency - stable-diffusion.cpp ${{ github.event.inputs.ref || 'pull request validation' }}
 
 on:
   workflow_dispatch:
@@ -28,13 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - backend: cuda
-            os: windows-2022
-          - backend: hip
-            os: windows-2022
-          - backend: vulkan
-            os: windows-2022
+        backend: ${{ fromJSON(github.event_name == 'pull_request' && '["vulkan"]' || '["cuda", "hip", "vulkan"]') }}
+        os: [windows-2022]
 
     runs-on: ${{ matrix.os }}
     env:

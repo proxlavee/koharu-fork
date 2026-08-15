@@ -34,6 +34,10 @@ refs=(
   "${llama_release#llama.cpp-}"
   "${diffusion_release#stable-diffusion.cpp-}"
 )
+run_titles=(
+  "Runtime dependency - llama.cpp ${refs[0]}"
+  "Runtime dependency - stable-diffusion.cpp ${refs[1]}"
+)
 dispatches=(0 0)
 
 release_ready() {
@@ -58,13 +62,27 @@ release_ready() {
 
 workflow_active() {
   local workflow=$1
-  gh run list \
+  local run_title=$2
+  local runs
+  local status
+  local title
+  if ! runs=$(gh run list \
     --repo "$GITHUB_REPOSITORY" \
     --workflow "$workflow" \
     --branch main \
+    --event workflow_dispatch \
     --limit 20 \
-    --json status \
-    --jq 'any(.[]; .status != "completed")'
+    --json status,displayTitle \
+    --jq '.[] | [.status, .displayTitle] | @tsv'); then
+    printf 'Unable to inspect workflow %s.\n' "$workflow" >&2
+    exit 1
+  fi
+  while IFS=$'\t' read -r status title; do
+    if [[ $title == "$run_title" && $status != completed ]]; then
+      return 0
+    fi
+  done <<< "$runs"
+  return 1
 }
 
 start_if_needed() {
@@ -76,8 +94,9 @@ start_if_needed() {
     printf 'Windows runtime release %s is incomplete.\n' "${tags[index]}" >&2
     exit 1
   fi
-  if [[ $(workflow_active "${workflows[index]}") == true ]]; then
-    printf 'Waiting for active workflow %s.\n' "${workflows[index]}"
+  if workflow_active "${workflows[index]}" "${run_titles[index]}"; then
+    printf 'Waiting for active workflow %s for pinned ref %s.\n' \
+      "${workflows[index]}" "${refs[index]}"
     return
   fi
   printf 'Dispatching %s for pinned ref %s.\n' \
@@ -105,7 +124,7 @@ while (( SECONDS < deadline )); do
       ready=$((ready + 1))
       continue
     fi
-    if [[ $(workflow_active "${workflows[index]}") != true ]]; then
+    if ! workflow_active "${workflows[index]}" "${run_titles[index]}"; then
       if (( dispatches[index] >= 2 )); then
         printf '%s completed twice without publishing all Windows assets.\n' \
           "${workflows[index]}" >&2
