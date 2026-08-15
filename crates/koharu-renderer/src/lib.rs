@@ -27,3 +27,4 @@ pub use renderer::Renderer;
 pub use types::{FontFace, FontFamily, FontMetadata, FontRange, FontSource, FontStyle, TextAlign};
 
 pub(crate) use layout::{HyphenationPolicy, LayoutRun, TextLayout};
+pub mod field;
