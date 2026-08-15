@@ -190,10 +190,7 @@ mod tests {
             Llama::WindowsCuda.fallbacks(),
             vec![Llama::WindowsHip, Llama::WindowsVulkan]
         );
-        assert_eq!(
-            Llama::WindowsHip.fallbacks(),
-            vec![Llama::WindowsVulkan]
-        );
+        assert_eq!(Llama::WindowsHip.fallbacks(), vec![Llama::WindowsVulkan]);
         assert!(Llama::WindowsVulkan.fallbacks().is_empty());
     }
 }
