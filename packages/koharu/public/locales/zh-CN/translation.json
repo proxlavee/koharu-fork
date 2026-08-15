@@ -55,7 +55,8 @@
   "canvas": {
     "empty": "请选择页面以开始。",
     "fit": "适应窗口",
-    "surface": "Koharu 画布"
+    "surface": "Koharu 画布",
+    "unavailable": "WebGPU 画布不可用"
   },
   "colorPicker": {
     "brushColor": "笔刷颜色",
@@ -507,6 +508,7 @@
   },
   "updater": {
     "available": {
+      "description": "Koharu <strong>{{version}}</strong> 已准备好安装",
       "title": "有可用更新"
     },
     "close": "关闭",

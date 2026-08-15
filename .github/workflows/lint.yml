@@ -39,6 +39,6 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun install --frozen-lockfile
       - name: Lint UI
-        run: bun run --filter @koharu/app lint
+        run: bun run lint

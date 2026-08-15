@@ -7,7 +7,6 @@ mod fonts;
 mod frame;
 mod images;
 mod layout;
-mod raster;
 mod renderer;
 mod script;
 mod segment;
@@ -18,11 +17,10 @@ mod types;
 pub use config::TypesettingConfig;
 pub use error::{Error, Result};
 pub use frame::{
-    Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation, RenderBounds,
+    Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation, RasterImage, RenderBounds,
     RenderDependency, RenderDiagnostic, RetentionStats, TextMetadata,
 };
 pub use layout::WritingMode;
-pub use raster::{DownsampleFilter, Raster, RasterOptions};
 pub use renderer::Renderer;
 pub use types::{FontFace, FontFamily, FontMetadata, FontRange, FontSource, FontStyle, TextAlign};
 

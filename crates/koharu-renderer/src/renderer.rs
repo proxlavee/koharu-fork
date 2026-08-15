@@ -2,12 +2,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ops::Range,
     sync::{Arc, OnceLock, Weak},
 };
 
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_scene::{
     Asset, AssetRole, BlobId, Change, Component, ComponentOwner, EntityChange, EntityId, FitsTo,
     FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, Presents, RasterLayer, RasterLayerKind,
@@ -22,36 +22,29 @@ use skrifa::{
     instance::Size,
     outline::{DrawSettings, OutlinePen},
 };
-use tokio::sync::OnceCell;
 use vello::{
     Scene,
     kurbo::{Affine, BezPath, Rect, Vec2},
-    peniko::{Blob, Fill, ImageAlphaType, ImageData, ImageFormat},
+    peniko::Fill,
 };
 
 use crate::{
     Error, FontFamily, FontStyle, Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation,
-    Raster, RasterOptions, RenderBounds, RenderDependency, RenderDiagnostic, Result,
-    RetentionStats, TextAlign, TextMetadata, TypesettingConfig, WritingMode,
+    RasterImage, RenderBounds, RenderDependency, RenderDiagnostic, Result, RetentionStats,
+    TextAlign, TextMetadata, TypesettingConfig, WritingMode,
     bubble::{GeometryFrame, LayoutBox, contour, flow_cells, geometry_bounds, geometry_frame},
     fonts::{FontPreview, FontRequest, Fonts},
     frame::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
+        prepare_frame,
     },
     images::{DecodedImage, ImageCache, decode},
-    raster::{Rasterizer, rgba},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
     text_renderer::{StrokeOptions, StrokeSizing, TextNodeDescriptor, TextRenderer},
 };
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
-// WGPU guarantees less than Koharu's document limit on some desktop adapters.
-// Retained images therefore use bounded textures independent of the eventual
-// canvas or export device. A one-pixel gutter preserves bilinear samples at
-// tile boundaries while the core clip prevents overlapping draws.
-const MAX_IMAGE_TEXTURE_DIMENSION: u32 = 4_096;
-const IMAGE_TILE_GUTTER: u32 = 1;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
@@ -69,7 +62,6 @@ struct RendererInner {
     image_loads: Mutex<HashMap<BlobId, Weak<ImageLoad>>>,
     nodes: Mutex<NodeCache>,
     workers: OnceLock<Arc<rayon::ThreadPool>>,
-    rasterizer: OnceCell<Arc<Rasterizer>>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -113,7 +105,6 @@ impl Renderer {
                 image_loads: Mutex::new(HashMap::new()),
                 nodes: Mutex::new(NodeCache::new(DEFAULT_RETAINED_NODES)),
                 workers: OnceLock::new(),
-                rasterizer: OnceCell::new(),
             }),
         }
     }
@@ -161,16 +152,6 @@ impl Renderer {
             .await
     }
 
-    /// Produces CPU-readable pixels from the exact retained vector frame.
-    #[tracing::instrument(level = "info", skip_all, fields(page = %frame.page(), revision = %frame.revision()))]
-    pub async fn rasterize(&self, frame: &Frame, options: RasterOptions) -> Result<Raster> {
-        let rasterizer = self.rasterizer().await?;
-        let frame = frame.clone();
-        tokio::task::spawn_blocking(move || rasterizer.rasterize(&frame, options))
-            .await
-            .map_err(|source| Error::Backend(anyhow!(source)))?
-    }
-
     pub async fn available_fonts(&self) -> Result<Vec<FontFamily>> {
         self.inner
             .fonts
@@ -179,7 +160,11 @@ impl Renderer {
             .map_err(Error::FontResource)
     }
 
-    pub async fn font_preview(&self, family_name: &str) -> Result<Vec<u8>> {
+    pub async fn font_preview(
+        &self,
+        family_name: &str,
+        rasterizer: Arc<Rasterizer>,
+    ) -> Result<Vec<u8>> {
         const FONT_SIZE: f32 = 24.0;
         const PREVIEW_HEIGHT: u32 = 96;
 
@@ -228,7 +213,6 @@ impl Renderer {
         .context("font preview worker stopped unexpectedly")
         .and_then(|result| result)
         .map_err(Error::FontResource)?;
-        let rasterizer = self.rasterizer().await?;
         tokio::task::spawn_blocking(move || {
             let image = rasterizer
                 .rasterize_scene(
@@ -254,19 +238,6 @@ impl Renderer {
     /// Discards retained Vello nodes after their presentation resource lifetime ends.
     pub fn discard_retained_nodes(&self) {
         self.inner.nodes.lock().entries.clear();
-    }
-
-    async fn rasterizer(&self) -> Result<Arc<Rasterizer>> {
-        self.inner
-            .rasterizer
-            .get_or_try_init(|| async {
-                tokio::task::spawn_blocking(Rasterizer::new)
-                    .await
-                    .map_err(|source| Error::Backend(anyhow!(source)))?
-                    .map(Arc::new)
-            })
-            .await
-            .cloned()
     }
 
     async fn finish(
@@ -364,11 +335,7 @@ impl Renderer {
         };
         let workers = self.workers()?;
         tokio::task::spawn_blocking(move || {
-            workers.install(|| {
-                let frame = assemble_frame(compiled, nodes, stats)?;
-                let _ = frame.scene();
-                Ok(frame)
-            })
+            workers.install(|| assemble_frame(compiled, nodes, stats))
         })
         .await
         .map_err(|source| Error::Backend(anyhow!(source)))?
@@ -460,12 +427,12 @@ impl Renderer {
         }
         let result = async {
             let bytes = snapshot.read_blob(id).await?;
+            let bytes: Arc<[u8]> = Arc::from(bytes.as_ref());
             let workers = self.workers()?;
-            let (id, image) = tokio::task::spawn_blocking(move || {
-                workers.install(|| decode(id, bytes.as_ref(), None))
-            })
-            .await
-            .map_err(|source| Error::Backend(anyhow!(source)))??;
+            let (id, image) =
+                tokio::task::spawn_blocking(move || workers.install(|| decode(id, bytes, None)))
+                    .await
+                    .map_err(|source| Error::Backend(anyhow!(source)))??;
             self.inner.images.lock().insert(id, image.clone());
             *load.image.lock() = Arc::downgrade(&image);
             Ok((id, image))
@@ -1105,6 +1072,7 @@ impl ImageNodeDescriptor {
     fn from_asset(asset: Asset, require_size: Option<(u32, u32)>) -> Self {
         Self {
             blob: asset.blob,
+            media_type: asset.media_type,
             expected_size: asset.metadata.width.zip(asset.metadata.height),
             require_size,
         }
@@ -1167,58 +1135,31 @@ fn build_node(
                     image.blob, decoded.width, decoded.height, image.require_size
                 )));
             }
-            let mut scene = Scene::new();
-            if decoded.width <= MAX_IMAGE_TEXTURE_DIMENSION
-                && decoded.height <= MAX_IMAGE_TEXTURE_DIMENSION
-            {
-                let pixels: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(ImageBytes::Shared {
-                    pixels: decoded.pixels.clone(),
-                    range: 0..decoded.pixels.len(),
-                });
-                let data = ImageData {
-                    data: Blob::new(pixels),
-                    format: ImageFormat::Rgba8,
-                    alpha_type: ImageAlphaType::Alpha,
-                    width: decoded.width,
-                    height: decoded.height,
-                };
-                scene.draw_image(&data, Affine::IDENTITY);
-            } else {
-                for tile in image_tiles(decoded, MAX_IMAGE_TEXTURE_DIMENSION)? {
-                    let pixels: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(tile.pixels);
-                    let data = ImageData {
-                        data: Blob::new(pixels),
-                        format: ImageFormat::Rgba8,
-                        alpha_type: ImageAlphaType::Alpha,
-                        width: tile.data[2] - tile.data[0],
-                        height: tile.data[3] - tile.data[1],
-                    };
-                    scene.push_clip_layer(
-                        Fill::NonZero,
-                        Affine::IDENTITY,
-                        &Rect::new(
-                            f64::from(tile.core[0]),
-                            f64::from(tile.core[1]),
-                            f64::from(tile.core[2]),
-                            f64::from(tile.core[3]),
-                        ),
-                    );
-                    scene.draw_image(
-                        &data,
-                        Affine::translate((f64::from(tile.data[0]), f64::from(tile.data[1]))),
-                    );
-                    scene.pop_layer();
-                }
-            }
+            let raster = RasterImage {
+                blob: image.blob,
+                source: koharu_rasterizer::ResourceId::for_encoded_raster(
+                    decoded.width,
+                    decoded.height,
+                    &image.media_type,
+                    &decoded.encoded,
+                ),
+                width: decoded.width,
+                height: decoded.height,
+                media_type: image.media_type.clone(),
+                encoded: decoded.encoded.clone(),
+                pixels: decoded.pixels.clone(),
+            };
             Ok(RetainedNode {
                 descriptor,
-                scene: Arc::new(scene),
+                scene: Arc::new(koharu_rasterizer::PreparedScene::default()),
+                resources: Arc::from([]),
                 local_bounds: RenderBounds {
                     x: 0.0,
                     y: 0.0,
                     width: decoded.width as f32,
                     height: decoded.height as f32,
                 },
+                image: Some(raster),
                 text: None,
                 diagnostics: Arc::from([]),
             })
@@ -1228,7 +1169,9 @@ fn build_node(
             Ok(RetainedNode {
                 descriptor,
                 scene: rendered.scene,
+                resources: rendered.resources,
                 local_bounds: rendered.local_bounds,
+                image: None,
                 text: Some(LocalTextMetadata {
                     rendered_bounds: rendered.metadata.rendered_bounds,
                     layout_bounds: rendered.metadata.layout_bounds,
@@ -1303,6 +1246,15 @@ fn assemble_frame(
         .enumerate()
         .map(|(index, layer)| (layer.entity(), index))
         .collect();
+    let prepared = prepare_frame(
+        compiled.revision,
+        compiled.page,
+        compiled.width,
+        compiled.height,
+        (0, 0),
+        Affine::IDENTITY,
+        &layers,
+    )?;
     Ok(Frame(Arc::new(FrameData {
         revision: compiled.revision,
         page: compiled.page,
@@ -1315,7 +1267,7 @@ fn assemble_frame(
         dependencies: compiled.dependencies,
         diagnostics: diagnostics.into(),
         stats,
-        scene: OnceLock::new(),
+        prepared: Arc::new(prepared),
     })))
 }
 
@@ -1671,117 +1623,8 @@ impl AffectedDependencies {
     }
 }
 
-#[derive(Clone)]
-enum ImageBytes {
-    Shared {
-        pixels: Arc<[u8]>,
-        range: Range<usize>,
-    },
-    Owned(Arc<[u8]>),
-}
-
-impl AsRef<[u8]> for ImageBytes {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Shared { pixels, range } => &pixels[range.clone()],
-            Self::Owned(pixels) => pixels,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ImageTile {
-    core: [u32; 4],
-    data: [u32; 4],
-    pixels: ImageBytes,
-}
-
-fn image_tiles(image: &DecodedImage, maximum_dimension: u32) -> Result<Vec<ImageTile>> {
-    if maximum_dimension <= IMAGE_TILE_GUTTER * 2 {
-        return Err(Error::invalid(
-            "image texture limit is too small for tile gutters",
-        ));
-    }
-    let core_dimension = maximum_dimension - IMAGE_TILE_GUTTER * 2;
-    let row_bytes = usize::try_from(image.width)
-        .ok()
-        .and_then(|width| width.checked_mul(4))
-        .ok_or_else(|| Error::invalid("decoded image row size overflow"))?;
-    let mut tiles = Vec::new();
-    let mut core_top = 0;
-    while core_top < image.height {
-        let core_bottom = core_top.saturating_add(core_dimension).min(image.height);
-        let mut core_left = 0;
-        while core_left < image.width {
-            let core_right = core_left.saturating_add(core_dimension).min(image.width);
-            let data = [
-                core_left.saturating_sub(IMAGE_TILE_GUTTER),
-                core_top.saturating_sub(IMAGE_TILE_GUTTER),
-                core_right
-                    .saturating_add(IMAGE_TILE_GUTTER)
-                    .min(image.width),
-                core_bottom
-                    .saturating_add(IMAGE_TILE_GUTTER)
-                    .min(image.height),
-            ];
-            let pixels = if data[0] == 0 && data[2] == image.width {
-                let start = usize::try_from(data[1])
-                    .ok()
-                    .and_then(|top| top.checked_mul(row_bytes))
-                    .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
-                let end = usize::try_from(data[3])
-                    .ok()
-                    .and_then(|bottom| bottom.checked_mul(row_bytes))
-                    .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
-                ImageBytes::Shared {
-                    pixels: image.pixels.clone(),
-                    range: start..end,
-                }
-            } else {
-                let tile_width = usize::try_from(data[2] - data[0])
-                    .map_err(|_| Error::invalid("decoded image tile width overflow"))?;
-                let tile_height = usize::try_from(data[3] - data[1])
-                    .map_err(|_| Error::invalid("decoded image tile height overflow"))?;
-                let tile_row_bytes = tile_width
-                    .checked_mul(4)
-                    .ok_or_else(|| Error::invalid("decoded image tile row size overflow"))?;
-                let mut pixels = Vec::new();
-                pixels
-                    .try_reserve_exact(tile_row_bytes.checked_mul(tile_height).ok_or_else(
-                        || Error::invalid("decoded image tile allocation size overflow"),
-                    )?)
-                    .map_err(|source| Error::Backend(anyhow!(source)))?;
-                let left = usize::try_from(data[0])
-                    .ok()
-                    .and_then(|left| left.checked_mul(4))
-                    .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
-                for y in data[1]..data[3] {
-                    let start = usize::try_from(y)
-                        .ok()
-                        .and_then(|y| y.checked_mul(row_bytes))
-                        .and_then(|row| row.checked_add(left))
-                        .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
-                    let end = start
-                        .checked_add(tile_row_bytes)
-                        .ok_or_else(|| Error::invalid("decoded image tile offset overflow"))?;
-                    pixels.extend_from_slice(&image.pixels[start..end]);
-                }
-                ImageBytes::Owned(pixels.into())
-            };
-            tiles.push(ImageTile {
-                core: [core_left, core_top, core_right, core_bottom],
-                data,
-                pixels,
-            });
-            core_left = core_right;
-        }
-        core_top = core_bottom;
-    }
-    Ok(tiles)
-}
-
 fn draw_font_preview(scene: &mut Scene, layout: &crate::LayoutRun<'_>) -> anyhow::Result<()> {
-    let brush = rgba([0, 0, 0, 255]);
+    let brush = vello::peniko::Color::from_rgba8(0, 0, 0, 255);
     for line in &layout.lines {
         let (baseline_x, baseline_y) = line.baseline;
         let mut pen_x = 0.0;
@@ -1939,62 +1782,6 @@ mod tests {
         assert!(Arc::ptr_eq(&renderer.inner, &cloned.inner));
         assert!(!renderer.inner.fonts.is_system_initialized());
         assert!(renderer.inner.workers.get().is_none());
-        assert!(renderer.inner.rasterizer.get().is_none());
-    }
-
-    #[test]
-    fn image_tiles_preserve_every_source_pixel_with_bounded_gutters() {
-        let width = 7;
-        let height = 6;
-        let pixels = (0..width * height)
-            .flat_map(|index| [index as u8, index as u8 + 1, index as u8 + 2, 255])
-            .collect::<Vec<_>>();
-        let image = DecodedImage {
-            width,
-            height,
-            pixels: pixels.clone().into(),
-        };
-
-        let tiles = image_tiles(&image, 4).unwrap();
-        let mut reconstructed = vec![0_u8; pixels.len()];
-        let mut coverage = vec![0_u8; (width * height) as usize];
-        for tile in tiles {
-            let data_width = tile.data[2] - tile.data[0];
-            let data_height = tile.data[3] - tile.data[1];
-            assert!(data_width <= 4 && data_height <= 4);
-            let bytes = tile.pixels.as_ref();
-            for y in tile.core[1]..tile.core[3] {
-                for x in tile.core[0]..tile.core[2] {
-                    let source =
-                        (((y - tile.data[1]) * data_width + x - tile.data[0]) * 4) as usize;
-                    let destination = ((y * width + x) * 4) as usize;
-                    reconstructed[destination..destination + 4]
-                        .copy_from_slice(&bytes[source..source + 4]);
-                    coverage[(y * width + x) as usize] += 1;
-                }
-            }
-        }
-
-        assert_eq!(reconstructed, pixels);
-        assert!(coverage.into_iter().all(|count| count == 1));
-    }
-
-    #[test]
-    fn narrow_long_image_tiles_share_the_decoded_storage() {
-        let image = DecodedImage {
-            width: 2,
-            height: 9,
-            pixels: Arc::from([0_u8; 2 * 9 * 4]),
-        };
-
-        let tiles = image_tiles(&image, 4).unwrap();
-
-        assert!(tiles.len() > 1);
-        assert!(
-            tiles
-                .iter()
-                .all(|tile| matches!(tile.pixels, ImageBytes::Shared { .. }))
-        );
     }
 
     #[tokio::test]

@@ -4,8 +4,8 @@
   "build": {
     "devUrl": "http://localhost:3000",
     "frontendDist": "../../packages/koharu/out",
-    "beforeDevCommand": "bun run --filter @koharu/app dev",
-    "beforeBuildCommand": "bun run --filter @koharu/app build"
+    "beforeDevCommand": "bun run ui:dev",
+    "beforeBuildCommand": "bun run ui:build"
   },
   "app": {
     "macOSPrivateApi": true,
@@ -39,6 +39,7 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": false,
-    "licenseFile": "../../LICENSE"
+    "license": "MIT OR Apache-2.0",
+    "resources": ["../../LICENSE-MIT", "../../LICENSE-APACHE"]
   }
 }

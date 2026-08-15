@@ -20,11 +20,6 @@ printf 'models survive installer upgrades\n' >"$legacy_marker"
 required=(
   "$install_dir/koharu.exe"
   "$install_dir/koharu-torch.dll"
-  "$install_dir/libcef.dll"
-  "$install_dir/chrome_elf.dll"
-  "$install_dir/icudtl.dat"
-  "$install_dir/v8_context_snapshot.bin"
-  "$install_dir/resources.pak"
 )
 for path in "${required[@]}"; do
   if [[ ! -f "$path" ]]; then
@@ -32,10 +27,6 @@ for path in "${required[@]}"; do
     exit 1
   fi
 done
-if ! compgen -G "$install_dir/locales/*.pak" >/dev/null; then
-  printf 'Installed payload has no CEF locale packs in %s\n' "$install_dir/locales" >&2
-  exit 1
-fi
 
 pid=
 cleanup() {

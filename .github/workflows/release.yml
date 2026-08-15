@@ -33,6 +33,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash .github/scripts/ensure-windows-runtimes.sh --dispatch-missing
       - uses: oven-sh/setup-bun@v2
+      - name: Install WebAssembly target
+        run: rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: koharu-app
@@ -50,22 +52,10 @@ jobs:
           key: ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-${{ hashFiles('packages/**/*.js', 'packages/**/*.jsx', 'packages/**/*.ts', 'packages/**/*.tsx') }}
           restore-keys: |
             ${{ runner.os }}-nextjs-${{ hashFiles('bun.lock') }}-
-      - name: Cache pinned Tauri CLI
-        id: tauri-cli-cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/cargo-tauri.exe
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargo-tauri-${{ hashFiles('package.json') }}
       - name: Install JavaScript dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
-      - name: Install pinned Tauri CLI
-        if: steps.tauri-cli-cache.outputs.cache-hit != 'true'
-        run: bun run postinstall
-      - name: Verify pinned Tauri CLI
-        run: cargo tauri --version
+        run: bun install --frozen-lockfile
+      - name: Verify Tauri CLI
+        run: bun x tauri --version
       - name: Validate release version
         id: version
         shell: bash
@@ -98,8 +88,6 @@ jobs:
 
           if [[ -n "$previous" ]]; then
             range="$previous..$GITHUB_REF_NAME"
-          elif git merge-base --is-ancestor v0.64.2-flux-fill-dev "$GITHUB_REF_NAME"; then
-            range="v0.64.2-flux-fill-dev..$GITHUB_REF_NAME"
           else
             range="$GITHUB_REF_NAME"
           fi
@@ -112,7 +100,7 @@ jobs:
       - name: Run UI tests
         run: bun run --filter @koharu/app test
       - name: Build unsigned Windows installer
-        run: cargo tauri build --ci --no-sign --bundles nsis -- --locked
+        run: bun x tauri build --ci --no-sign --bundles nsis -- --locked
       - name: Upload Windows installer
         uses: actions/upload-artifact@v7
         with:

@@ -18,8 +18,17 @@ struct Cli {
 }
 
 #[tokio::main]
-#[tauri::cef_entry_point]
 async fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: This only requests the existing parent console. It does not allocate one.
+        let _ = unsafe {
+            windows::Win32::System::Console::AttachConsole(
+                windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            )
+        };
+    }
+
     let cli = Cli::parse();
     if let Some(report) = cli.verify_torch_runtime {
         if runtime_diagnostic::verify_torch(&report).await.is_err() {
@@ -27,7 +36,6 @@ async fn main() {
         }
         return;
     }
-
     let _guard = sentry::initialize();
     panic::install();
     let filter = tracing_subscriber::filter::EnvFilter::builder()

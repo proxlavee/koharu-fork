@@ -6,7 +6,7 @@ on:
       ref:
         description: llama.cpp branch or tag to build
         required: true
-        default: b9982
+        default: b10430
   pull_request:
     branches: ['main']
     paths:
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REF: ${{ github.event.inputs.ref || 'b9982' }}
+  REF: ${{ github.event.inputs.ref || 'b10430' }}
 
 jobs:
   build:

@@ -1,6 +1,9 @@
 #include "torch_api.h"
 #include <ATen/autocast_mode.h>
+#include <limits>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/jit/codegen/cuda/interface.h>
 #include <torch/csrc/jit/frontend/tracer.h>
@@ -20,9 +23,50 @@
 #include "stb_image_write.h"
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "stb_image_resize.h"
+#include "stb_image_resize2.h"
 
 thread_local char *torch_last_err = nullptr;
+
+namespace {
+
+int checked_image_dimension(int64_t value, const char *name) {
+  if (value <= 0 || value > std::numeric_limits<int>::max())
+    throw std::invalid_argument(std::string(name) +
+                                " must be between 1 and INT_MAX");
+  return static_cast<int>(value);
+}
+
+size_t checked_image_byte_count(int height, int width, int channels) {
+  if (height <= 0 || width <= 0 || channels <= 0)
+    throw std::invalid_argument("image dimensions and channels must be positive");
+  size_t bytes = static_cast<size_t>(height);
+  const size_t maximum = std::numeric_limits<size_t>::max();
+  if (bytes > maximum / static_cast<size_t>(width))
+    throw std::overflow_error("image dimensions exceed addressable memory");
+  bytes *= static_cast<size_t>(width);
+  if (bytes > maximum / static_cast<size_t>(channels))
+    throw std::overflow_error("image byte length exceeds addressable memory");
+  return bytes * static_cast<size_t>(channels);
+}
+
+stbir_pixel_layout image_pixel_layout(int channels) {
+  switch (channels) {
+  case 1:
+    return STBIR_1CHANNEL;
+  case 2:
+    return STBIR_2CHANNEL;
+  case 3:
+    return STBIR_RGB;
+  case 4:
+    return STBIR_4CHANNEL;
+  default:
+    throw std::invalid_argument("image channel count must be between 1 and 4");
+  }
+}
+
+using StbiImage = std::unique_ptr<stbi_uc, decltype(&stbi_image_free)>;
+
+} // namespace
 
 char *get_and_reset_last_err() {
   char *tmp = torch_last_err;
@@ -353,22 +397,30 @@ tensor at_load(const char *filename) {
 
 tensor at_load_image(const char *filename) {
   PROTECT(
+      if (filename == nullptr) throw std::invalid_argument("image path is null");
       int w = -1; int h = -1; int c = -1;
-      void *data = stbi_load(filename, &w, &h, &c, 3);
-      if (data == nullptr) throw std::invalid_argument(stbi_failure_reason());
+      StbiImage data(stbi_load(filename, &w, &h, &c, 3), stbi_image_free);
+      if (!data) throw std::invalid_argument(stbi_failure_reason());
+      const size_t byte_count = checked_image_byte_count(h, w, 3);
       torch::Tensor tensor = torch::zeros({h, w, 3}, at::ScalarType::Byte);
-      memcpy(tensor.data_ptr(), data, h * w * 3); free(data);
+      memcpy(tensor.data_ptr(), data.get(), byte_count);
       return new torch::Tensor(tensor);)
   return nullptr;
 }
 
 tensor at_load_image_from_memory(const unsigned char *img_data, size_t img_size) {
   PROTECT(
+      if (img_data == nullptr) throw std::invalid_argument("image buffer is null");
+      if (img_size > static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("image buffer exceeds stb's INT_MAX input limit");
       int w = -1; int h = -1; int c = -1;
-      void *data = stbi_load_from_memory(img_data, img_size, &w, &h, &c, 3);
-      if (data == nullptr) throw std::invalid_argument(stbi_failure_reason());
+      StbiImage data(stbi_load_from_memory(img_data, static_cast<int>(img_size),
+                                          &w, &h, &c, 3),
+                     stbi_image_free);
+      if (!data) throw std::invalid_argument(stbi_failure_reason());
+      const size_t byte_count = checked_image_byte_count(h, w, 3);
       torch::Tensor tensor = torch::zeros({h, w, 3}, at::ScalarType::Byte);
-      memcpy(tensor.data_ptr(), data, h * w * 3); free(data);
+      memcpy(tensor.data_ptr(), data.get(), byte_count);
       return new torch::Tensor(tensor);)
   return nullptr;
 }
@@ -386,20 +438,32 @@ bool ends_with(const char *str, const char *suffix) {
 
 int at_save_image(tensor tensor, const char *filename) {
   PROTECT(auto sizes = tensor->sizes();
+          if (filename == nullptr) throw std::invalid_argument(
+              "image path is null");
           if (tensor->device().type() != at::kCPU) throw std::invalid_argument(
               "the input tensor has to be on cpu");
           if (sizes.size() != 3) throw std::invalid_argument(
               "invalid number of dimensions, should be 3");
-          int h = sizes[0]; int w = sizes[1]; int c = sizes[2];
+          if (tensor->scalar_type() != at::ScalarType::Byte)
+            throw std::invalid_argument("the input tensor has to contain bytes");
+          int h = checked_image_dimension(sizes[0], "image height");
+          int w = checked_image_dimension(sizes[1], "image width");
+          int c = checked_image_dimension(sizes[2], "image channels");
+          image_pixel_layout(c);
+          checked_image_byte_count(h, w, c);
           auto tmp_tensor = tensor->contiguous();
           void *tensor_data = tmp_tensor.data_ptr();
-          if (ends_with(filename, ".jpg")) return stbi_write_jpg(
-              filename, w, h, c, tensor_data, 90);
-          if (ends_with(filename, ".bmp")) return stbi_write_bmp(
-              filename, w, h, c, tensor_data);
-          if (ends_with(filename, ".tga")) return stbi_write_tga(
-              filename, w, h, c, tensor_data);
-          return stbi_write_png(filename, w, h, c, tensor_data, 0);)
+          int result;
+          if (ends_with(filename, ".jpg"))
+            result = stbi_write_jpg(filename, w, h, c, tensor_data, 90);
+          else if (ends_with(filename, ".bmp"))
+            result = stbi_write_bmp(filename, w, h, c, tensor_data);
+          else if (ends_with(filename, ".tga"))
+            result = stbi_write_tga(filename, w, h, c, tensor_data);
+          else
+            result = stbi_write_png(filename, w, h, c, tensor_data, 0);
+          if (result == 0) throw std::runtime_error("failed to encode image");
+          return result;)
   return -1;
 }
 
@@ -446,12 +510,23 @@ tensor at_resize_image(tensor tensor, int out_w, int out_h) {
           "the input tensor has to be on cpu");
       if (sizes.size() != 3) throw std::invalid_argument(
           "invalid number of dimensions, should be 3");
-      int h = sizes[0]; int w = sizes[1]; int c = sizes[2];
+      if (tensor->scalar_type() != at::ScalarType::Byte)
+        throw std::invalid_argument("the input tensor has to contain bytes");
+      int h = checked_image_dimension(sizes[0], "image height");
+      int w = checked_image_dimension(sizes[1], "image width");
+      int c = checked_image_dimension(sizes[2], "image channels");
+      checked_image_dimension(out_w, "output width");
+      checked_image_dimension(out_h, "output height");
+      const stbir_pixel_layout layout = image_pixel_layout(c);
+      checked_image_byte_count(h, w, c);
+      checked_image_byte_count(out_h, out_w, c);
       auto tmp_tensor = tensor->contiguous();
       const unsigned char *tensor_data = (unsigned char *)tmp_tensor.data_ptr();
       torch::Tensor out = torch::zeros({out_h, out_w, c}, at::ScalarType::Byte);
-      stbir_resize_uint8(tensor_data, w, h, 0, (unsigned char *)out.data_ptr(),
-                         out_w, out_h, 0, c);
+      if (stbir_resize_uint8_linear(
+              tensor_data, w, h, 0, (unsigned char *)out.data_ptr(), out_w,
+              out_h, 0, layout) == nullptr)
+        throw std::runtime_error("failed to resize image");
       return new torch::Tensor(out);)
   return nullptr;
 }

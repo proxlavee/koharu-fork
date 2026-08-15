@@ -1,20 +1,19 @@
-//! Text layout and Vello glyph recording.
+//! Text layout and portable glyph recording.
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use vello::{
-    FontEmbolden, Glyph, Scene,
-    kurbo::{Affine, Diagonal2, Join, Stroke},
-    peniko::Fill,
+use koharu_rasterizer::{
+    PreparedGlyph, PreparedGlyphRun, PreparedGlyphStyle, PreparedResource, PreparedScene,
+    PreparedSceneCommand, ResourceId,
 };
+use vello::kurbo::Affine;
 
 use crate::{
     Error, FontStyle, HyphenationPolicy, LayoutRun, RenderBounds, RenderDiagnostic,
     Result as RenderResult, TextAlign, TextLayout, WritingMode,
     bubble::LayoutBox,
     fonts::{Fonts, font_key},
-    raster::rgba,
     script::is_chinese_or_japanese_text,
 };
 
@@ -53,7 +52,8 @@ pub(crate) struct TextNodeDescriptor {
 }
 
 pub(crate) struct RenderedTextNode {
-    pub(crate) scene: Arc<Scene>,
+    pub(crate) scene: Arc<PreparedScene>,
+    pub(crate) resources: Arc<[PreparedResource]>,
     pub(crate) local_bounds: RenderBounds,
     pub(crate) metadata: RenderedTextMetadata,
     pub(crate) diagnostics: Vec<RenderDiagnostic>,
@@ -138,7 +138,8 @@ impl TextRenderer {
 
     pub(crate) fn render(
         &self,
-        scene: &mut Scene,
+        scene: &mut PreparedScene,
+        resources: &mut Vec<PreparedResource>,
         layout: &LayoutRun<'_>,
         writing_mode: WritingMode,
         options: &TextRenderOptions,
@@ -150,6 +151,7 @@ impl TextRenderer {
         {
             draw_layout(
                 scene,
+                resources,
                 layout,
                 writing_mode,
                 options,
@@ -159,6 +161,7 @@ impl TextRenderer {
         }
         draw_layout(
             scene,
+            resources,
             layout,
             writing_mode,
             options,
@@ -283,7 +286,8 @@ impl TextRenderer {
             stroke: None,
             ..TextRenderOptions::default()
         };
-        let mut scene = Scene::new();
+        let mut scene = PreparedScene::default();
+        let mut resources = Vec::new();
         if let Some(stroke) = descriptor
             .stroke
             .map(|stroke| stroke.for_font_size(layout.font_size))
@@ -292,6 +296,7 @@ impl TextRenderer {
         }
         self.render(
             &mut scene,
+            &mut resources,
             &layout,
             descriptor.writing_mode,
             &options,
@@ -325,6 +330,7 @@ impl TextRenderer {
             .map_or(0.0, |stroke| stroke.width_px.max(0.0));
         Ok(RenderedTextNode {
             scene: Arc::new(scene),
+            resources: resources.into(),
             local_bounds: RenderBounds {
                 x: rendered_bounds.x - stroke_padding,
                 y: rendered_bounds.y - stroke_padding,
@@ -420,7 +426,8 @@ enum DrawStyle {
 }
 
 fn draw_layout(
-    scene: &mut Scene,
+    scene: &mut PreparedScene,
+    resources: &mut Vec<PreparedResource>,
     layout: &LayoutRun<'_>,
     writing_mode: WritingMode,
     options: &TextRenderOptions,
@@ -445,7 +452,7 @@ fn draw_layout(
 
             let mut glyphs = Vec::with_capacity(end - start);
             for glyph in &line.glyphs[start..end] {
-                glyphs.push(Glyph {
+                glyphs.push(PreparedGlyph {
                     id: glyph.glyph_id,
                     x: options.padding + baseline_x + pen_x + glyph.x_offset,
                     y: options.padding + baseline_y + pen_y
@@ -456,35 +463,40 @@ fn draw_layout(
                 pen_y -= glyph.y_advance;
             }
 
-            let font_data = font.vello_data();
-            let normalized_coords = font.normalized_coords();
-            let mut run = scene
-                .draw_glyphs(&font_data)
-                .font_size(layout.font_size)
-                .transform(transform)
-                .hint(options.hint_glyphs);
-            if !normalized_coords.is_empty() {
-                run = run.normalized_coords(normalized_coords);
+            let font_id = ResourceId::for_font(font.bytes());
+            if !resources.iter().any(|candidate| candidate.id() == font_id) {
+                resources.push(PreparedResource::font_shared(font.shared_bytes()));
             }
-            if let Some(angle) = font.synthetic_skew() {
-                run = run
-                    .glyph_transform(Some(Affine::skew(-(angle.to_radians().tan() as f64), 0.0)));
-            }
-            if font.synthetic_bold() {
-                run = run.font_embolden(FontEmbolden::new(Diagonal2::new(1.0, 1.0)));
-            }
-
-            match style {
-                DrawStyle::Fill => run
-                    .brush(rgba(options.color))
-                    .draw(Fill::NonZero, glyphs.into_iter()),
-                DrawStyle::Stroke(stroke) => {
-                    let outline =
-                        Stroke::new((stroke.width_px * 2.0) as f64).with_join(Join::Round);
-                    run.brush(rgba(stroke.color))
-                        .draw(&outline, glyphs.into_iter());
-                }
-            }
+            let glyph_transform = font
+                .synthetic_skew()
+                .map(|angle| Affine::skew(-(angle.to_radians().tan() as f64), 0.0).as_coeffs());
+            let style = match style {
+                DrawStyle::Fill => PreparedGlyphStyle::Fill {
+                    color: options.color,
+                },
+                DrawStyle::Stroke(stroke) => PreparedGlyphStyle::Stroke {
+                    color: stroke.color,
+                    width: stroke.width_px * 2.0,
+                },
+            };
+            scene
+                .commands
+                .push(PreparedSceneCommand::GlyphRun(PreparedGlyphRun {
+                    font: font_id,
+                    font_index: font.index(),
+                    font_size: layout.font_size,
+                    normalized_coords: font.normalized_coords().to_vec(),
+                    transform: transform.as_coeffs(),
+                    glyph_transform,
+                    hint: options.hint_glyphs,
+                    embolden: if font.synthetic_bold() {
+                        [1.0, 1.0]
+                    } else {
+                        [0.0; 2]
+                    },
+                    style,
+                    glyphs,
+                }));
             start = end;
         }
     }
@@ -492,9 +504,15 @@ fn draw_layout(
 
 #[cfg(test)]
 mod tests {
+    use koharu_rasterizer::{
+        Bounds, CompositionCommand, LayerId, LayerKind as PreparedLayerKind, Point,
+        PreparedContent, PreparedFrame, PreparedFrameBundle, PreparedFrameManifest, PreparedLayer,
+        PreparedResourcePacket, PreparedResourceStore, Presentation, Revision,
+    };
     use koharu_scene::EntityId;
 
     use super::*;
+    use crate::fonts::FontSystem;
 
     #[test]
     fn detected_size_caps_growth_without_preventing_region_fit() {
@@ -563,5 +581,90 @@ mod tests {
         assert!((inferred.for_font_size(12.0).width_px - 1.44).abs() < 0.001);
         assert!((generated_without_reference.for_font_size(12.0).width_px - 1.44).abs() < 0.001);
         assert_eq!(user.for_font_size(12.0).width_px, 10.0);
+    }
+
+    #[test]
+    fn rendered_text_survives_prepared_packet_round_trip() {
+        let font = FontSystem::new().first_font().unwrap();
+        let layout = TextLayout::new(&font)
+            .with_font_size(24.0)
+            .run("Koharu")
+            .unwrap();
+        let mut scene = PreparedScene::default();
+        let mut resources = Vec::new();
+        TextRenderer::new().render(
+            &mut scene,
+            &mut resources,
+            &layout,
+            WritingMode::Horizontal,
+            &TextRenderOptions::default(),
+            Affine::IDENTITY,
+        );
+        assert_eq!(resources.len(), 1);
+        assert!(matches!(
+            &resources[0],
+            PreparedResource::Font { bytes, .. } if !bytes.is_empty()
+        ));
+
+        let layer = LayerId::from_bytes([2; 16]);
+        let bundle = PreparedFrameBundle {
+            frame: PreparedFrame {
+                revision: Revision::new(7),
+                page: LayerId::from_bytes([1; 16]),
+                width: 160,
+                height: 48,
+                origin: (0, 0),
+                normalization: Affine::IDENTITY.as_coeffs(),
+                layers: vec![PreparedLayer {
+                    id: layer,
+                    geometry: vec![
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: 160.0, y: 0.0 },
+                        Point { x: 160.0, y: 48.0 },
+                        Point { x: 0.0, y: 48.0 },
+                    ],
+                    bounds: Bounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 160.0,
+                        height: 48.0,
+                    },
+                    local_bounds: Bounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 160.0,
+                        height: 48.0,
+                    },
+                    presentation: Presentation {
+                        visible: true,
+                        opacity: 1.0,
+                    },
+                    kind: PreparedLayerKind::Text,
+                    placement: Affine::IDENTITY.as_coeffs(),
+                    content: PreparedContent::Vector(scene),
+                    element_frame: None,
+                }],
+            },
+            resources,
+        };
+
+        let encoded = bundle.manifest().unwrap().encode().unwrap();
+        let manifest = PreparedFrameManifest::decode(&encoded).unwrap();
+        let mut resources = PreparedResourceStore::default();
+        for reference in manifest.required_resources() {
+            let encoded = bundle
+                .resource_packet(reference.id)
+                .unwrap()
+                .encode()
+                .unwrap();
+            resources.insert(PreparedResourcePacket::decode(&encoded).unwrap());
+        }
+        let compiled = manifest.compile(&resources).unwrap();
+        assert_eq!(compiled.revision(), Revision::new(7));
+        assert_eq!(compiled.layers()[0].id(), layer);
+        assert!(matches!(
+            compiled.composition_commands(1).as_slice(),
+            [CompositionCommand::Vector(_)]
+        ));
     }
 }
