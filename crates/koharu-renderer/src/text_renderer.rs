@@ -423,10 +423,7 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
-fn maximum_font_size(
-    descriptor: &TextNodeDescriptor,
-    bounds: LayoutBox,
-) -> f32 {
+fn maximum_font_size(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> f32 {
     if descriptor.auto_fit {
         content_aware_maximum_font_size(descriptor, bounds)
     } else {
@@ -434,10 +431,7 @@ fn maximum_font_size(
     }
 }
 
-fn font_size_limits(
-    descriptor: &TextNodeDescriptor,
-    bounds: LayoutBox,
-) -> (f32, f32) {
+fn font_size_limits(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> (f32, f32) {
     let maximum = maximum_font_size(descriptor, bounds);
     let maximum = if descriptor.auto_fit {
         maximum.max(descriptor.minimum_font_size)
