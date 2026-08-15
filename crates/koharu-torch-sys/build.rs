@@ -12,7 +12,7 @@ const OPAQUE_TYPES: &str = "^(tensor|scalar|optimizer|module|ivalue)$";
 const TORCH_API_HEADER: &str = "libtch/torch_api.h";
 const TORCH_API_GENERATED_HEADER: &str = "libtch/torch_api_generated.h";
 // Vendored from nothings/stb@2c980bb59875b0d32144a71867fbdebb2f77cd20.
-// The image and writer headers retain local checked-size hardening at allocation boundaries.
+// The headers retain local checked-size hardening at allocation and copy boundaries.
 const STB_IMAGE_HEADER: &str = "libtch/stb_image.h";
 const STB_IMAGE_RESIZE_HEADER: &str = "libtch/stb_image_resize2.h";
 const STB_IMAGE_WRITE_HEADER: &str = "libtch/stb_image_write.h";

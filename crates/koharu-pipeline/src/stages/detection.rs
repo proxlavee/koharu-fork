@@ -2616,6 +2616,8 @@ mod tests {
                 bbox: [200.0, 52.0, 824.0, 76.0],
                 area: pixels.iter().filter(|value| **value != 0).count() as u32,
                 mask: KoharuLayoutMask {
+                    x: 0,
+                    y: 0,
                     width,
                     height,
                     pixels,
