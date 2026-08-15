@@ -89,7 +89,6 @@ impl ImageCache {
     }
 }
 
-
 pub(crate) fn decode(
     blob: BlobId,
     bytes: &[u8],
