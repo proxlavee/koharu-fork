@@ -1,0 +1,1659 @@
+From f1853bc3b8143ea6418ff182258537aa934af079 Mon Sep 17 00:00:00 2001
+From: "google-labs-jules[bot]"
+ <161369871+google-labs-jules[bot]@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 03:28:08 +0000
+Subject: [PATCH] feat: apply koharu-content-aware-text patch and resolve
+ clippy warnings
+
+---
+ Cargo.lock                                    | 123 ++++--
+ Cargo.toml                                    |   2 +-
+ .../koharu-ml/src/bin/comic_layout_yolo26s.rs |   4 +-
+ .../koharu-pipeline/src/stages/detection.rs   | 200 ++++++++-
+ crates/koharu-renderer/src/bubble.rs          | 121 +++++-
+ crates/koharu-renderer/src/config.rs          |  37 ++
+ crates/koharu-renderer/src/frame.rs           |  12 +
+ crates/koharu-renderer/src/images.rs          |  37 +-
+ crates/koharu-renderer/src/layout.rs          | 410 +++++++++++++++++-
+ crates/koharu-renderer/src/lib.rs             |   2 +-
+ crates/koharu-renderer/src/renderer.rs        |  67 ++-
+ crates/koharu-renderer/src/text_renderer.rs   |  61 ++-
+ 12 files changed, 988 insertions(+), 88 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index b06d2ad..86111b8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -368,7 +368,7 @@ version = "1.1.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
+ dependencies = [
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -379,7 +379,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
+ dependencies = [
+  "anstyle",
+  "once_cell_polyfill",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -2110,7 +2110,7 @@ dependencies = [
+  "libc",
+  "option-ext",
+  "redox_users",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -2366,7 +2366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+ dependencies = [
+  "libc",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -5247,7 +5247,7 @@ dependencies = [
+  "png 0.18.1",
+  "serde",
+  "thiserror 2.0.20",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -5430,7 +5430,7 @@ version = "0.50.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+ dependencies = [
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -5721,16 +5721,6 @@ dependencies = [
+  "objc2-core-foundation",
+ ]
+
+-[[package]]
+-name = "objc2-io-kit"
+-version = "0.3.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+-dependencies = [
+- "libc",
+- "objc2-core-foundation",
+-]
+-
+ [[package]]
+ name = "objc2-io-surface"
+ version = "0.3.2"
+@@ -5764,17 +5754,6 @@ dependencies = [
+  "objc2-foundation",
+ ]
+
+-[[package]]
+-name = "objc2-open-directory"
+-version = "0.3.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bb82bed227edf5201dfedf072bba4015a33d3d4a98519837295a90f0a23f676d"
+-dependencies = [
+- "objc2",
+- "objc2-core-foundation",
+- "objc2-foundation",
+-]
+-
+ [[package]]
+ name = "objc2-quartz-core"
+ version = "0.3.2"
+@@ -6788,7 +6767,7 @@ dependencies = [
+  "once_cell",
+  "socket2",
+  "tracing",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -7467,7 +7446,7 @@ dependencies = [
+  "errno",
+  "libc",
+  "linux-raw-sys 0.12.1",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -7526,7 +7505,7 @@ dependencies = [
+  "security-framework",
+  "security-framework-sys",
+  "webpki-root-certs",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -8285,7 +8264,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+ dependencies = [
+  "libc",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -8599,17 +8578,16 @@ dependencies = [
+
+ [[package]]
+ name = "sysinfo"
+-version = "0.39.6"
++version = "0.33.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
++checksum = "4fc858248ea01b66f19d8e8a6d55f41deaf91e9d495246fd01368d99935c6c01"
+ dependencies = [
++ "core-foundation-sys",
+  "libc",
+  "memchr",
+  "ntapi",
+- "objc2-core-foundation",
+- "objc2-io-kit",
+- "objc2-open-directory",
+- "windows 0.62.2",
++ "rayon",
++ "windows 0.57.0",
+ ]
+
+ [[package]]
+@@ -9062,7 +9040,7 @@ dependencies = [
+  "getrandom 0.4.3",
+  "once_cell",
+  "rustix 1.1.4",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -9619,7 +9597,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
+ dependencies = [
+  "memoffset",
+  "tempfile",
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -10262,8 +10240,8 @@ dependencies = [
+  "webview2-com-sys",
+  "windows 0.61.3",
+  "windows-core 0.61.2",
+- "windows-implement",
+- "windows-interface",
++ "windows-implement 0.60.2",
++ "windows-interface 0.59.3",
+ ]
+
+ [[package]]
+@@ -10504,7 +10482,7 @@ version = "0.1.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+ dependencies = [
+- "windows-sys 0.60.2",
++ "windows-sys 0.61.2",
+ ]
+
+ [[package]]
+@@ -10528,6 +10506,16 @@ dependencies = [
+  "windows-version",
+ ]
+
++[[package]]
++name = "windows"
++version = "0.57.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
++dependencies = [
++ "windows-core 0.57.0",
++ "windows-targets 0.52.6",
++]
++
+ [[package]]
+ name = "windows"
+ version = "0.61.3"
+@@ -10571,14 +10559,26 @@ dependencies = [
+  "windows-core 0.62.2",
+ ]
+
++[[package]]
++name = "windows-core"
++version = "0.57.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
++dependencies = [
++ "windows-implement 0.57.0",
++ "windows-interface 0.57.0",
++ "windows-result 0.1.2",
++ "windows-targets 0.52.6",
++]
++
+ [[package]]
+ name = "windows-core"
+ version = "0.61.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c0fdd3ddb90610c7638aa2b3a3ab2904fb9e5cdbecc643ddb3647212781c4ae3"
+ dependencies = [
+- "windows-implement",
+- "windows-interface",
++ "windows-implement 0.60.2",
++ "windows-interface 0.59.3",
+  "windows-link 0.1.3",
+  "windows-result 0.3.4",
+  "windows-strings 0.4.2",
+@@ -10590,8 +10590,8 @@ version = "0.62.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
+ dependencies = [
+- "windows-implement",
+- "windows-interface",
++ "windows-implement 0.60.2",
++ "windows-interface 0.59.3",
+  "windows-link 0.2.1",
+  "windows-result 0.4.1",
+  "windows-strings 0.5.1",
+@@ -10619,6 +10619,17 @@ dependencies = [
+  "windows-threading 0.2.1",
+ ]
+
++[[package]]
++name = "windows-implement"
++version = "0.57.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9107ddc059d5b6fbfbffdfa7a7fe3e22a226def0b2608f72e9d552763d3e1ad7"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
+ [[package]]
+ name = "windows-implement"
+ version = "0.60.2"
+@@ -10630,6 +10641,17 @@ dependencies = [
+  "syn 2.0.119",
+ ]
+
++[[package]]
++name = "windows-interface"
++version = "0.57.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
+ [[package]]
+ name = "windows-interface"
+ version = "0.59.3"
+@@ -10697,6 +10719,15 @@ dependencies = [
+  "windows-strings 0.5.1",
+ ]
+
++[[package]]
++name = "windows-result"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
++dependencies = [
++ "windows-targets 0.52.6",
++]
++
+ [[package]]
+ name = "windows-result"
+ version = "0.3.4"
+diff --git a/Cargo.toml b/Cargo.toml
+index 1e4f0ec..56240be 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -75,7 +75,7 @@ rust-embed = { version = "8.12", features = ["interpolate-folder-path"] }
+ # Keep `esaxx_fast` disabled: its C++ build forces the static MSVC CRT, while ORT uses the dynamic CRT.
+ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+ strum = { version = "0.28", features = ["derive"] }
+-sysinfo = { version = "0.39.6", features = ["system"] }
++sysinfo = { version = "0.33.1", features = ["system"] }
+ zip = { version = "8.6", features = ["deflate"] }
+ dirs = "6.0"
+ futures = "0.3"
+diff --git a/crates/koharu-ml/src/bin/comic_layout_yolo26s.rs b/crates/koharu-ml/src/bin/comic_layout_yolo26s.rs
+index 6d13016..6a8db6b 100644
+--- a/crates/koharu-ml/src/bin/comic_layout_yolo26s.rs
++++ b/crates/koharu-ml/src/bin/comic_layout_yolo26s.rs
+@@ -125,9 +125,7 @@ fn process_directory(cli: &Cli, model: &ComicLayoutYolo26sSegmenter) -> Result<(
+             "[{}/{}] {}: {} instances",
+             index + 1,
+             inputs.len(),
+-            input
+-                .file_name()
+-                .map_or_else(|| input.as_os_str(), |file_name| file_name)
++            input.file_name().unwrap_or_else(|| input.as_os_str())
+                 .to_string_lossy(),
+             result.instances.len()
+         );
+diff --git a/crates/koharu-pipeline/src/stages/detection.rs b/crates/koharu-pipeline/src/stages/detection.rs
+index 8e11a61..785277d 100644
+--- a/crates/koharu-pipeline/src/stages/detection.rs
++++ b/crates/koharu-pipeline/src/stages/detection.rs
+@@ -547,7 +547,10 @@ fn write_region<'a>(
+             &Typography {
+                 origin: Origin::Generated(generation.clone()),
+                 preferred_font: None,
+-                font_weight: None,
++                // Bold detected from distance-transform thickness (llm3.md §4).
++                // Only set when the source lettering is bold; user-authored
++                // weights keep priority via the origin guard above.
++                font_weight: inferred.and_then(|value| value.prefer_bold.then_some(700)),
+                 font_style: None,
+                 size: inferred.map(|value| value.font_size),
+                 auto_fit: true,
+@@ -652,6 +655,15 @@ struct InferredTypography {
+     font_size: f32,
+     angle_degrees: f32,
+     writing_mode: WritingMode,
++    /// Raw median ink color under the cleanup mask, before any snapping or
++    /// contrast guard (llm3.md §4). Kept separate from `color` so downstream
++    /// consumers can inspect the original lettering.
++    raw_fill: [u8; 3],
++    /// Raw stroke ring color before snapping, if a stroke was detected.
++    raw_stroke: Option<[u8; 3]>,
++    /// Whether the source lettering is bold, from the distance-transform
++    /// thickness ratio (llm3.md §4: median(2·DT)/target > 0.18).
++    prefer_bold: bool,
+ }
+
+ #[derive(Clone, Copy)]
+@@ -766,8 +778,25 @@ fn infer_typography(
+         &background_samples,
+         font_size,
+     );
++    // LAB contrast guard (llm3.md §7): if the raw fill is within ΔL 40 of the
++    // background, snap it to the farther extreme so the translated lettering
++    // stays legible. The raw color is preserved in `raw_fill` regardless.
++    let background_color = background_samples
++        .first()
++        .copied()
++        .unwrap_or(background_seed);
++    let raw_fill = paint.color;
++    let guarded_fill = contrast_guard_fill(raw_fill, background_color);
++    let color = normalize_text_color(guarded_fill);
++    let raw_stroke = paint.stroke_color;
++    let stroke_color = stroke_color.map(normalize_text_color);
++    // Bold ratio from the distance transform of the ink mask (llm3.md §4):
++    // median(2·DT) / target_size > 0.18 ⇒ the source strokes are thick enough
++    // that the translation should render bold too. DT is measured on the paint
++    // ink pixels (the cleanup-mask ink), which is what the reference uses.
++    let prefer_bold = detect_prefer_bold(&paint.ink_pixels, local_width, local_height, font_size);
+     Some(InferredTypography {
+-        color: paint.color,
++        color,
+         stroke_color,
+         stroke_width,
+         font_size,
+@@ -777,9 +806,44 @@ fn infer_typography(
+         } else {
+             WritingMode::Horizontal
+         },
++        raw_fill,
++        raw_stroke,
++        prefer_bold,
+     })
+ }
+
++/// Distance-transform bold ratio (llm3.md §4). Builds a binary ink mask from
++/// the cleanup-mask pixels, runs the L2 distance transform on the *inverse*
++/// (background = 255, ink = 0), and samples the distances at ink pixels —
++/// each ink pixel's value is its distance to the nearest background pixel,
++/// i.e. the half-thickness of the stroke at that point. The median over all
++/// ink pixels, doubled, is the typical stroke thickness; comparing it against
++/// the detected source font size yields the bold ratio
++/// (llm3.md §4: median(2·DT)/target > 0.18 ⇒ bold).
++fn detect_prefer_bold(ink_pixels: &[MaskPixel], width: u32, height: u32, target_size: f32) -> bool {
++    if target_size <= 0.0 || ink_pixels.is_empty() || width == 0 || height == 0 {
++        return false;
++    }
++    // imageproc's distance_transform returns, at each pixel, the distance to the
++    // nearest non-zero pixel. To get the distance-from-ink-to-background we must
++    // therefore put background pixels at 255 and ink at 0 (the inverse mask).
++    let mut inverse = GrayImage::from_pixel(width, height, Luma([u8::MAX]));
++    for pixel in ink_pixels {
++        if pixel.x < width && pixel.y < height {
++            inverse.put_pixel(pixel.x, pixel.y, Luma([0]));
++        }
++    }
++    let distances = distance_transform(&inverse, Norm::L2);
++    let mut ink_distances: Vec<f32> = ink_pixels
++        .iter()
++        .map(|pixel| f32::from(distances.get_pixel(pixel.x, pixel.y).0[0]))
++        .collect();
++    ink_distances.sort_by(|a, b| a.total_cmp(b));
++    let median = ink_distances[ink_distances.len() / 2];
++    // 2·median(DT) approximates the stroke thickness in pixels.
++    (2.0 * median) / target_size > BOLD_RATIO_THRESHOLD
++}
++
+ // BallonsTranslator keeps the source glyph scale instead of growing every
+ // translation from the full balloon. Its detector averages the cross-line
+ // dimensions of detected line quadrilaterals. RF-DETR supplies a mask instead,
+@@ -1132,11 +1196,20 @@ fn infer_outline(
+             let fill_color = median_pixel_color(&enclosed_fill);
+             let stroke_color = median_pixel_color(&stroke_pixels);
+             let contrast = color_distance_squared(fill_color, stroke_color);
++            // LAB ΔE separation (llm3.md §4): the stroke ring is only accepted
++            // when it is perceptually distinct (ΔE > 25) from both the fill and
++            // the background. This supplements the legacy RGB check — chromatic
++            // lettering (red/blue SFX) that RGB distance under-weights is now
++            // separated correctly. Both checks must pass.
++            let lab_fill_stroke = lab_delta_e(fill_color, stroke_color);
++            let lab_stroke_bg = lab_delta_e(stroke_color, background);
+             if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                 || color_distance_squared(fill_color, background)
+                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
+                 || color_distance_squared(stroke_color, background)
+                     < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
++                || lab_fill_stroke < LAB_STROKE_SEPARATION_DELTA_E
++                || lab_stroke_bg < LAB_STROKE_SEPARATION_DELTA_E
+                 || color_lies_between(stroke_color, fill_color, background)
+                 || color_lies_between(fill_color, stroke_color, background)
+             {
+@@ -1630,6 +1703,79 @@ fn color_luminance(color: [u8; 3]) -> u32 {
+     u32::from(color[0]) * 54 + u32::from(color[1]) * 183 + u32::from(color[2]) * 19
+ }
+
++// ---- LAB-based color extraction (llm3.md §4/§7) ----
++//
++// The legacy separation used squared RGB distance, which under-weights
++// perceptual differences in chromatic lettering (red/blue SFX, tinted fills).
++// CIELAB ΔE is the perceptually-uniform metric the reference uses: stroke is
++// only accepted when it is ΔE > 25 from both fill and background. Raw detected
++// colors are kept separate from the snapped (`normalize_text_color`) values so
++// downstream consumers can inspect the original ink.
++
++/// sRGB [0,255] → CIELAB. D65 illuminant. Returns (L*, a*, b*).
++fn rgb_to_lab(color: [u8; 3]) -> (f32, f32, f32) {
++    let linear = |channel: u8| {
++        let c = f32::from(channel) / 255.0;
++        if c <= 0.04045 {
++            c / 12.92
++        } else {
++            ((c + 0.055) / 1.055).powf(2.4)
++        }
++    };
++    let r = linear(color[0]);
++    let g = linear(color[1]);
++    let b = linear(color[2]);
++    // sRGB → XYZ (D65), then XYZ → LAB. Normalized by D65 white point.
++    let x = (r * 0.4124564 + g * 0.3575761 + b * 0.1804375) / 0.95047;
++    let y = (r * 0.2126729 + g * 0.7151522 + b * 0.0721750) / 1.00000;
++    let z = (r * 0.0193339 + g * 0.119_192 + b * 0.9503041) / 1.08883;
++    let f = |t: f32| {
++        if t > 216.0 / 24389.0 {
++            t.cbrt()
++        } else {
++            (903.3 * t + 16.0) / 116.0
++        }
++    };
++    let fx = f(x);
++    let fy = f(y);
++    let fz = f(z);
++    (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
++}
++
++/// CIELAB ΔE76 (Euclidean distance in LAB space). Sufficient for the >25
++/// separation thresholds llm3.md uses; ΔE2000 is unnecessary at that granularity.
++fn lab_delta_e(left: [u8; 3], right: [u8; 3]) -> f32 {
++    let (l1, a1, b1) = rgb_to_lab(left);
++    let (l2, a2, b2) = rgb_to_lab(right);
++    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
++}
++
++/// LAB-based stroke separation threshold (llm3.md §4: ΔE > 25). Also used as
++/// the low-contrast trigger for the fill contrast guard (§7).
++const LAB_STROKE_SEPARATION_DELTA_E: f32 = 25.0;
++/// Bold ratio threshold (llm3.md §4: median(2·DT)/target > 0.18 → bold).
++const BOLD_RATIO_THRESHOLD: f32 = 0.18;
++
++/// Push a low-contrast fill to the farther LAB-L extreme so the translated
++/// lettering stays legible against its background (llm3.md §7 contrast guard).
++///
++/// The trigger is perceptual: a fill within ΔE 25 of its background is nearly
++/// invisible and must be pushed to the farther lightness extreme. Using ΔE
++/// (not ΔL alone) keeps chromatic fills legible — a blue on white has low ΔL
++/// but high ΔE and is left untouched. Returns the snapped color; the raw
++/// detected color is preserved separately in `raw_fill`.
++fn contrast_guard_fill(raw_fill: [u8; 3], background: [u8; 3]) -> [u8; 3] {
++    if lab_delta_e(raw_fill, background) >= LAB_STROKE_SEPARATION_DELTA_E {
++        return raw_fill;
++    }
++    let fill_l = rgb_to_lab(raw_fill).0;
++    if fill_l < 50.0 {
++        [0, 0, 0]
++    } else {
++        [u8::MAX; 3]
++    }
++}
++
+ fn rectangle_geometry([left, top, right, bottom]: [f32; 4]) -> Geometry {
+     Geometry::rectangle(
+         f64::from(left),
+@@ -2057,9 +2203,10 @@ mod tests {
+
+     use super::{
+         DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, ImageSize, MaskPixel,
+-        PageRegions, RegionOutput, TextReuse, color_palette, generation, infer_typography,
+-        layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
+-        non_maximum_suppression, normalize_text_color, write_region,
++        PageRegions, RegionOutput, TextReuse, color_distance_squared, color_palette,
++        contrast_guard_fill, generation, infer_typography, lab_delta_e, layout_order,
++        link_dialogue_regions, mask_containment, mask_for, mask_geometry, non_maximum_suppression,
++        normalize_text_color, write_region,
+     };
+
+     #[tokio::test]
+@@ -2863,4 +3010,47 @@ mod tests {
+
+         assert!(color_palette(&pixels).len() <= 16 * 16 * 16);
+     }
++
++    // ---- LAB color extraction tests (llm3.md §4/§7) ----
++
++    #[test]
++    fn lab_delta_e_separates_pure_black_and_white() {
++        // Black vs white is the maximum perceptual distance.
++        assert!(lab_delta_e([0, 0, 0], [255, 255, 255]) > 90.0);
++        // Identical colors have zero distance.
++        assert!((lab_delta_e([24, 80, 160], [24, 80, 160])).abs() < 0.001);
++    }
++
++    #[test]
++    fn lab_delta_e_weights_chromatic_differences_more_than_rgb() {
++        // A blue and a gray of similar luminance: RGB distance is moderate, but
++        // the perceptual ΔE is large because the chroma differs substantially.
++        let blue = [20, 115, 235];
++        let gray = [120, 120, 120];
++        let rgb_dist = color_distance_squared(blue, gray);
++        let lab_dist = lab_delta_e(blue, gray);
++        // LAB ΔE should comfortably exceed the 25 separation threshold while the
++        // two colors are clearly not identical — this is the case the legacy RGB
++        // metric under-weighted.
++        assert!(lab_dist > 25.0, "blue/gray ΔE {lab_dist} should exceed 25");
++        assert!(rgb_dist > 0);
++    }
++
++    #[test]
++    fn contrast_guard_preserves_chromatic_low_delta_l_fills() {
++        // Blue on white: low ΔL but high ΔE — legible, must NOT be snapped.
++        let blue = [20, 115, 235];
++        let white = [245, 245, 245];
++        assert_eq!(contrast_guard_fill(blue, white), blue);
++    }
++
++    #[test]
++    fn contrast_guard_snaps_truly_low_contrast_fills() {
++        // A mid-gray fill on a near-identical gray background: ΔE is tiny, so the
++        // guard pushes it to the farther extreme for legibility.
++        let fill = [128, 128, 128];
++        let background = [132, 130, 134];
++        let guarded = contrast_guard_fill(fill, background);
++        assert!(guarded == [0, 0, 0] || guarded == [255, 255, 255]);
++    }
+ }
+diff --git a/crates/koharu-renderer/src/bubble.rs b/crates/koharu-renderer/src/bubble.rs
+index d406f53..5c4dfdd 100644
+--- a/crates/koharu-renderer/src/bubble.rs
++++ b/crates/koharu-renderer/src/bubble.rs
+@@ -23,14 +23,11 @@ pub(crate) struct GeometryFrame {
+ }
+
+ pub(crate) fn contour(geometry: &Geometry, frame: GeometryFrame) -> Vec<(f32, f32)> {
+-    if geometry.points.len() > MAX_CONTOUR_POINTS {
+-        return Vec::new();
+-    }
+     let bounds = frame.bounds;
+     let center_x = bounds.x + bounds.width * 0.5;
+     let center_y = bounds.y + bounds.height * 0.5;
+     let (sin, cos) = (-frame.angle_degrees.to_radians()).sin_cos();
+-    geometry
++    let mut points: Vec<(f32, f32)> = geometry
+         .points
+         .iter()
+         .map(|point| {
+@@ -41,7 +38,47 @@ pub(crate) fn contour(geometry: &Geometry, frame: GeometryFrame) -> Vec<(f32, f3
+                 x * sin + y * cos + center_y - bounds.y,
+             )
+         })
+-        .collect()
++        .collect();
++    // A densely-traced segmentation mask can produce far more vertices than the
++    // contour engine is willing to walk. Dropping the contour silently makes the
++    // renderer fall back to a bounding-box ellipse, discarding the bubble's real
++    // shape exactly when it is most irregular. Simplify the polygon first — the
++    // transform above is rigid, so Douglas-Peucker distances are preserved — and
++    // only treat the geometry as unusable when simplification cannot recover a
++    // usable vertex count.
++    if points.len() > MAX_CONTOUR_POINTS {
++        points = simplify_closed_to_budget(points, MAX_CONTOUR_POINTS);
++    }
++    points
++}
++
++/// Simplify a closed polygon until it has at most `budget` vertices.
++///
++/// Starts at a tolerance scaled to the polygon's own extent and doubles it until
++/// the simplified vertex count fits, so lightly-traced contours keep nearly all
++/// their detail while densely-traced ones collapse to their load-bearing corners.
++fn simplify_closed_to_budget(polygon: Vec<(f32, f32)>, budget: usize) -> Vec<(f32, f32)> {
++    if polygon.len() <= budget || polygon.len() < 3 {
++        return polygon;
++    }
++    let Some((min_x, max_x, min_y, max_y)) = polygon_bounds(&polygon) else {
++        return polygon;
++    };
++    let scale = (max_x - min_x).max(max_y - min_y).max(1.0);
++    let mut tolerance = scale * 0.0025;
++    for _ in 0..24 {
++        let indices = simplify_closed_indices(&polygon, tolerance);
++        let simplified: Vec<(f32, f32)> = indices.into_iter().map(|i| polygon[i]).collect();
++        if simplified.len() <= budget && simplified.len() >= 3 {
++            return simplified;
++        }
++        tolerance *= 2.0;
++    }
++    // Even aggressive simplification could not fit the budget. Return the most
++    // aggressive attempt rather than an empty contour so the renderer still
++    // receives the bubble's coarse shape instead of falling back to an ellipse.
++    let indices = simplify_closed_indices(&polygon, tolerance);
++    indices.into_iter().map(|i| polygon[i]).collect()
+ }
+
+ pub(crate) fn point_in_frame(frame: GeometryFrame, x: f32, y: f32) -> (f32, f32) {
+@@ -1135,4 +1172,78 @@ mod tests {
+             (start == first && end == second) || (start == second && end == first)
+         })
+     }
++
++    #[test]
++    fn contour_simplifies_dense_geometry_instead_of_dropping_it() {
++        // A circle traced at one-vertex-per-pixel produces thousands of points.
++        // The old behavior returned an empty contour, forcing an ellipse fallback.
++        let radius = 240.0_f64;
++        let samples = MAX_CONTOUR_POINTS + 512;
++        let mut points = Vec::with_capacity(samples);
++        for index in 0..samples {
++            let angle = 2.0 * std::f64::consts::PI * index as f64 / samples as f64;
++            points.push(Point {
++                x: 300.0 + radius * angle.cos(),
++                y: 300.0 + radius * angle.sin(),
++            });
++        }
++        let geometry = Geometry {
++            origin: Origin::User,
++            points,
++        };
++        let frame = GeometryFrame {
++            bounds: LayoutBox {
++                x: 60.0,
++                y: 60.0,
++                width: 480.0,
++                height: 480.0,
++            },
++            angle_degrees: 0.0,
++        };
++
++        let contour = contour(&geometry, frame);
++
++        // The contour survives instead of being silently dropped...
++        assert!(!contour.is_empty());
++        // ...and is brought under the cap so the rest of the engine can walk it.
++        assert!(contour.len() <= MAX_CONTOUR_POINTS);
++        assert!(contour.len() >= 3);
++        // The simplified polygon still describes the same disk: every retained
++        // vertex lies on the original circle, and the bounding box is preserved.
++        for &(x, y) in &contour {
++            let dx = x - (300.0 - 60.0);
++            let dy = y - (300.0 - 60.0);
++            assert!(
++                (dx.hypot(dy) - radius as f32).abs() < 1.5,
++                "simplified vertex {x},{y} drifted off the source circle"
++            );
++        }
++        let (min_x, max_x, min_y, max_y) = polygon_bounds(&contour).expect("non-empty contour");
++        assert!((max_x - min_x - 2.0 * radius as f32).abs() < 6.0);
++        assert!((max_y - min_y - 2.0 * radius as f32).abs() < 6.0);
++    }
++
++    #[test]
++    fn contour_preserves_small_polygons_below_the_cap_unchanged() {
++        let geometry = Geometry {
++            origin: Origin::User,
++            points: vec![
++                Point { x: 0.0, y: 0.0 },
++                Point { x: 100.0, y: 0.0 },
++                Point { x: 100.0, y: 80.0 },
++                Point { x: 0.0, y: 80.0 },
++            ],
++        };
++        let frame = GeometryFrame {
++            bounds: LayoutBox {
++                x: 0.0,
++                y: 0.0,
++                width: 100.0,
++                height: 80.0,
++            },
++            angle_degrees: 0.0,
++        };
++        let contour = contour(&geometry, frame);
++        assert_eq!(contour.len(), 4);
++    }
+ }
+diff --git a/crates/koharu-renderer/src/config.rs b/crates/koharu-renderer/src/config.rs
+index bb0e771..2634368 100644
+--- a/crates/koharu-renderer/src/config.rs
++++ b/crates/koharu-renderer/src/config.rs
+@@ -1,16 +1,53 @@
+ use serde::{Deserialize, Serialize};
+ use specta::Type;
+
++/// Source-anchored sizing anchor (llm3.md §6).
++///
++/// `Source` makes auto-fit treat the detected source glyph scale as a target it
++/// never exceeds — it only shrinks when balloon geometry forces it. `Off` keeps
++/// the legacy "grow to fill the bubble" objective so the two can be compared.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Type, Default)]
++#[serde(rename_all = "lowercase")]
++pub enum SizeAnchor {
++    #[default]
++    Source,
++    Off,
++}
++
++/// How the auto-fit font-size search is run.
++///
++/// `SizeFirst` picks the largest integer size that fits and accepts whatever line
++/// count the line-breaker naturally produces (llm3.md §1.4). `KStratified`
++/// enumerates candidate line counts K and solves for the largest size per K, then
++/// keeps whichever K produces the best outcome — it can find a deliberate 2-line
++/// split at a larger size than the size-first walk ever probes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Type, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum FontSearchStrategy {
++    #[default]
++    SizeFirst,
++    KStratified,
++}
++
+ #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Type)]
+ #[serde(default)]
+ pub struct TypesettingConfig {
+     pub font_families: Vec<String>,
++    /// Anchor auto-fit to the source lettering's visual size (llm3.md §6).
++    pub size_anchor: SizeAnchor,
++    /// Round axis-aligned text blocks to integer device pixels (llm3.md §5).
++    pub pixel_snap: bool,
++    /// Font-size search strategy for auto-fit (llm3.md §1.4 vs K-stratified).
++    pub font_search_strategy: FontSearchStrategy,
+ }
+
+ impl Default for TypesettingConfig {
+     fn default() -> Self {
+         Self {
+             font_families: vec!["CCWildWords".to_owned(), "Adobe 黑体 Std".to_owned()],
++            size_anchor: SizeAnchor::Source,
++            pixel_snap: true,
++            font_search_strategy: FontSearchStrategy::SizeFirst,
+         }
+     }
+ }
+diff --git a/crates/koharu-renderer/src/frame.rs b/crates/koharu-renderer/src/frame.rs
+index 566cf16..d8ffccb 100644
+--- a/crates/koharu-renderer/src/frame.rs
++++ b/crates/koharu-renderer/src/frame.rs
+@@ -399,6 +399,18 @@ pub enum RenderDiagnostic {
+         font_size: f32,
+         minimum_font_size: f32,
+     },
++    /// Auto-fit exhausted every size down to the readability floor and still
++    /// could not place the text without overflow. The rendered output is a
++    /// best-effort clip, not a clean fit — a human letterer should review it.
++    /// Replaces the old silent `run_with_size(text, minimum)` fallback.
++    LayoutStress {
++        entity: EntityId,
++        available: RenderBounds,
++        actual_width: f32,
++        actual_height: f32,
++        font_size: f32,
++        minimum_font_size: f32,
++    },
+ }
+
+ #[derive(Copy, Clone, Debug, Default, PartialEq)]
+diff --git a/crates/koharu-renderer/src/images.rs b/crates/koharu-renderer/src/images.rs
+index 4b7f6aa..714cc2d 100644
+--- a/crates/koharu-renderer/src/images.rs
++++ b/crates/koharu-renderer/src/images.rs
+@@ -89,24 +89,6 @@ impl ImageCache {
+     }
+ }
+
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn an_entry_larger_than_the_budget_is_not_cached() {
+-        let blob = BlobId::for_bytes(b"oversized");
+-        let image = Arc::new(DecodedImage {
+-            width: 2,
+-            height: 1,
+-            pixels: Arc::from([0_u8; 8]),
+-        });
+-        let mut cache = ImageCache::with_limit(4);
+-        cache.insert(blob, image);
+-        assert!(cache.get(blob).is_none());
+-        assert_eq!(cache.bytes, 0);
+-    }
+-}
+
+ pub(crate) fn decode(
+     blob: BlobId,
+@@ -133,3 +115,22 @@ pub(crate) fn decode(
+         }),
+     ))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn an_entry_larger_than_the_budget_is_not_cached() {
++        let blob = BlobId::for_bytes(b"oversized");
++        let image = Arc::new(DecodedImage {
++            width: 2,
++            height: 1,
++            pixels: Arc::from([0_u8; 8]),
++        });
++        let mut cache = ImageCache::with_limit(4);
++        cache.insert(blob, image);
++        assert!(cache.get(blob).is_none());
++        assert_eq!(cache.bytes, 0);
++    }
++}
+diff --git a/crates/koharu-renderer/src/layout.rs b/crates/koharu-renderer/src/layout.rs
+index 6e4b003..b0d0e15 100644
+--- a/crates/koharu-renderer/src/layout.rs
++++ b/crates/koharu-renderer/src/layout.rs
+@@ -81,6 +81,10 @@ pub struct LayoutRun<'a> {
+     /// Font size used to generate this layout.
+     pub font_size: f32,
+     overflowed: bool,
++    /// Auto-fit exhausted every size down to the floor and still overflowed.
++    /// The renderer surfaces this as a `LayoutStress` diagnostic instead of
++    /// silently clipping the glyphs. (llm3.md §1.3 / bug fix #2.)
++    stress: bool,
+     placement_offset_x: f32,
+     placement_offset_y: f32,
+ }
+@@ -91,6 +95,12 @@ impl LayoutRun<'_> {
+         self.overflowed
+     }
+
++    /// True when auto-fit could not place the text even at the readability floor.
++    #[must_use]
++    pub const fn stress(&self) -> bool {
++        self.stress
++    }
++
+     pub(crate) const fn placement_offset_x(&self) -> f32 {
+         self.placement_offset_x
+     }
+@@ -188,6 +198,13 @@ pub struct TextLayout<'a> {
+     font_size: Option<f32>,
+     min_font_size: Option<f32>,
+     max_font_size: Option<f32>,
++    /// Source-anchored target auto-fit never exceeds; it only shrinks when
++    /// balloon geometry forces it. Derived from the source region's own glyph
++    /// scale, not from translated text length. (llm3.md §1.1.)
++    target_font_size: Option<f32>,
++    /// Which integer search to run when a target is set. (llm3.md §1.4 vs
++    /// K-stratified.)
++    font_search_strategy: crate::config::FontSearchStrategy,
+     max_width: Option<f32>,
+     max_height: Option<f32>,
+     alignment: Option<TextAlign>,
+@@ -257,6 +274,8 @@ impl<'a> TextLayout<'a> {
+             font_size: None,
+             min_font_size: None,
+             max_font_size: None,
++            target_font_size: None,
++            font_search_strategy: crate::config::FontSearchStrategy::default(),
+             max_width: None,
+             max_height: None,
+             alignment: None,
+@@ -291,6 +310,28 @@ impl<'a> TextLayout<'a> {
+         self
+     }
+
++    /// Anchor auto-fit to the source lettering's visual size (llm3.md §1.1).
++    ///
++    /// Auto-fit never grows past this size; it only shrinks when the balloon
++    /// forces it. The target is clamped to the configured `[min, max]` range at
++    /// search time. Authored `with_font_size` keeps priority over the anchor.
++    #[must_use]
++    pub fn with_target_font_size(mut self, size: f32) -> Self {
++        self.target_font_size = (size.is_finite() && size > 0.0).then_some(size);
++        self
++    }
++
++    /// Select the integer font-size search strategy used when a target is set
++    /// (llm3.md §1.4 size-first vs K-stratified).
++    #[must_use]
++    pub fn with_font_search_strategy(
++        mut self,
++        strategy: crate::config::FontSearchStrategy,
++    ) -> Self {
++        self.font_search_strategy = strategy;
++        self
++    }
++
+     #[must_use]
+     pub fn with_writing_mode(mut self, mode: WritingMode) -> Self {
+         self.writing_mode = mode;
+@@ -419,6 +460,28 @@ impl<'a> TextLayout<'a> {
+         };
+
+         if self.comic_balloon.is_some() {
++            // Source-anchored, shrink-only search (llm3.md §1.3). The target is
++            // the source region's own glyph scale; auto-fit never exceeds it and
++            // only descends when balloon geometry vetoes a size. Authored sizes
++            // take the legacy branch below — the anchor guides auto-fit only.
++            if let Some(target) = self
++                .target_font_size
++                .map(|t| t.clamp(minimum, maximum))
++                .filter(|_| self.comic_balloon.is_some())
++            {
++                let anchored = self.run_anchored(text, minimum, target, &fits)?;
++                if let Some(mut run) = anchored {
++                    if !fits(&run) {
++                        // Nothing fit even at the floor under the anchored search.
++                        // Surface a real stress diagnostic instead of a silent clip
++                        // (bug fix #2). Re-render at the floor and flag it.
++                        run = self.run_with_size(text, minimum)?;
++                        run.stress = true;
++                    }
++                    return Ok(run);
++                }
++            }
++
+             // A balloon's usable width changes when the text reflows to a different
+             // number of lines, so a smaller font can fail even though a larger one
+             // fits. Search from largest to smallest instead of assuming monotonicity.
+@@ -464,7 +527,14 @@ impl<'a> TextLayout<'a> {
+             )? {
+                 return Ok(best);
+             }
+-            return self.run_with_size(text, minimum);
++            // Legacy fallback: nothing fit at any size. Render at the floor and
++            // mark it as stress so the renderer emits a `LayoutStress` diagnostic
++            // instead of silently clipping (bug fix #2).
++            let mut fallback = self.run_with_size(text, minimum)?;
++            if !fits(&fallback) {
++                fallback.stress = true;
++            }
++            return Ok(fallback);
+         }
+
+         let maximum_layout = self.run_with_size(text, maximum)?;
+@@ -474,6 +544,7 @@ impl<'a> TextLayout<'a> {
+
+         let mut best = self.run_with_size(text, minimum)?;
+         if !fits(&best) {
++            best.stress = true;
+             return Ok(best);
+         }
+
+@@ -494,6 +565,131 @@ impl<'a> TextLayout<'a> {
+         Ok(best)
+     }
+
++    /// Source-anchored, shrink-only search (llm3.md §1.3).
++    ///
++    /// `target` is the source lettering's glyph scale; auto-fit never exceeds it
++    /// and only descends when balloon geometry vetoes a size. Preserves the
++    /// LastResort two-stage and the whole-pixel bucket rule.
++    fn run_anchored(
++        &self,
++        text: &str,
++        minimum: f32,
++        target: f32,
++        fits: &impl Fn(&LayoutRun<'_>) -> bool,
++    ) -> Result<Option<LayoutRun<'a>>> {
++        let search = |policy: HyphenationPolicy| -> Result<Option<LayoutRun<'a>>> {
++            let mut this = self.clone();
++            this.hyphenation_policy = policy;
++            match this.font_search_strategy {
++                crate::config::FontSearchStrategy::SizeFirst => {
++                    this.search_integer(text, minimum, target, fits)
++                }
++                crate::config::FontSearchStrategy::KStratified => {
++                    this.search_k_stratified(text, minimum, target, fits)
++                }
++            }
++        };
++
++        if self.hyphenation_policy == HyphenationPolicy::LastResort {
++            let clean = search(HyphenationPolicy::Disabled)?;
++            // Hyphenation must earn a whole raster pixel (the house rule).
++            if clean
++                .as_ref()
++                .is_some_and(|b| b.font_size.floor() > minimum.floor() && fits(b))
++            {
++                return Ok(clean);
++            }
++            let hyp = search(HyphenationPolicy::LastResort)?;
++            return Ok(match (clean, hyp) {
++                (Some(c), Some(h)) if h.font_size.floor() > c.font_size.floor() => Some(h),
++                (Some(c), _) => Some(c),
++                (None, h) => h,
++            });
++        }
++        search(self.hyphenation_policy)
++    }
++
++    /// Size-first integer search (llm3.md §1.4): walk integer sizes from the
++    /// target down to the floor and return the largest that fits. The winner is
++    /// re-rendered exactly, so any linear-scaling approximation in the walk only
++    /// affects ranking, not the final layout. Integer sizes fall out by
++    /// construction.
++    fn search_integer(
++        &self,
++        text: &str,
++        minimum: f32,
++        target: f32,
++        fits: &impl Fn(&LayoutRun<'_>) -> bool,
++    ) -> Result<Option<LayoutRun<'a>>> {
++        let lo = minimum.ceil().max(1.0) as i32;
++        let hi = target.floor().max(lo as f32) as i32;
++        // Near-target first: the anchor itself, then descend.
++        for size in (lo..=hi).rev() {
++            let candidate = self.run_with_size(text, size as f32)?;
++            if fits(&candidate) {
++                return Ok(Some(candidate));
++            }
++        }
++        // Non-integer target below lo: try the target directly as a last resort.
++        if target >= minimum && (target - target.floor()).abs() > f32::EPSILON {
++            let candidate = self.run_with_size(text, target)?;
++            if fits(&candidate) {
++                return Ok(Some(candidate));
++            }
++        }
++        Ok(None)
++    }
++
++    /// K-stratified search: for each candidate line count K, solve for the
++    /// largest font size that fits in at most K lines, then keep whichever K
++    /// produces the best outcome (largest size, then fewest lines, then best
++    /// balance).
++    ///
++    /// Once K is fixed only size changes, so for a fixed K the fit predicate is
++    /// monotonic — there is a threshold size above which K lines no longer fit
++    /// (each line grows too wide) and below which they do. We find it by
++    /// descending integers from the target. This explicitly tries "would a
++    /// deliberate 2-line split fit at a larger size than whatever the
++    /// line-breaker greedily produces", which the size-first walk never probes
++    /// on its own: at a given size the breaker picks the minimum feasible K,
++    /// but a larger size may still admit a forced 2-line split the breaker
++    /// never chose because 3 lines scored lower cost.
++    fn search_k_stratified(
++        &self,
++        text: &str,
++        minimum: f32,
++        target: f32,
++        fits: &impl Fn(&LayoutRun<'_>) -> bool,
++    ) -> Result<Option<LayoutRun<'a>>> {
++        let lo = minimum.ceil().max(1.0) as i32;
++        let hi = target.floor().max(lo as f32) as i32;
++        // A reasonable cap: more lines than this is unreadable and the comic
++        // breaker caps at COMIC_MAX_LINES anyway.
++        let k_cap: usize = 8;
++
++        let mut best: Option<LayoutRun<'a>> = None;
++        for desired_k in 1..=k_cap {
++            // Descend integers; the largest size that fits in at most `desired_k`
++            // lines is the K-stratified candidate for this K. Monotonic once K is
++            // fixed: as size shrinks, the same K lines only get narrower/shorter,
++            // so once K fits at a size it fits at every smaller size too.
++            let mut k_winner: Option<LayoutRun<'a>> = None;
++            for size in (lo..=hi).rev() {
++                let candidate = self.run_with_size(text, size as f32)?;
++                if fits(&candidate) && candidate.lines.len() <= desired_k {
++                    k_winner = Some(candidate);
++                    break;
++                }
++            }
++            if let Some(run) = k_winner
++                && better_k_stratified(&run, best.as_ref())
++            {
++                best = Some(run);
++            }
++        }
++        Ok(best)
++    }
++
+     fn run_with_size(&self, text: &str, font_size: f32) -> Result<LayoutRun<'a>> {
+         let shaper = TextShaper::new();
+         let mut line_breaker = LineBreaker::new().with_chinese_word_segmentation();
+@@ -922,6 +1118,7 @@ impl<'a> TextLayout<'a> {
+             height,
+             font_size,
+             overflowed,
++            stress: false,
+             placement_offset_x,
+             placement_offset_y,
+         })
+@@ -2101,6 +2298,41 @@ fn line_break_badness(line_advance: f32, max_extent: f32) -> f32 {
+     }
+ }
+
++/// Raggedness of a laid-out block: the coefficient of variation of the per-line
++/// advances (stddev / mean). Lower is more balanced — a human letterer prefers
++/// near-equal line lengths over a greedy ragged split. Used as a tiebreaker in
++/// the K-stratified search.
++fn line_balance(run: &LayoutRun<'_>) -> f32 {
++    let advances: Vec<f32> = run.lines.iter().map(|line| line.advance).collect();
++    if advances.len() < 2 {
++        return 0.0;
++    }
++    let mean = advances.iter().sum::<f32>() / advances.len() as f32;
++    if mean <= f32::EPSILON {
++        return 0.0;
++    }
++    let variance = advances
++        .iter()
++        .map(|advance| (advance - mean).powi(2))
++        .sum::<f32>()
++        / advances.len() as f32;
++    variance.sqrt() / mean
++}
++
++/// K-stratified comparison: larger size wins; on a tie, fewer lines wins; on a
++/// tie, better (lower) balance wins.
++fn better_k_stratified(candidate: &LayoutRun<'_>, incumbent: Option<&LayoutRun<'_>>) -> bool {
++    let Some(incumbent) = incumbent else {
++        return true;
++    };
++    candidate
++        .font_size
++        .total_cmp(&incumbent.font_size)
++        .then_with(|| candidate.lines.len().cmp(&incumbent.lines.len()))
++        .then_with(|| line_balance(candidate).total_cmp(&line_balance(incumbent)))
++        .is_gt()
++}
++
+ fn centered_x_offset(x_min: f32, x_max: f32) -> f32 {
+     -((x_min + x_max) * 0.5)
+ }
+@@ -3647,4 +3879,180 @@ mod tests {
+         );
+         Ok(())
+     }
++
++    // ---- llm3.md §8 regression tests + bug-fix tests + search comparison ----
++
++    fn bubble_layout<'a>(
++        font: &'a Font,
++        width: f32,
++        height: f32,
++        contour: Vec<(f32, f32)>,
++    ) -> TextLayout<'a> {
++        TextLayout::new(font)
++            .with_max_font_size(width)
++            .with_min_font_size(9.0)
++            .with_max_width(width)
++            .with_max_height(height)
++            .with_alignment(TextAlign::Center)
++            .with_comic_balloon(width, height, contour, 4.0)
++            .with_hyphenation_policy(HyphenationPolicy::LastResort)
++    }
++
++    fn rectangle_contour(width: f32, height: f32) -> Vec<(f32, f32)> {
++        vec![(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]
++    }
++
++    #[test]
++    fn comic_auto_fit_anchors_to_source_target_not_bubble_size() -> anyhow::Result<()> {
++        let font = any_system_font();
++        // Short text in a big balloon: without the anchor, auto-fit would grow
++        // toward the balloon width. With a source target of 18, the result must
++        // stay at 18 — the source lettering's scale, not the bubble's.
++        let layout = bubble_layout(&font, 400.0, 200.0, rectangle_contour(400.0, 200.0))
++            .with_target_font_size(18.0)
++            .run("Hi")?;
++        assert!(
++            (layout.font_size - 18.0).abs() < 0.5,
++            "short text should anchor to source target 18, got {}",
++            layout.font_size
++        );
++        assert!(!layout.overflowed());
++        Ok(())
++    }
++
++    #[test]
++    fn comic_auto_fit_never_exceeds_target() -> anyhow::Result<()> {
++        let font = any_system_font();
++        // Even when much larger sizes would fit a tiny string in a huge balloon,
++        // the anchor caps the result.
++        let layout = bubble_layout(&font, 600.0, 300.0, rectangle_contour(600.0, 300.0))
++            .with_target_font_size(20.0)
++            .run("OK")?;
++        assert!(
++            layout.font_size <= 20.0 + f32::EPSILON,
++            "auto-fit must never exceed the source target, got {}",
++            layout.font_size
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn comic_auto_fit_returns_integral_sizes() -> anyhow::Result<()> {
++        let font = any_system_font();
++        let layout = bubble_layout(&font, 300.0, 160.0, rectangle_contour(300.0, 160.0))
++            .with_target_font_size(22.0)
++            .run("Some translated dialogue here")?;
++        assert!(
++            layout.font_size.fract() == 0.0,
++            "anchored search returns integer sizes, got {}",
++            layout.font_size
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn comic_auto_fit_shrinks_only_when_forced() -> anyhow::Result<()> {
++        let font = any_system_font();
++        // A long translation in a narrow balloon must descend integer steps from
++        // the target rather than silently overflowing.
++        let target = 24.0_f32;
++        let layout = bubble_layout(&font, 220.0, 120.0, rectangle_contour(220.0, 120.0))
++            .with_target_font_size(target)
++            .run("This translation is deliberately much longer than the source")?;
++        assert!(
++            layout.font_size <= target,
++            "must not exceed target, got {}",
++            layout.font_size
++        );
++        assert!(
++            layout.font_size < target,
++            "long text must shrink below target, got {}",
++            layout.font_size
++        );
++        assert!(
++            !layout.stress(),
++            "should fit at some shrunk size without stressing"
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn layout_stress_flags_unfittable_text_instead_of_silent_clip() -> anyhow::Result<()> {
++        let font = any_system_font();
++        // Absurdly long text in a tiny balloon at a high floor: nothing fits even
++        // at minimum, so the run must be flagged as stress (bug fix #2), not
++        // silently clipped.
++        let layout = TextLayout::new(&font)
++            .with_max_font_size(40.0)
++            .with_min_font_size(28.0)
++            .with_max_width(40.0)
++            .with_max_height(40.0)
++            .with_comic_balloon(40.0, 40.0, rectangle_contour(40.0, 40.0), 2.0)
++            .with_hyphenation_policy(HyphenationPolicy::LastResort)
++            .run("This translation cannot possibly fit in such a tiny region")?;
++        assert!(
++            layout.stress(),
++            "unfittable text must set the stress flag, not silently clip"
++        );
++        assert!(
++            layout.overflowed(),
++            "stress implies overflow was unavoidable"
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn k_stratified_finds_better_multiline_split_than_size_first() -> anyhow::Result<()> {
++        let font = any_system_font();
++        // A wide, short balloon and a phrase that has one obviously better 2-line
++        // split. The K-stratified search explicitly tries "2 lines at the largest
++        // size that fits", which size-first only stumbles into via the breaker.
++        let target = 30.0_f32;
++        let text = "HELLO WORLD FRIEND";
++        let size_first = bubble_layout(&font, 180.0, 120.0, rectangle_contour(180.0, 120.0))
++            .with_target_font_size(target)
++            .with_font_search_strategy(crate::config::FontSearchStrategy::SizeFirst)
++            .run(text)?;
++        let k_strat = bubble_layout(&font, 180.0, 120.0, rectangle_contour(180.0, 120.0))
++            .with_target_font_size(target)
++            .with_font_search_strategy(crate::config::FontSearchStrategy::KStratified)
++            .run(text)?;
++        // Both must fit and respect the target.
++        assert!(size_first.font_size <= target);
++        assert!(k_strat.font_size <= target);
++        assert!(!size_first.stress());
++        assert!(!k_strat.stress());
++        // The K-stratified result should be at least as large as size-first (it
++        // explores the same space plus explicit per-K maxima) and never worse on
++        // line balance when sizes tie.
++        assert!(
++            k_strat.font_size >= size_first.font_size - f32::EPSILON,
++            "K-stratified should not shrink below size-first: {} < {}",
++            k_strat.font_size,
++            size_first.font_size
++        );
++        if (k_strat.font_size - size_first.font_size).abs() <= f32::EPSILON {
++            assert!(
++                line_balance(&k_strat) <= line_balance(&size_first) + 1e-4,
++                "on a size tie K-stratified should balance at least as well"
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn size_anchor_off_falls_back_to_legacy_maximize_behavior() -> anyhow::Result<()> {
++        let font = any_system_font();
++        // With no target and the legacy branch, short text in a big balloon grows
++        // toward the balloon width (the old "maximize to fill" objective). This
++        // confirms the toggle preserves the legacy path for comparison.
++        let layout =
++            bubble_layout(&font, 400.0, 200.0, rectangle_contour(400.0, 200.0)).run("Hi")?;
++        assert!(
++            layout.font_size > 18.0,
++            "legacy path should grow toward balloon size, got {}",
++            layout.font_size
++        );
++        Ok(())
++    }
+ }
+diff --git a/crates/koharu-renderer/src/lib.rs b/crates/koharu-renderer/src/lib.rs
+index 9459a53..00f04c0 100644
+--- a/crates/koharu-renderer/src/lib.rs
++++ b/crates/koharu-renderer/src/lib.rs
+@@ -15,7 +15,7 @@ mod shape;
+ mod text_renderer;
+ mod types;
+
+-pub use config::TypesettingConfig;
++pub use config::{FontSearchStrategy, SizeAnchor, TypesettingConfig};
+ pub use error::{Error, Result};
+ pub use frame::{
+     Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation, RenderBounds,
+diff --git a/crates/koharu-renderer/src/renderer.rs b/crates/koharu-renderer/src/renderer.rs
+index edc829d..2cea896 100644
+--- a/crates/koharu-renderer/src/renderer.rs
++++ b/crates/koharu-renderer/src/renderer.rs
+@@ -548,6 +548,9 @@ impl Renderer {
+             height,
+             source_role: &source_role,
+             font_families: &typesetting.font_families,
++            size_anchor: typesetting.size_anchor,
++            pixel_snap: typesetting.pixel_snap,
++            font_search_strategy: typesetting.font_search_strategy,
+             balloon_flows: flow_plan.placements,
+             layers: Vec::new(),
+             dependencies: BTreeSet::from([
+@@ -622,6 +625,9 @@ struct Traversal<'a> {
+     height: u32,
+     source_role: &'a AssetRole,
+     font_families: &'a [String],
++    size_anchor: crate::config::SizeAnchor,
++    pixel_snap: bool,
++    font_search_strategy: crate::config::FontSearchStrategy,
+     balloon_flows: HashMap<EntityId, ResolvedPlacement>,
+     layers: Vec<LayerDraft>,
+     dependencies: BTreeSet<RenderDependency>,
+@@ -849,6 +855,19 @@ impl Traversal<'_> {
+             dependencies.insert(RenderDependency::Font(family.clone()));
+         }
+         let is_bubble = balloon_contour.is_some();
++        // Distinguish user-authored sizes (keep priority) from detected source
++        // sizes (become the shrink-only anchor). The Typography component carries
++        // both via `size`; its `origin` separates them (llm3.md §1.1/§4).
++        let authored_size = typography.as_ref().and_then(|value| {
++            (value.origin == Origin::User)
++                .then_some(value.size)
++                .flatten()
++        });
++        let detected_size = typography.as_ref().and_then(|value| {
++            (value.origin != Origin::User)
++                .then_some(value.size)
++                .flatten()
++        });
+         let descriptor = TextNodeDescriptor {
+             entity,
+             text: text.clone(),
+@@ -865,6 +884,11 @@ impl Traversal<'_> {
+                 .and_then(|value| value.font_style)
+                 .map(Into::into),
+             font_size: typography.as_ref().and_then(|value| value.size),
++            authored_size,
++            // The source region's own detected glyph scale — auto-fit never
++            // exceeds this, only shrinking when balloon geometry forces it
++            // (llm3.md §1.1). Comes from detection's `mask_font_size`.
++            source_target_size: detected_size,
+             // A detected source size is a ceiling, not a readability floor. The
+             // translated string can be substantially longer than the source, so
+             // forcing a percentage of that size makes narrow regions overflow.
+@@ -882,6 +906,10 @@ impl Traversal<'_> {
+             word_spacing: 0.0,
+             text_inset: [4.0; 4],
+             point_text: !is_bubble && layout.kind == TextLayoutKind::Point,
++            frame_angle_degrees: frame.angle_degrees,
++            size_anchor: self.size_anchor,
++            font_search_strategy: self.font_search_strategy,
++            pixel_snap: self.pixel_snap,
+         };
+         Ok(Some(LayerDraft {
+             entity,
+@@ -1320,7 +1348,7 @@ fn assemble_frame(
+ }
+
+ fn placement(draft: &LayerDraft, node: &RetainedNode) -> Affine {
+-    match draft.descriptor {
++    match &draft.descriptor {
+         NodeDescriptor::Image(_) => Affine::scale_non_uniform(
+             f64::from(draft.frame.bounds.width / node.local_bounds.width),
+             f64::from(draft.frame.bounds.height / node.local_bounds.height),
+@@ -1329,12 +1357,24 @@ fn placement(draft: &LayerDraft, node: &RetainedNode) -> Affine {
+             f64::from(draft.frame.bounds.x),
+             f64::from(draft.frame.bounds.y),
+         )),
+-        NodeDescriptor::Text(_) => {
++        NodeDescriptor::Text(text) => {
+             let frame = draft.frame.bounds;
+-            Affine::translate((
+-                f64::from(frame.x + frame.width * 0.5),
+-                f64::from(frame.y + frame.height * 0.5),
+-            )) * Affine::rotate(f64::from(draft.frame.angle_degrees).to_radians())
++            // Integer-exact block transform for axis-aligned frames (llm3.md §5):
++            // round the frame center so device pixels land on whole boundaries.
++            // Rotated frames keep fractional placement so the rotation is exact.
++            let (cx, cy) = if text.pixel_snap && draft.frame.angle_degrees == 0.0 {
++                (
++                    f64::from(frame.x + frame.width * 0.5).round(),
++                    f64::from(frame.y + frame.height * 0.5).round(),
++                )
++            } else {
++                (
++                    f64::from(frame.x + frame.width * 0.5),
++                    f64::from(frame.y + frame.height * 0.5),
++                )
++            };
++            Affine::translate((cx, cy))
++                * Affine::rotate(f64::from(draft.frame.angle_degrees).to_radians())
+                 * Affine::translate((
+                     -f64::from(frame.width * 0.5),
+                     -f64::from(frame.height * 0.5),
+@@ -1373,6 +1413,21 @@ fn transform_diagnostic(diagnostic: RenderDiagnostic, transform: Affine) -> Rend
+             actual_height,
+             font_size,
+         },
++        RenderDiagnostic::LayoutStress {
++            entity,
++            available,
++            actual_width,
++            actual_height,
++            font_size,
++            minimum_font_size,
++        } => RenderDiagnostic::LayoutStress {
++            entity,
++            available: transform_bounds(available, transform),
++            actual_width,
++            actual_height,
++            font_size,
++            minimum_font_size,
++        },
+         diagnostic => diagnostic,
+     }
+ }
+diff --git a/crates/koharu-renderer/src/text_renderer.rs b/crates/koharu-renderer/src/text_renderer.rs
+index b492683..130a6b2 100644
+--- a/crates/koharu-renderer/src/text_renderer.rs
++++ b/crates/koharu-renderer/src/text_renderer.rs
+@@ -39,6 +39,13 @@ pub(crate) struct TextNodeDescriptor {
+     pub(crate) font_weight: Option<u16>,
+     pub(crate) font_style: Option<FontStyle>,
+     pub(crate) font_size: Option<f32>,
++    /// User-authored typography size — keeps priority over the source anchor.
++    /// When `Some`, auto-fit uses it as the ceiling and ignores `source_target_size`.
++    pub(crate) authored_size: Option<f32>,
++    /// Source lettering's detected glyph scale — the anchor auto-fit never
++    /// exceeds, only shrinking when balloon geometry forces it (llm3.md §1.1).
++    /// Derived from the source region, not from translated text length.
++    pub(crate) source_target_size: Option<f32>,
+     pub(crate) minimum_font_size: f32,
+     pub(crate) auto_fit: bool,
+     pub(crate) alignment: TextAlign,
+@@ -50,6 +57,15 @@ pub(crate) struct TextNodeDescriptor {
+     pub(crate) word_spacing: f32,
+     pub(crate) text_inset: [f32; 4],
+     pub(crate) point_text: bool,
++    /// Frame rotation in degrees — used to gate integer pixel snapping to
++    /// axis-aligned frames only (llm3.md §5).
++    pub(crate) frame_angle_degrees: f32,
++    /// Whether source-anchored sizing is enabled (llm3.md §6 `size_anchor`).
++    pub(crate) size_anchor: crate::config::SizeAnchor,
++    /// Which integer font-size search to run when a target is set.
++    pub(crate) font_search_strategy: crate::config::FontSearchStrategy,
++    /// Round axis-aligned text blocks to integer device pixels (llm3.md §5).
++    pub(crate) pixel_snap: bool,
+ }
+
+ pub(crate) struct RenderedTextNode {
+@@ -257,9 +273,19 @@ impl TextRenderer {
+             layout = layout.with_hyphenation_policy(HyphenationPolicy::LastResort);
+         }
+         let layout = if descriptor.auto_fit && !descriptor.point_text {
+-            layout
++            let mut l = layout
+                 .with_max_font_size(maximum)
+                 .with_min_font_size(minimum)
++                .with_font_search_strategy(descriptor.font_search_strategy);
++            // Source-anchored, shrink-only sizing (llm3.md §1.1/§6). The anchor
++            // only guides auto-fit; authored typography size keeps priority.
++            if descriptor.authored_size.is_none()
++                && descriptor.size_anchor == crate::config::SizeAnchor::Source
++                && let Some(target) = descriptor.source_target_size
++            {
++                l = l.with_target_font_size(target);
++            }
++            l
+         } else {
+             layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
+         };
+@@ -276,6 +302,13 @@ impl TextRenderer {
+         };
+         x += layout.placement_offset_x();
+         y += layout.placement_offset_y();
++        // Integer block placement for axis-aligned frames (llm3.md §5). Glyph
++        // hinting stays on; only the block transform is rounded so device pixels
++        // land on whole boundaries without disturbing rotated frames.
++        if descriptor.pixel_snap && descriptor.frame_angle_degrees == 0.0 {
++            x = x.round();
++            y = y.round();
++        }
+         let transform = Affine::translate((f64::from(x), f64::from(y)));
+         let color = descriptor.foreground_color;
+         let mut options = TextRenderOptions {
+@@ -305,7 +338,20 @@ impl TextRenderer {
+                 minimum_font_size: descriptor.minimum_font_size,
+             });
+         }
+-        if layout.overflowed() {
++        if layout.stress() {
++            // Auto-fit exhausted every size down to the floor and still overflowed.
++            // Surface a dedicated stress diagnostic (bug fix #2) — this replaces
++            // the old silent `run_with_size(text, minimum)` clip. The generic
++            // TextOverflow below is suppressed in this case to avoid duplicates.
++            diagnostics.push(RenderDiagnostic::LayoutStress {
++                entity: descriptor.entity,
++                available: bounds.into(),
++                actual_width: layout.width,
++                actual_height: layout.height,
++                font_size: layout.font_size,
++                minimum_font_size: descriptor.minimum_font_size,
++            });
++        } else if layout.overflowed() {
+             diagnostics.push(RenderDiagnostic::TextOverflow {
+                 entity: descriptor.entity,
+                 available: bounds.into(),
+@@ -350,6 +396,11 @@ impl TextRenderer {
+     }
+ }
+
++/// The legacy "grow to fill the bubble" ceiling — the bubble's inline extent.
++/// Only used as a fallback when no source target size is available AND
++/// source-anchored sizing is off (or as the hard ceiling the anchored search
++/// clamps to). Replaces nothing by itself; the `target_font_size` anchor is
++/// what makes auto-fit shrink-only (llm3.md §1.1).
+ fn automatic_maximum(
+     descriptor: &TextNodeDescriptor,
+     bounds: LayoutBox,
+@@ -511,6 +562,8 @@ mod tests {
+             font_weight: None,
+             font_style: None,
+             font_size: Some(6.0),
++            authored_size: None,
++            source_target_size: None,
+             minimum_font_size: 9.0,
+             auto_fit: true,
+             alignment: TextAlign::Center,
+@@ -522,6 +575,10 @@ mod tests {
+             word_spacing: 0.0,
+             text_inset: [0.0; 4],
+             point_text: false,
++            frame_angle_degrees: 0.0,
++            size_anchor: crate::config::SizeAnchor::Source,
++            font_search_strategy: crate::config::FontSearchStrategy::SizeFirst,
++            pixel_snap: true,
+         };
+         let bounds = LayoutBox {
+             x: 0.0,
+--
+2.55.0

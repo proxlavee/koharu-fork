@@ -548,6 +548,9 @@ impl Renderer {
             height,
             source_role: &source_role,
             font_families: &typesetting.font_families,
+            size_anchor: typesetting.size_anchor,
+            pixel_snap: typesetting.pixel_snap,
+            font_search_strategy: typesetting.font_search_strategy,
             balloon_flows: flow_plan.placements,
             layers: Vec::new(),
             dependencies: BTreeSet::from([
@@ -622,6 +625,9 @@ struct Traversal<'a> {
     height: u32,
     source_role: &'a AssetRole,
     font_families: &'a [String],
+    size_anchor: crate::config::SizeAnchor,
+    pixel_snap: bool,
+    font_search_strategy: crate::config::FontSearchStrategy,
     balloon_flows: HashMap<EntityId, ResolvedPlacement>,
     layers: Vec<LayerDraft>,
     dependencies: BTreeSet<RenderDependency>,
@@ -849,6 +855,19 @@ impl Traversal<'_> {
             dependencies.insert(RenderDependency::Font(family.clone()));
         }
         let is_bubble = balloon_contour.is_some();
+        // Distinguish user-authored sizes (keep priority) from detected source
+        // sizes (become the shrink-only anchor). The Typography component carries
+        // both via `size`; its `origin` separates them (llm3.md §1.1/§4).
+        let authored_size = typography.as_ref().and_then(|value| {
+            (value.origin == Origin::User)
+                .then_some(value.size)
+                .flatten()
+        });
+        let detected_size = typography.as_ref().and_then(|value| {
+            (value.origin != Origin::User)
+                .then_some(value.size)
+                .flatten()
+        });
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -865,6 +884,11 @@ impl Traversal<'_> {
                 .and_then(|value| value.font_style)
                 .map(Into::into),
             font_size: typography.as_ref().and_then(|value| value.size),
+            authored_size,
+            // The source region's own detected glyph scale — auto-fit never
+            // exceeds this, only shrinking when balloon geometry forces it
+            // (llm3.md §1.1). Comes from detection's `mask_font_size`.
+            source_target_size: detected_size,
             // A detected source size is a ceiling, not a readability floor. The
             // translated string can be substantially longer than the source, so
             // forcing a percentage of that size makes narrow regions overflow.
@@ -882,6 +906,10 @@ impl Traversal<'_> {
             word_spacing: 0.0,
             text_inset: [4.0; 4],
             point_text: !is_bubble && layout.kind == TextLayoutKind::Point,
+            frame_angle_degrees: frame.angle_degrees,
+            size_anchor: self.size_anchor,
+            font_search_strategy: self.font_search_strategy,
+            pixel_snap: self.pixel_snap,
         };
         Ok(Some(LayerDraft {
             entity,
@@ -1320,7 +1348,7 @@ fn assemble_frame(
 }
 
 fn placement(draft: &LayerDraft, node: &RetainedNode) -> Affine {
-    match draft.descriptor {
+    match &draft.descriptor {
         NodeDescriptor::Image(_) => Affine::scale_non_uniform(
             f64::from(draft.frame.bounds.width / node.local_bounds.width),
             f64::from(draft.frame.bounds.height / node.local_bounds.height),
@@ -1329,12 +1357,24 @@ fn placement(draft: &LayerDraft, node: &RetainedNode) -> Affine {
             f64::from(draft.frame.bounds.x),
             f64::from(draft.frame.bounds.y),
         )),
-        NodeDescriptor::Text(_) => {
+        NodeDescriptor::Text(text) => {
             let frame = draft.frame.bounds;
-            Affine::translate((
-                f64::from(frame.x + frame.width * 0.5),
-                f64::from(frame.y + frame.height * 0.5),
-            )) * Affine::rotate(f64::from(draft.frame.angle_degrees).to_radians())
+            // Integer-exact block transform for axis-aligned frames (llm3.md §5):
+            // round the frame center so device pixels land on whole boundaries.
+            // Rotated frames keep fractional placement so the rotation is exact.
+            let (cx, cy) = if text.pixel_snap && draft.frame.angle_degrees == 0.0 {
+                (
+                    f64::from(frame.x + frame.width * 0.5).round(),
+                    f64::from(frame.y + frame.height * 0.5).round(),
+                )
+            } else {
+                (
+                    f64::from(frame.x + frame.width * 0.5),
+                    f64::from(frame.y + frame.height * 0.5),
+                )
+            };
+            Affine::translate((cx, cy))
+                * Affine::rotate(f64::from(draft.frame.angle_degrees).to_radians())
                 * Affine::translate((
                     -f64::from(frame.width * 0.5),
                     -f64::from(frame.height * 0.5),
@@ -1372,6 +1412,21 @@ fn transform_diagnostic(diagnostic: RenderDiagnostic, transform: Affine) -> Rend
             actual_width,
             actual_height,
             font_size,
+        },
+        RenderDiagnostic::LayoutStress {
+            entity,
+            available,
+            actual_width,
+            actual_height,
+            font_size,
+            minimum_font_size,
+        } => RenderDiagnostic::LayoutStress {
+            entity,
+            available: transform_bounds(available, transform),
+            actual_width,
+            actual_height,
+            font_size,
+            minimum_font_size,
         },
         diagnostic => diagnostic,
     }

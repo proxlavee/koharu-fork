@@ -127,7 +127,7 @@ fn process_directory(cli: &Cli, model: &ComicLayoutYolo26sSegmenter) -> Result<(
             inputs.len(),
             input
                 .file_name()
-                .map_or_else(|| input.as_os_str(), |file_name| file_name)
+                .unwrap_or_else(|| input.as_os_str())
                 .to_string_lossy(),
             result.instances.len()
         );

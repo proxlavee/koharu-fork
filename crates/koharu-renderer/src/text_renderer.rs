@@ -39,6 +39,13 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) font_weight: Option<u16>,
     pub(crate) font_style: Option<FontStyle>,
     pub(crate) font_size: Option<f32>,
+    /// User-authored typography size — keeps priority over the source anchor.
+    /// When `Some`, auto-fit uses it as the ceiling and ignores `source_target_size`.
+    pub(crate) authored_size: Option<f32>,
+    /// Source lettering's detected glyph scale — the anchor auto-fit never
+    /// exceeds, only shrinking when balloon geometry forces it (llm3.md §1.1).
+    /// Derived from the source region, not from translated text length.
+    pub(crate) source_target_size: Option<f32>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
@@ -50,6 +57,15 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) word_spacing: f32,
     pub(crate) text_inset: [f32; 4],
     pub(crate) point_text: bool,
+    /// Frame rotation in degrees — used to gate integer pixel snapping to
+    /// axis-aligned frames only (llm3.md §5).
+    pub(crate) frame_angle_degrees: f32,
+    /// Whether source-anchored sizing is enabled (llm3.md §6 `size_anchor`).
+    pub(crate) size_anchor: crate::config::SizeAnchor,
+    /// Which integer font-size search to run when a target is set.
+    pub(crate) font_search_strategy: crate::config::FontSearchStrategy,
+    /// Round axis-aligned text blocks to integer device pixels (llm3.md §5).
+    pub(crate) pixel_snap: bool,
 }
 
 pub(crate) struct RenderedTextNode {
@@ -257,9 +273,19 @@ impl TextRenderer {
             layout = layout.with_hyphenation_policy(HyphenationPolicy::LastResort);
         }
         let layout = if descriptor.auto_fit && !descriptor.point_text {
-            layout
+            let mut l = layout
                 .with_max_font_size(maximum)
                 .with_min_font_size(minimum)
+                .with_font_search_strategy(descriptor.font_search_strategy);
+            // Source-anchored, shrink-only sizing (llm3.md §1.1/§6). The anchor
+            // only guides auto-fit; authored typography size keeps priority.
+            if descriptor.authored_size.is_none()
+                && descriptor.size_anchor == crate::config::SizeAnchor::Source
+                && let Some(target) = descriptor.source_target_size
+            {
+                l = l.with_target_font_size(target);
+            }
+            l
         } else {
             layout.with_font_size(descriptor.font_size.unwrap_or(maximum))
         };
@@ -276,6 +302,13 @@ impl TextRenderer {
         };
         x += layout.placement_offset_x();
         y += layout.placement_offset_y();
+        // Integer block placement for axis-aligned frames (llm3.md §5). Glyph
+        // hinting stays on; only the block transform is rounded so device pixels
+        // land on whole boundaries without disturbing rotated frames.
+        if descriptor.pixel_snap && descriptor.frame_angle_degrees == 0.0 {
+            x = x.round();
+            y = y.round();
+        }
         let transform = Affine::translate((f64::from(x), f64::from(y)));
         let color = descriptor.foreground_color;
         let mut options = TextRenderOptions {
@@ -305,7 +338,20 @@ impl TextRenderer {
                 minimum_font_size: descriptor.minimum_font_size,
             });
         }
-        if layout.overflowed() {
+        if layout.stress() {
+            // Auto-fit exhausted every size down to the floor and still overflowed.
+            // Surface a dedicated stress diagnostic (bug fix #2) — this replaces
+            // the old silent `run_with_size(text, minimum)` clip. The generic
+            // TextOverflow below is suppressed in this case to avoid duplicates.
+            diagnostics.push(RenderDiagnostic::LayoutStress {
+                entity: descriptor.entity,
+                available: bounds.into(),
+                actual_width: layout.width,
+                actual_height: layout.height,
+                font_size: layout.font_size,
+                minimum_font_size: descriptor.minimum_font_size,
+            });
+        } else if layout.overflowed() {
             diagnostics.push(RenderDiagnostic::TextOverflow {
                 entity: descriptor.entity,
                 available: bounds.into(),
@@ -350,6 +396,11 @@ impl TextRenderer {
     }
 }
 
+/// The legacy "grow to fill the bubble" ceiling — the bubble's inline extent.
+/// Only used as a fallback when no source target size is available AND
+/// source-anchored sizing is off (or as the hard ceiling the anchored search
+/// clamps to). Replaces nothing by itself; the `target_font_size` anchor is
+/// what makes auto-fit shrink-only (llm3.md §1.1).
 fn automatic_maximum(
     descriptor: &TextNodeDescriptor,
     bounds: LayoutBox,
@@ -511,6 +562,8 @@ mod tests {
             font_weight: None,
             font_style: None,
             font_size: Some(6.0),
+            authored_size: None,
+            source_target_size: None,
             minimum_font_size: 9.0,
             auto_fit: true,
             alignment: TextAlign::Center,
@@ -522,6 +575,10 @@ mod tests {
             word_spacing: 0.0,
             text_inset: [0.0; 4],
             point_text: false,
+            frame_angle_degrees: 0.0,
+            size_anchor: crate::config::SizeAnchor::Source,
+            font_search_strategy: crate::config::FontSearchStrategy::SizeFirst,
+            pixel_snap: true,
         };
         let bounds = LayoutBox {
             x: 0.0,

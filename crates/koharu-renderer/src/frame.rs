@@ -399,6 +399,18 @@ pub enum RenderDiagnostic {
         font_size: f32,
         minimum_font_size: f32,
     },
+    /// Auto-fit exhausted every size down to the readability floor and still
+    /// could not place the text without overflow. The rendered output is a
+    /// best-effort clip, not a clean fit — a human letterer should review it.
+    /// Replaces the old silent `run_with_size(text, minimum)` fallback.
+    LayoutStress {
+        entity: EntityId,
+        available: RenderBounds,
+        actual_width: f32,
+        actual_height: f32,
+        font_size: f32,
+        minimum_font_size: f32,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
