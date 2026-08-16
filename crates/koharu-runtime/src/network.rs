@@ -41,10 +41,7 @@ pub(crate) fn api_client() -> Result<Client> {
     if let Some(client) = API.get() {
         return Ok(client.clone());
     }
-    let client = Client::builder()
-        .user_agent(USER_AGENT)
-        .http2_adaptive_window(true)
-        .build()?;
+    let client = Client::builder().user_agent(USER_AGENT).build()?;
     Ok(API.get_or_init(|| client).clone())
 }
 
@@ -65,7 +62,6 @@ pub(crate) fn download_client() -> Result<DownloadClient> {
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(policy.connect_timeout_seconds.max(1)))
         .read_timeout(Duration::from_secs(policy.read_timeout_seconds.max(1)))
-        .http2_adaptive_window(true)
         .build()
         .context("failed to build download client")?;
     let client = Arc::new(
