@@ -1,6 +1,6 @@
 'use client'
 
-import { Folder, FolderPlus, Plus, Settings, Trash2 } from 'lucide-react'
+import { Folder, FolderPlus, LoaderCircle, Plus, Settings, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -156,7 +156,11 @@ export function StartView() {
                     className='h-9 justify-center gap-1.5 text-[11px]'
                     disabled={!name.trim() || busy !== null}
                   >
-                    <Plus className='size-3.5' />
+                    {busy === 'create' ? (
+                      <LoaderCircle className='size-3.5 animate-spin' />
+                    ) : (
+                      <Plus className='size-3.5' />
+                    )}
                     {t('start.create')}
                   </Button>
                 </form>
@@ -217,7 +221,11 @@ export function StartView() {
                             disabled={busy !== null}
                           >
                             <span className='grid size-8 shrink-0 place-items-center rounded-lg bg-accent text-accent-foreground'>
-                              <Folder className='size-4' />
+                              {busy === project.name ? (
+                                <LoaderCircle className='size-4 animate-spin' />
+                              ) : (
+                                <Folder className='size-4' />
+                              )}
                             </span>
                             <span className='min-w-0'>
                               <span className='block truncate text-[11px] font-medium'>
@@ -268,6 +276,7 @@ export function StartView() {
             aria-busy={busy !== null}
             onClick={() => void deleteProject().catch(() => undefined)}
           >
+            {busy !== null && <LoaderCircle className='mr-1.5 size-3.5 animate-spin' />}
             {busy !== null ? t('start.deleting') : t('start.deleteAction')}
           </AlertDialogAction>
         </AlertDialogFooter>
