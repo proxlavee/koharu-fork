@@ -1,6 +1,7 @@
 'use client'
 
 import { CircleAlert, Download, Square, X } from 'lucide-react'
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { call } from '@/lib/backend'
@@ -12,14 +13,24 @@ export function ActivityCenter() {
   const { t } = useTranslation()
   const jobs = useKoharuStore((state) => state.jobs)
   const downloads = useKoharuStore((state) => state.downloads)
-  const visibleJobs = Object.values(jobs).filter(
-    (job) => job.state === 'running' || job.state === 'failed',
+
+  const visibleJobs = useMemo(
+    () =>
+      Object.values(jobs).filter((job) => job.state === 'running' || job.state === 'failed'),
+    [jobs],
   )
-  const runningDownloads = Object.values(downloads).filter(
-    (download) => download.state === 'running',
+  const runningDownloads = useMemo(
+    () => Object.values(downloads).filter((download) => download.state === 'running'),
+    [downloads],
   )
-  const failedDownloads = Object.values(downloads).filter((download) => download.state === 'failed')
-  const visibleDownloads = [...runningDownloads, ...failedDownloads]
+  const failedDownloads = useMemo(
+    () => Object.values(downloads).filter((download) => download.state === 'failed'),
+    [downloads],
+  )
+  const visibleDownloads = useMemo(
+    () => [...runningDownloads, ...failedDownloads],
+    [runningDownloads, failedDownloads],
+  )
   if (visibleJobs.length === 0 && visibleDownloads.length === 0) return null
 
   return (
