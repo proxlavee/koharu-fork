@@ -186,7 +186,10 @@ mod tests {
             Diffusion::WindowsCuda.fallbacks(),
             vec![Diffusion::WindowsHip, Diffusion::WindowsVulkan]
         );
-        assert_eq!(Diffusion::WindowsHip.fallbacks(), vec![Diffusion::WindowsVulkan]);
+        assert_eq!(
+            Diffusion::WindowsHip.fallbacks(),
+            vec![Diffusion::WindowsVulkan]
+        );
         assert!(Diffusion::WindowsVulkan.fallbacks().is_empty());
     }
 }
