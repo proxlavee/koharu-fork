@@ -60,7 +60,7 @@ fn context_params(device: &crate::Device, paths: ModelPaths) -> ContextParams {
         enable_mmap: true,
         flash_attention: use_accelerator,
         diffusion_flash_attention: use_accelerator,
-        vae_format: VaeFormat::Flux2,
+        vae_format: VaeFormat::Flux,
         backend: Some(if use_accelerator {
             device.name.to_ascii_lowercase()
         } else {
