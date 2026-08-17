@@ -336,7 +336,7 @@ function TypeInspector() {
                   aria-pressed={effectiveAlignment === alignment}
                   disabled={disabled}
                   data-active={effectiveAlignment === alignment}
-                  className='grid place-items-center rounded-[4px] text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 data-[active=true]:bg-primary data-[active=true]:text-primary-foreground data-[active=true]:hover:bg-primary/90'
+                  className='grid place-items-center rounded-[4px] text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-40 data-[active=true]:bg-primary data-[active=true]:text-primary-foreground data-[active=true]:hover:bg-primary/90'
                   onClick={() =>
                     apply((value) => ({
                       ...value,
@@ -655,7 +655,7 @@ function LayerRow({
             aria-label={t('layers.edit', { name })}
             aria-expanded={locked ? undefined : expanded}
             disabled={locked}
-            className='flex min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left hover:bg-foreground/[0.05] focus-visible:ring-2 focus-visible:ring-ring/25'
+            className='flex min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left outline-none hover:bg-foreground/[0.05] focus-visible:ring-2 focus-visible:ring-ring/25'
             onClick={onSelect}
           >
             <Icon className='size-3.5 shrink-0 text-muted-foreground' />
@@ -674,7 +674,7 @@ function LayerRow({
                 type='button'
                 aria-label={t('layers.moveUp', { name })}
                 disabled={reordering || !canMoveUp}
-                className='grid size-5 place-items-center rounded-sm text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25 disabled:pointer-events-none disabled:opacity-30'
+                className='grid size-5 place-items-center rounded-sm text-muted-foreground outline-none hover:bg-foreground/[0.07] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25 disabled:pointer-events-none disabled:opacity-30'
                 onClick={() => onMove(-1)}
               >
                 <ArrowUp className='size-3' />
@@ -683,7 +683,7 @@ function LayerRow({
                 type='button'
                 aria-label={t('layers.moveDown', { name })}
                 disabled={reordering || !canMoveDown}
-                className='grid size-5 place-items-center rounded-sm text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25 disabled:pointer-events-none disabled:opacity-30'
+                className='grid size-5 place-items-center rounded-sm text-muted-foreground outline-none hover:bg-foreground/[0.07] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25 disabled:pointer-events-none disabled:opacity-30'
                 onClick={() => onMove(1)}
               >
                 <ArrowDown className='size-3' />
@@ -716,7 +716,7 @@ function LayerRow({
               aria-label={
                 layer.visibility.visible ? t('layers.hide', { name }) : t('layers.show', { name })
               }
-              className='grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25'
+              className='grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground outline-none hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25'
               onClick={onToggle}
             >
               {layer.visibility.visible ? (

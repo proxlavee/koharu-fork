@@ -72,7 +72,7 @@ function WindowButton({
     <button
       type='button'
       aria-label={label}
-      className={`grid h-full w-11 place-items-center text-muted-foreground transition-colors hover:bg-primary/10 hover:text-foreground [&_svg]:size-3.5 ${className}`}
+      className={`grid h-full w-11 place-items-center text-muted-foreground outline-none transition-colors hover:bg-primary/10 hover:text-foreground focus-visible:bg-primary/10 focus-visible:text-foreground [&_svg]:size-3.5 ${className}`}
       onClick={onClick}
     >
       {children}
