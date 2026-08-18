@@ -9,6 +9,7 @@ import type {
   EntityId,
   Frame,
   Geometry,
+  Layer,
   Page,
   Point,
   TransformFrame,
@@ -53,13 +54,20 @@ export function CanvasOverlay({
   const selectedIds = useMemo(() => new Set(expandedSelection), [expandedSelection])
   const multipleSelected = expandedSelection.length > 1
   const layers = useMemo(
-    () =>
-      page.layers.flatMap((layer) => {
-        const visibility = effectiveLayerVisibility(page.layers, layer)
+    () => {
+      // Performance optimization: Pre-compute a lookup table for layers to avoid
+      // O(N) loop calls inside effectiveLayerVisibility across all layers.
+      const layerMap = new Map<string, Layer>()
+      for (let i = 0; i < page.layers.length; i++) {
+        layerMap.set(page.layers[i].id, page.layers[i])
+      }
+      return page.layers.flatMap((layer) => {
+        const visibility = effectiveLayerVisibility(page.layers, layer, layerMap)
         if (!visibility.visible || visibility.opacity <= 0) return []
         const frame = previews[layer.id] ?? controlFrame(layer, frames)
         return frame ? [{ layer, frame, opacity: visibility.opacity }] : []
-      }),
+      })
+    },
     [page.layers, previews, frames],
   )
   const selectedLayer =
