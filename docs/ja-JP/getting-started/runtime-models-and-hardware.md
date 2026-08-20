@@ -11,11 +11,10 @@ Koharu は使用する機能に必要なネイティブライブラリとモデ�
 
 起動時にハードウェアを検出し、ML スタックで共有するデバイスを次の順で選びます。
 
-1. Apple シリコン macOS の Metal
-2. 対応 NVIDIA ドライバーがある場合の CUDA
-3. 対応 AMD ターゲットを検出した場合の ROCm/HIP
-4. 利用可能な Vulkan デバイス
-5. アクセラレーターを使用できない場合の CPU
+1. 対応 NVIDIA ドライバーがある場合の CUDA
+2. 対応 AMD ターゲットを検出した場合の ROCm/HIP
+3. 利用可能な Vulkan デバイス
+4. アクセラレーターを使用できない場合の CPU
 
 実際の利用可否は OS、ドライバー、モデルのバックエンド、そのプラットフォーム向けネイティブパッケージに依存します。CPU フォールバックは異常ではなく、速度より正しさを優先する動作です。
 
@@ -23,11 +22,11 @@ Koharu は使用する機能に必要なネイティブライブラリとモデ�
 
 ### CUDA
 
-Koharu は Windows と Linux で CUDA 13.0 に対応しています。Koharu を起動する前に [最新の NVIDIA ドライバー](https://www.nvidia.com/en-us/drivers/)をインストールしてください。[CUDA 13.0 には R580 シリーズ以降のドライバーが必要です](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver)。
+このフォークは Windows で CUDA 13.0 に対応しています。Koharu を起動する前に [最新の NVIDIA ドライバー](https://www.nvidia.com/en-us/drivers/)をインストールしてください。[CUDA 13.0 には R580 シリーズ以降のドライバーが必要です](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver)。
 
 ### ROCm/HIP
 
-Koharu は Windows と Linux で ROCm/HIP に対応しています。Koharu を起動する前に、使用する OS 向けの [HIP を含む ROCm Core SDK](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html)をダウンロードしてインストールしてください。
+このフォークは Windows で ROCm/HIP に対応しています。Koharu を起動する前に、Windows 向けの [HIP を含む ROCm Core SDK](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html)をダウンロードしてインストールしてください。
 
 ### WebGPU
 

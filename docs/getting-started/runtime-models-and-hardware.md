@@ -11,11 +11,10 @@ Koharu assembles the native libraries and model files required by the features y
 
 Koharu discovers hardware during startup and selects one shared device for its ML stack:
 
-1. Metal on Apple-silicon macOS;
-2. CUDA when a compatible NVIDIA driver is available;
-3. ROCm/HIP when a supported AMD target is discovered;
-4. Vulkan when a usable Vulkan device is available;
-5. CPU when no accelerator path is usable.
+1. CUDA when a compatible NVIDIA driver is available;
+2. ROCm/HIP when a supported AMD target is discovered;
+3. Vulkan when a usable Vulkan device is available;
+4. CPU when no accelerator path is usable.
 
 Availability still depends on the operating system, driver, model backend, and native package published for that platform. CPU fallback is normal and prioritizes correctness over speed.
 
@@ -23,11 +22,11 @@ Availability still depends on the operating system, driver, model backend, and n
 
 ### CUDA
 
-Koharu supports CUDA 13.0 on Windows and Linux. Install the [latest NVIDIA driver](https://www.nvidia.com/en-us/drivers/) before starting Koharu; [CUDA 13.0 requires an R580-series or newer driver](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver).
+This fork supports CUDA 13.0 on Windows. Install the [latest NVIDIA driver](https://www.nvidia.com/en-us/drivers/) before starting Koharu; [CUDA 13.0 requires an R580-series or newer driver](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver).
 
 ### ROCm/HIP
 
-Koharu supports ROCm/HIP on Windows and Linux. Before starting Koharu, download and install the [ROCm Core SDK with HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html) for your operating system.
+This fork supports ROCm/HIP on Windows. Before starting Koharu, download and install the [ROCm Core SDK with HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html) for Windows.
 
 ### WebGPU
 

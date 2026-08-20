@@ -5,19 +5,11 @@ description: Install a release build, launch Koharu, and keep it updated.
 
 # Install Koharu
 
-Use a release build unless you intend to modify Koharu itself. Current releases are built for 64-bit Windows and Linux, and for Apple-silicon macOS.
+Use a release build unless you intend to modify Koharu itself. This fork publishes only a 64-bit Windows installer.
 
 ## Download a release
 
-Open the [latest GitHub release](https://github.com/mayocream/koharu/releases/latest) and choose the installer or package for your operating system.
-
-On Windows, you can also install the published package with WinGet:
-
-```powershell
-winget install --id mayocream.koharu
-```
-
-Linux packages may require the WebKit and desktop libraries normally used by Tauri applications. Prefer the package produced for your distribution when one is available.
+Open the [latest GitHub release](https://github.com/proxlavee/koharu-fork/releases/latest) and run the NSIS installer. The installer is not code-signed and may trigger Microsoft Defender SmartScreen. This fork does not publish macOS or Linux application binaries.
 
 ## First launch
 
@@ -27,7 +19,7 @@ Downloads require access to GitHub release assets and, for model weights, Huggin
 
 ## Updates
 
-Release builds include an updater that checks Koharu's signed GitHub release feed. When an update is offered, let the download finish before restarting the application.
+This unsigned build does not enable Tauri's signed updater. To update, close Koharu and run the newer installer from this fork's GitHub Releases page.
 
 ## Next step
 

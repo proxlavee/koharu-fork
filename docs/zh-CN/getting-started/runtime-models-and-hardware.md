@@ -11,11 +11,10 @@ Koharu 会为实际使用的功能准备所需原生库和模型文件，并非�
 
 启动时会检测硬件，并按以下顺序为 ML 栈选择统一设备：
 
-1. Apple 芯片 macOS 上的 Metal
-2. 检测到兼容 NVIDIA 驱动时的 CUDA
-3. 检测到支持的 AMD 目标时的 ROCm/HIP
-4. 可用的 Vulkan 设备
-5. 无可用加速路径时的 CPU
+1. 检测到兼容 NVIDIA 驱动时的 CUDA
+2. 检测到支持的 AMD 目标时的 ROCm/HIP
+3. 可用的 Vulkan 设备
+4. 无可用加速路径时的 CPU
 
 最终可用性还取决于操作系统、驱动、模型后端及对应平台是否发布了原生包。CPU 回退是正常行为，它优先保证正确性而不是速度。
 
@@ -23,11 +22,11 @@ Koharu 会为实际使用的功能准备所需原生库和模型文件，并非�
 
 ### CUDA
 
-Koharu 在 Windows 和 Linux 上支持 CUDA 13.0。启动 Koharu 前，请安装[最新的 NVIDIA 驱动](https://www.nvidia.com/en-us/drivers/)；[CUDA 13.0 需要 R580 系列或更高版本的驱动](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver)。
+此分支在 Windows 上支持 CUDA 13.0。启动 Koharu 前，请安装[最新的 NVIDIA 驱动](https://www.nvidia.com/en-us/drivers/)；[CUDA 13.0 需要 R580 系列或更高版本的驱动](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver)。
 
 ### ROCm/HIP
 
-Koharu 在 Windows 和 Linux 上支持 ROCm/HIP。启动 Koharu 前，请为你的操作系统下载并安装[包含 HIP 的 ROCm Core SDK](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html)。
+此分支在 Windows 上支持 ROCm/HIP。启动 Koharu 前，请下载并安装 Windows 版[包含 HIP 的 ROCm Core SDK](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html)。
 
 ### WebGPU
 

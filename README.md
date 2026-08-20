@@ -3,7 +3,7 @@
 <p align="center">ML-powered manga translator, written in <b>Rust</b>.</p>
 
 <p align="center">
-<a href="https://github.com/mayocream/koharu/releases/latest" target="_blank"><img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/mayocream/koharu/total?style=for-the-badge&link=https%3A%2F%2Fgithub.com%2Fmayocream%2Fkoharu%2Freleases%2Flatest"></a>
+<a href="https://github.com/proxlavee/koharu-fork/releases/latest" target="_blank"><img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/proxlavee/koharu-fork/total?style=for-the-badge&link=https%3A%2F%2Fgithub.com%2Fproxlavee%2Fkoharu-fork%2Freleases%2Flatest"></a>
 </p>
 
 <p align="center">
@@ -46,23 +46,19 @@ Koharu introduces a local-first workflow for manga translation, utilizing the po
 
 ## Hardware Acceleration
 
-Koharu supports GPU acceleration with CUDA and ROCm / HIP on Windows and Linux, Metal on Apple silicon, and Vulkan on Windows and Linux. [Runtime and hardware requirements](https://koharu.rs/getting-started/runtime-models-and-hardware/) vary by backend and operating system.
+This fork targets 64-bit Windows and supports CUDA, ROCm / HIP, and Vulkan acceleration. [Runtime and hardware requirements](https://koharu.rs/getting-started/runtime-models-and-hardware/) vary by backend.
 
 ### CUDA
 
-The CUDA backend targets CUDA 13.0 on Windows and Linux. Make sure to install the [latest NVIDIA driver](https://www.nvidia.com/en-us/drivers/). [CUDA 13.0 requires R580 or newer](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver).
+The CUDA backend targets CUDA 13.0 on Windows. Make sure to install the [latest NVIDIA driver](https://www.nvidia.com/en-us/drivers/). [CUDA 13.0 requires R580 or newer](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-driver).
 
 ### ROCm / HIP
 
-ROCm / HIP is available for AMD GPUs on Windows and Linux. Make sure to install the official [ROCm Core SDK with HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html).
-
-### Metal
-
-Metal is used on Apple silicon Macs.
+ROCm / HIP is available for AMD GPUs on Windows. Make sure to install the official [ROCm Core SDK with HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/install/install.html).
 
 ### Vulkan
 
-Vulkan is available on Windows and Linux as an alternative to CUDA and ROCm / HIP.
+Vulkan is available on Windows as an alternative to CUDA and ROCm / HIP.
 
 ### WebGPU
 
@@ -136,33 +132,15 @@ OpenAI-compatible endpoints are also supported.
 
 ## Installation
 
-Download release builds from the [releases page](https://github.com/mayocream/koharu/releases/latest). [Installation requirements and first launch](https://koharu.rs/getting-started/install/) vary by operating system.
+Download the latest 64-bit Windows installer from this fork's [releases page](https://github.com/proxlavee/koharu-fork/releases/latest).
 
-Builds are available for Windows, macOS, and Linux.
-
-### WinGet
-
-Install on Windows with [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/):
-
-```bash
-winget install koharu
-```
-
-### Homebrew
-
-Install on macOS with [Homebrew](https://brew.sh/):
-
-```bash
-brew install --cask koharu
-```
+The installer is unsigned and may trigger Microsoft Defender SmartScreen. This fork does not publish macOS or Linux application binaries and does not enable Tauri's signed automatic updater; install newer versions manually from the releases page.
 
 ## Troubleshooting
 
 Startup, runtime, model, and provider errors are covered in [Troubleshooting](https://koharu.rs/reference/troubleshooting/). Set `RUST_LOG` to `debug` or `trace` for verbose logs:
 
 ```bash
-# macOS / Linux
-RUST_LOG=debug koharu
 # Windows (PowerShell)
 $env:RUST_LOG="debug"; koharu.exe
 ```

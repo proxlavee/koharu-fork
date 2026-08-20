@@ -5,19 +5,11 @@ description: 安装发行版，完成首次启动并保持更新。
 
 # 安装 Koharu
 
-除非你准备修改 Koharu 本身，否则请使用发行版。当前发行版面向 64 位 Windows、64 位 Linux 和 Apple 芯片 macOS。
+除非你准备修改 Koharu 本身，否则请使用发行版。此分支仅发布 64 位 Windows 安装程序。
 
 ## 下载发行版
 
-打开[最新 GitHub Release](https://github.com/mayocream/koharu/releases/latest)，选择适合操作系统的安装程序或软件包。
-
-Windows 也可以使用 WinGet：
-
-```powershell
-winget install --id mayocream.koharu
-```
-
-Linux 可能需要 Tauri 应用常用的 WebKit 和桌面库。若有适配当前发行版的软件包，请优先使用它。
+打开[最新 GitHub Release](https://github.com/proxlavee/koharu-fork/releases/latest)并运行 NSIS 安装程序。该安装程序没有代码签名，因此 Microsoft Defender SmartScreen 可能会显示警告。此分支不发布 macOS 或 Linux 应用程序二进制文件。
 
 ## 首次启动
 
@@ -27,7 +19,7 @@ Linux 可能需要 Tauri 应用常用的 WebKit 和桌面库。若有适配当�
 
 ## 更新
 
-发行版包含更新器，会检查 Koharu 已签名的 GitHub 发布源。出现更新提示后，请等待下载完成再重启。
+此未签名版本不启用 Tauri 的签名更新器。如需更新，请关闭 Koharu，然后从此分支的 GitHub Releases 页面运行新版安装程序。
 
 下一步请[翻译第一个项目](/zh-CN/getting-started/first-project/)。硬件选择与缓存行为见[运行时、模型与硬件](/zh-CN/getting-started/runtime-models-and-hardware/)。
 

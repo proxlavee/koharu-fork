@@ -5,19 +5,11 @@ description: リリース版をインストールし、初回起動と更新を�
 
 # Koharu のインストール
 
-Koharu 自体を変更する目的でなければ、リリース版を使用してください。現在は 64-bit Windows、64-bit Linux、Apple シリコン搭載 macOS 向けにビルドされています。
+Koharu 自体を変更する目的でなければ、リリース版を使用してください。このフォークは 64-bit Windows インストーラーのみを公開します。
 
 ## リリースを入手する
 
-[最新の GitHub リリース](https://github.com/mayocream/koharu/releases/latest)を開き、OS に合ったインストーラーまたはパッケージを選びます。
-
-Windows では WinGet も使用できます。
-
-```powershell
-winget install --id mayocream.koharu
-```
-
-Linux では Tauri アプリが利用する WebKit とデスクトップライブラリが必要になる場合があります。利用できるならディストリビューション向けパッケージを優先してください。
+[最新の GitHub リリース](https://github.com/proxlavee/koharu-fork/releases/latest)を開き、NSIS インストーラーを実行します。インストーラーはコード署名されていないため、Microsoft Defender SmartScreen の警告が表示される場合があります。このフォークは macOS または Linux 向けアプリケーションバイナリを公開しません。
 
 ## 初回起動
 
@@ -27,7 +19,7 @@ Linux では Tauri アプリが利用する WebKit とデスクトップライ�
 
 ## 更新
 
-リリース版には署名済み GitHub リリースフィードを確認するアップデーターがあります。更新が表示されたら、ダウンロード完了後に再起動してください。
+この未署名ビルドでは Tauri の署名付きアップデーターを有効にしません。更新するには Koharu を終了し、このフォークの GitHub Releases ページから新しいインストーラーを実行してください。
 
 次は[最初のプロジェクト](/ja-JP/getting-started/first-project/)を作成します。ハードウェア選択とキャッシュについては[ランタイム、モデル、ハードウェア](/ja-JP/getting-started/runtime-models-and-hardware/)を参照してください。
 

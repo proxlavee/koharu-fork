@@ -106,8 +106,6 @@ pub fn run(context: tauri::Context<Cef>) -> Result<()> {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(crate::commands::bindings().invoke_handler())
         .setup(move |application| {
             #[cfg(target_os = "windows")]
