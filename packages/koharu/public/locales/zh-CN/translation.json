@@ -242,16 +242,20 @@
   "menu": {
     "about": "关于",
     "closeProject": "关闭项目",
+    "contextTranslation": "全文上下文翻译",
     "delete": "删除所选项",
     "discord": "Discord",
     "edit": "编辑",
     "exportPng": "导出 PNG…",
     "exportPsd": "导出 PSD…",
+    "exportTranslationText": "导出章节文本…",
     "file": "文件",
     "fit": "适应窗口",
     "github": "GitHub",
     "help": "帮助",
     "importPages": "导入页面…",
+    "importTranslationText": "导入已翻译文本…",
+    "preparingTranslationText": "正在准备翻译文本…",
     "process": "处理",
     "processLayers": "处理所选图层",
     "processPages": "处理所选页面",
@@ -507,6 +511,12 @@
     "remove": "移除",
     "select": "选择",
     "text": "文本"
+  },
+  "translationPackage": {
+    "exportedDescription": "已保存 {{pages}} 页中的 {{segments}} 个文本片段。请将完整文件交给 Gemini，以便它结合整章上下文进行翻译。",
+    "exportedTitle": "章节文本已导出",
+    "importedDescription": "已将 {{count}} 条翻译作为一次可撤销的编辑应用。",
+    "importedTitle": "上下文翻译已导入"
   },
   "window": {
     "close": "关闭",

@@ -242,16 +242,20 @@
   "menu": {
     "about": "Sobre",
     "closeProject": "Fechar projeto",
+    "contextTranslation": "Tradução com contexto completo",
     "delete": "Excluir seleção",
     "discord": "Discord",
     "edit": "Editar",
     "exportPng": "Exportar PNG…",
     "exportPsd": "Exportar PSD…",
+    "exportTranslationText": "Exportar texto do capítulo…",
     "file": "Arquivo",
     "fit": "Ajustar à janela",
     "github": "GitHub",
     "help": "Ajuda",
     "importPages": "Importar páginas…",
+    "importTranslationText": "Importar texto traduzido…",
+    "preparingTranslationText": "Preparando texto de tradução…",
     "process": "Processar",
     "processLayers": "Processar camadas selecionadas",
     "processPages": "Processar páginas selecionadas",
@@ -507,6 +511,12 @@
     "remove": "Remover",
     "select": "Selecionar",
     "text": "Texto"
+  },
+  "translationPackage": {
+    "exportedDescription": "Foram salvos {{segments}} segmentos de texto de {{pages}} páginas. Envie o arquivo inteiro ao Gemini para traduzir com o contexto de todo o capítulo.",
+    "exportedTitle": "Texto do capítulo exportado",
+    "importedDescription": "Foram aplicadas {{count}} traduções como uma única edição que pode ser desfeita.",
+    "importedTitle": "Traduções contextuais importadas"
   },
   "window": {
     "close": "Fechar",

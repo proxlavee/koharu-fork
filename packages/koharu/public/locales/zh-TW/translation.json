@@ -242,16 +242,20 @@
   "menu": {
     "about": "關於",
     "closeProject": "關閉專案",
+    "contextTranslation": "全文脈絡翻譯",
     "delete": "刪除所選項目",
     "discord": "Discord",
     "edit": "編輯",
     "exportPng": "匯出 PNG…",
     "exportPsd": "匯出 PSD…",
+    "exportTranslationText": "匯出章節文字…",
     "file": "檔案",
     "fit": "適應視窗",
     "github": "GitHub",
     "help": "說明",
     "importPages": "匯入頁面…",
+    "importTranslationText": "匯入已翻譯文字…",
+    "preparingTranslationText": "正在準備翻譯文字…",
     "process": "處理",
     "processLayers": "處理所選圖層",
     "processPages": "處理所選頁面",
@@ -507,6 +511,12 @@
     "remove": "移除",
     "select": "選取",
     "text": "文字"
+  },
+  "translationPackage": {
+    "exportedDescription": "已儲存 {{pages}} 頁中的 {{segments}} 個文字片段。請將完整檔案交給 Gemini，讓它依照整章脈絡進行翻譯。",
+    "exportedTitle": "章節文字已匯出",
+    "importedDescription": "已將 {{count}} 筆翻譯作為一次可復原的編輯套用。",
+    "importedTitle": "脈絡翻譯已匯入"
   },
   "window": {
     "close": "關閉",

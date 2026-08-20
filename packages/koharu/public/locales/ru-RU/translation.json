@@ -242,16 +242,20 @@
   "menu": {
     "about": "О программе",
     "closeProject": "Закрыть проект",
+    "contextTranslation": "Перевод с полным контекстом",
     "delete": "Удалить выбранное",
     "discord": "Discord",
     "edit": "Правка",
     "exportPng": "Экспорт PNG…",
     "exportPsd": "Экспорт PSD…",
+    "exportTranslationText": "Экспортировать текст главы…",
     "file": "Файл",
     "fit": "Вписать в окно",
     "github": "GitHub",
     "help": "Справка",
     "importPages": "Импортировать страницы…",
+    "importTranslationText": "Импортировать перевод…",
+    "preparingTranslationText": "Подготовка текста для перевода…",
     "process": "Обработка",
     "processLayers": "Обработать выбранные слои",
     "processPages": "Обработать выбранные страницы",
@@ -507,6 +511,12 @@
     "remove": "Удаление",
     "select": "Выбор",
     "text": "Текст"
+  },
+  "translationPackage": {
+    "exportedDescription": "Сохранено {{segments}} текстовых фрагментов с {{pages}} страниц. Передайте Gemini весь файл, чтобы перевод учитывал контекст всей главы.",
+    "exportedTitle": "Текст главы экспортирован",
+    "importedDescription": "Применено {{count}} переводов как одно отменяемое изменение.",
+    "importedTitle": "Контекстные переводы импортированы"
   },
   "window": {
     "close": "Закрыть",

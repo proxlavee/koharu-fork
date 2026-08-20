@@ -286,6 +286,30 @@ describe('greenfield editor', () => {
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
   })
 
+  it('exports and imports one full-context translation package', async () => {
+    const user = userEvent.setup()
+    installProject()
+    const exportPackage = vi.spyOn(commands, 'exportTranslationPackage').mockResolvedValue({
+      page_count: 1,
+      segment_count: 1,
+    })
+    const importPackage = vi.spyOn(commands, 'importTranslationPackage').mockResolvedValue({
+      page_count: 1,
+      translation_count: 1,
+    })
+    render(<TitleBar />)
+
+    await user.click(screen.getByRole('menuitem', { name: 'File' }))
+    await user.hover(await screen.findByRole('menuitem', { name: 'Full-context Translation' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Export Chapter Text…' }))
+    await waitFor(() => expect(exportPackage).toHaveBeenCalledWith('en-US'))
+
+    await user.click(screen.getByRole('menuitem', { name: 'File' }))
+    await user.hover(await screen.findByRole('menuitem', { name: 'Full-context Translation' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Import Translated Text…' }))
+    await waitFor(() => expect(importPackage).toHaveBeenCalledWith('en-US'))
+  })
+
   it('opens community links through the Tauri opener plugin', async () => {
     nativeOpenUrl.mockClear()
     const user = userEvent.setup()

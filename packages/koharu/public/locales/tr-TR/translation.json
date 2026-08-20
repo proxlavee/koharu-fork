@@ -242,16 +242,20 @@
   "menu": {
     "about": "Hakkında",
     "closeProject": "Projeyi Kapat",
+    "contextTranslation": "Tam Bağlamlı Çeviri",
     "delete": "Seçilenleri Sil",
     "discord": "Discord",
     "edit": "Düzenle",
     "exportPng": "PNG Dışa Aktar…",
     "exportPsd": "PSD Dışa Aktar…",
+    "exportTranslationText": "Bölüm Metnini Dışa Aktar…",
     "file": "Dosya",
     "fit": "Pencereye Sığdır",
     "github": "GitHub",
     "help": "Yardım",
     "importPages": "Sayfaları İçe Aktar…",
+    "importTranslationText": "Çevrilmiş Metni İçe Aktar…",
+    "preparingTranslationText": "Çeviri metni hazırlanıyor…",
     "process": "İşle",
     "processLayers": "Seçili Katmanları İşle",
     "processPages": "Seçili Sayfaları İşle",
@@ -507,6 +511,12 @@
     "remove": "Kaldır",
     "select": "Seç",
     "text": "Metin"
+  },
+  "translationPackage": {
+    "exportedDescription": "{{pages}} sayfadaki {{segments}} metin parçası kaydedildi. Gemini'nin bölümün tamamını bağlam olarak kullanması için dosyanın tümünü verin.",
+    "exportedTitle": "Bölüm metni dışa aktarıldı",
+    "importedDescription": "{{count}} çeviri, geri alınabilir tek bir düzenleme olarak uygulandı.",
+    "importedTitle": "Bağlamlı çeviriler içe aktarıldı"
   },
   "window": {
     "close": "Kapat",

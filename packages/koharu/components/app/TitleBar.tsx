@@ -1,7 +1,7 @@
 'use client'
 
 import { openUrl } from '@tauri-apps/plugin-opener'
-import { FilePlus2, FolderOpen, LoaderCircle, Settings } from 'lucide-react'
+import { FileDown, FilePlus2, FileUp, FolderOpen, LoaderCircle, Settings } from 'lucide-react'
 import Image from 'next/image'
 import { useState, type ComponentProps } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -34,11 +34,15 @@ import {
   MenubarSubTrigger,
   MenubarTrigger as UiMenubarTrigger,
 } from '@koharu/ui/components/menubar'
+import { toast } from '@koharu/ui/components/toast'
 import { cn } from '@koharu/ui/lib/utils'
 
 export function TitleBar() {
   const { t } = useTranslation()
   const [aboutOpen, setAboutOpen] = useState(false)
+  const [translationPackageBusy, setTranslationPackageBusy] = useState<'export' | 'import' | null>(
+    null,
+  )
   const macOS = useMacOS()
   const project = useProject().data
   const pagesQuery = usePages(Boolean(project))
@@ -50,12 +54,53 @@ export function TitleBar() {
   const selectLayers = useKoharuStore((state) => state.selectLayers)
   const setSettingsOpen = useKoharuStore((state) => state.setSettingsOpen)
   const requestCanvasFit = useKoharuStore((state) => state.requestCanvasFit)
+  const targetLanguage = useKoharuStore(
+    (state) => state.preferences?.pipeline.translation.target_language ?? 'en-US',
+  )
   const { importPages, importing } = useImportPages()
 
   const run = (scope: Scope, operation: Operation = { operation: 'full' }) =>
     void call(commands.process, scope, operation).catch(() => undefined)
 
   const closeProject = () => void call(commands.closeProject).catch(() => undefined)
+
+  const exportTranslationPackage = async () => {
+    setTranslationPackageBusy('export')
+    try {
+      const result = await call(commands.exportTranslationPackage, targetLanguage)
+      if (result) {
+        toast.add({
+          type: 'success',
+          title: t('translationPackage.exportedTitle'),
+          description: t('translationPackage.exportedDescription', {
+            pages: result.page_count,
+            segments: result.segment_count,
+          }),
+        })
+      }
+    } finally {
+      setTranslationPackageBusy(null)
+    }
+  }
+
+  const importTranslationPackage = async () => {
+    setTranslationPackageBusy('import')
+    try {
+      const result = await call(commands.importTranslationPackage, targetLanguage)
+      if (result) {
+        await refresh(projectKey, pagesKey, pageKey)
+        toast.add({
+          type: 'success',
+          title: t('translationPackage.importedTitle'),
+          description: t('translationPackage.importedDescription', {
+            count: result.translation_count,
+          }),
+        })
+      }
+    } finally {
+      setTranslationPackageBusy(null)
+    }
+  }
 
   return (
     <>
@@ -102,6 +147,37 @@ export function TitleBar() {
                   </MenubarItem>
                 </MenubarSubContent>
               </MenubarSub>
+              <MenubarSub>
+                <MenubarSubTrigger
+                  disabled={!project || pages.length === 0 || translationPackageBusy !== null}
+                  aria-busy={translationPackageBusy !== null}
+                  className='min-h-8 gap-1.5 px-2 py-1 text-xs'
+                >
+                  {translationPackageBusy && (
+                    <LoaderCircle className='animate-spin' aria-hidden='true' />
+                  )}
+                  {translationPackageBusy
+                    ? t('menu.preparingTranslationText')
+                    : t('menu.contextTranslation')}
+                </MenubarSubTrigger>
+                <MenubarSubContent className='min-w-56 p-1'>
+                  <MenubarItem
+                    disabled={translationPackageBusy !== null}
+                    onClick={() => void exportTranslationPackage().catch(() => undefined)}
+                  >
+                    <FileDown />
+                    {t('menu.exportTranslationText')}
+                  </MenubarItem>
+                  <MenubarItem
+                    disabled={translationPackageBusy !== null}
+                    onClick={() => void importTranslationPackage().catch(() => undefined)}
+                  >
+                    <FileUp />
+                    {t('menu.importTranslationText')}
+                  </MenubarItem>
+                </MenubarSubContent>
+              </MenubarSub>
+              <MenubarSeparator />
               <MenubarItem
                 disabled={!project || pages.length === 0}
                 onClick={() =>

@@ -5,11 +5,12 @@ use image::{DynamicImage, ImageFormat, RgbaImage};
 use koharu_desktop::Frame;
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, Authored, Commit, EntityId, EntityOrigin,
-    Geometry as SceneGeometry, Group as SceneGroup, Origin, PageDraft, Point as ScenePoint,
-    Presents, RasterLayer as SceneRasterLayer, RasterLayerKind, Region as SceneRegion,
-    RemovePolicy, Revision, Session, Snapshot, SourceText as SceneSourceText,
-    TextGroup as SceneTextGroup, TextLayout as SceneTextLayout, TextLayoutKind,
-    Translation as SceneTranslation, Typography as SceneTypography, Visibility as SceneVisibility,
+    Geometry as SceneGeometry, Group as SceneGroup, LanguageTag, Origin, PageDraft,
+    Point as ScenePoint, Presents, RasterLayer as SceneRasterLayer, RasterLayerKind,
+    Region as SceneRegion, RemovePolicy, Revision, Session, Snapshot,
+    SourceText as SceneSourceText, TextGroup as SceneTextGroup, TextLayout as SceneTextLayout,
+    TextLayoutKind, Translation as SceneTranslation, Typography as SceneTypography,
+    Visibility as SceneVisibility,
 };
 use serde::Serialize;
 use specta::Type;
@@ -172,6 +173,13 @@ pub struct Typography {
 
 pub(crate) struct CurrentProject {
     pub(crate) project: Mutex<Option<Project>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TranslationUpdate {
+    pub(crate) layer: EntityId,
+    pub(crate) text: String,
+    pub(crate) language: LanguageTag,
 }
 
 #[derive(Clone)]
@@ -517,6 +525,49 @@ impl Project {
                 ),
                 None => edit.remove::<SceneTranslation>(content),
             }
+        })?;
+        self.commit(patch).await
+    }
+
+    pub(crate) async fn set_translations(
+        &mut self,
+        updates: Vec<TranslationUpdate>,
+    ) -> Result<Commit> {
+        if updates.is_empty() {
+            bail!("translation package contains no translations");
+        }
+        let snapshot = self.snapshot();
+        let mut seen_layers = HashSet::with_capacity(updates.len());
+        let mut seen_contents = HashSet::with_capacity(updates.len());
+        let updates = updates
+            .into_iter()
+            .map(|update| {
+                if !seen_layers.insert(update.layer) {
+                    bail!("translation package targets a text layer more than once");
+                }
+                if update.text.trim().is_empty() {
+                    bail!("translation package contains an empty translation");
+                }
+                let content = Self::text_content(&snapshot, update.layer)?;
+                if !seen_contents.insert(content) {
+                    bail!("translation package targets text content more than once");
+                }
+                Ok((update, content))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let patch = snapshot.patch(|edit| {
+            for (update, content) in updates {
+                edit.promote_entity_to_user(update.layer)?;
+                edit.promote_entity_to_user(content)?;
+                edit.set(
+                    content,
+                    &SceneTranslation {
+                        text: Authored::user(update.text),
+                        language: Some(update.language),
+                    },
+                )?;
+            }
+            Ok(())
         })?;
         self.commit(patch).await
     }
@@ -1358,6 +1409,81 @@ mod tests {
             Project::typography_view(typography).writing_mode,
             Some(WritingMode::Vertical)
         );
+    }
+
+    #[tokio::test]
+    async fn package_translations_are_one_undoable_user_edit() {
+        let mut session = Session::memory().await.unwrap();
+        let snapshot = session.snapshot();
+        let mut layers = Vec::new();
+        let patch = snapshot
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 100.0, 100.0), At::End)?;
+                for source in ["First", "Second"] {
+                    let content = edit.add_text_content(page, At::End)?;
+                    edit.set(
+                        content,
+                        &SceneSourceText {
+                            text: Authored::user(source.to_owned()),
+                            language: Some(LanguageTag::new("en-US")?),
+                        },
+                    )?;
+                    layers.push(edit.add_text_layer(
+                        page,
+                        At::End,
+                        content,
+                        &SceneTextLayout {
+                            origin: Origin::User,
+                            kind: TextLayoutKind::Paragraph,
+                        },
+                    )?);
+                }
+                Ok(())
+            })
+            .unwrap();
+        session.commit(patch).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+
+        let commit = project
+            .set_translations(vec![
+                TranslationUpdate {
+                    layer: layers[0],
+                    text: "Birinci".to_owned(),
+                    language: LanguageTag::new("tr-TR").unwrap(),
+                },
+                TranslationUpdate {
+                    layer: layers[1],
+                    text: "İkinci".to_owned(),
+                    language: LanguageTag::new("tr-TR").unwrap(),
+                },
+            ])
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+
+        for layer in &layers {
+            let snapshot = project.snapshot();
+            let content = snapshot.text_layer(*layer).unwrap().content().unwrap().id();
+            let translation = snapshot
+                .component::<SceneTranslation>(content)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(translation.text.origin, Origin::User));
+            assert_eq!(translation.language.unwrap().as_str(), "tr-TR");
+        }
+        assert_eq!(project.undo.len(), 1);
+
+        project.undo().await.unwrap();
+        for layer in layers {
+            let snapshot = project.snapshot();
+            let content = snapshot.text_layer(layer).unwrap().content().unwrap().id();
+            assert!(
+                snapshot
+                    .component::<SceneTranslation>(content)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

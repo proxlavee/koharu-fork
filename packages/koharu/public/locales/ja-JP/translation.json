@@ -242,16 +242,20 @@
   "menu": {
     "about": "Koharuについて",
     "closeProject": "プロジェクトを閉じる",
+    "contextTranslation": "全体文脈翻訳",
     "delete": "選択項目を削除",
     "discord": "Discord",
     "edit": "編集",
     "exportPng": "PNGを書き出す…",
     "exportPsd": "PSDを書き出す…",
+    "exportTranslationText": "章テキストを書き出す…",
     "file": "ファイル",
     "fit": "ウィンドウに合わせる",
     "github": "GitHub",
     "help": "ヘルプ",
     "importPages": "ページを読み込む…",
+    "importTranslationText": "翻訳済みテキストを読み込む…",
+    "preparingTranslationText": "翻訳テキストを準備中…",
     "process": "処理",
     "processLayers": "選択したレイヤーを処理",
     "processPages": "選択ページを処理",
@@ -507,6 +511,12 @@
     "remove": "削除",
     "select": "選択",
     "text": "テキスト"
+  },
+  "translationPackage": {
+    "exportedDescription": "{{pages}}ページの{{segments}}個のテキストを保存しました。章全体の文脈で翻訳できるよう、ファイル全体をGeminiに渡してください。",
+    "exportedTitle": "章テキストを書き出しました",
+    "importedDescription": "{{count}}件の翻訳を、取り消し可能な1回の編集として適用しました。",
+    "importedTitle": "文脈翻訳を読み込みました"
   },
   "window": {
     "close": "閉じる",

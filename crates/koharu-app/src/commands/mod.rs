@@ -8,6 +8,7 @@ pub(crate) mod output;
 pub(crate) mod preferences;
 pub(crate) mod processing;
 pub(crate) mod project;
+pub(crate) mod translation_package;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -90,6 +91,8 @@ pub fn bindings() -> tauri_specta::Builder<tauri::Cef> {
             processing::stop_job,
             output::export_pages,
             output::get_thumbnail,
+            translation_package::export_translation_package,
+            translation_package::import_translation_package,
             fonts::get_fonts,
             fonts::get_font_preview,
             preferences::save_preferences,

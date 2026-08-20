@@ -242,16 +242,20 @@
   "menu": {
     "about": "정보",
     "closeProject": "프로젝트 닫기",
+    "contextTranslation": "전체 문맥 번역",
     "delete": "선택 항목 삭제",
     "discord": "Discord",
     "edit": "편집",
     "exportPng": "PNG 내보내기…",
     "exportPsd": "PSD 내보내기…",
+    "exportTranslationText": "챕터 텍스트 내보내기…",
     "file": "파일",
     "fit": "창에 맞춤",
     "github": "GitHub",
     "help": "도움말",
     "importPages": "페이지 가져오기…",
+    "importTranslationText": "번역된 텍스트 가져오기…",
+    "preparingTranslationText": "번역 텍스트 준비 중…",
     "process": "처리",
     "processLayers": "선택한 레이어 처리",
     "processPages": "선택한 페이지 처리",
@@ -507,6 +511,12 @@
     "remove": "제거",
     "select": "선택",
     "text": "텍스트"
+  },
+  "translationPackage": {
+    "exportedDescription": "{{pages}}페이지의 텍스트 {{segments}}개를 저장했습니다. 챕터 전체 문맥으로 번역할 수 있도록 파일 전체를 Gemini에 전달하세요.",
+    "exportedTitle": "챕터 텍스트를 내보냈습니다",
+    "importedDescription": "번역 {{count}}개를 실행 취소 가능한 하나의 편집으로 적용했습니다.",
+    "importedTitle": "문맥 번역을 가져왔습니다"
   },
   "window": {
     "close": "닫기",
