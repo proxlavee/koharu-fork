@@ -475,11 +475,23 @@ function normalizeFontName(value: string): string {
 
 function displayedLayers(layers: Layer[], page: EntityId) {
   const indexes = new Map(layers.map((layer, index) => [layer.id, index]))
+  const childrenMap = new Map<string, Layer[]>()
+  for (const layer of layers) {
+    if (layer.parent) {
+      const children = childrenMap.get(layer.parent)
+      if (children) {
+        children.push(layer)
+      } else {
+        childrenMap.set(layer.parent, [layer])
+      }
+    }
+  }
+
   const rows: { layer: Layer; index: number; depth: number }[] = []
   const append = (layer: Layer, depth: number) => {
     rows.push({ layer, index: indexes.get(layer.id) ?? 0, depth })
     if (!isGroupLayer(layer)) return
-    const children = layerChildren(layers, layer.id)
+    const children = layerChildren(layers, layer.id, childrenMap)
     const ordered = layer.role === 'text' ? children : [...children].reverse()
     for (const child of ordered) append(child, depth + 1)
   }
