@@ -1,3 +1,14 @@
+## [0.78.0](https://github.com/proxlavee/koharu-fork/compare/0.77.4..0.78.0) - 2026-08-20
+
+### ⛰️  Features
+
+- Add full-context translation packages - ([bba0214](https://github.com/proxlavee/koharu-fork/commit/bba0214afc711b29a7e7e7fffec355e2db2a655c))
+
+### Build
+
+- Restrict delivery to unsigned Windows releases - ([afd83e8](https://github.com/proxlavee/koharu-fork/commit/afd83e8506984eb78380f1c690bf755efe9375fd))
+
+
 ## [0.77.4](https://github.com/mayocream/koharu/compare/0.77.3..0.77.4) - 2026-08-20
 
 ### 📚 Documentation

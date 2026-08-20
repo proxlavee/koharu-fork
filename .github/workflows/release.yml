@@ -60,7 +60,7 @@ jobs:
         run: |
           {
             echo 'release_body<<EOF'
-            bun git-cliff --current --strip all
+            bun git-cliff --current --strip all --github-repo "$GITHUB_REPOSITORY"
             printf '\nThis Windows installer is unsigned and may trigger Microsoft Defender SmartScreen.\n'
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
