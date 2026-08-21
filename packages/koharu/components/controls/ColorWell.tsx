@@ -120,6 +120,7 @@ export function ColorWell(props: ColorWellProps) {
             size='sm'
             variant={transparent ? 'secondary' : 'ghost'}
             className='mt-2 w-full justify-start gap-2'
+            aria-pressed={transparent}
             onClick={clear}
           >
             <SquareSlash aria-hidden='true' className='size-3.5 text-muted-foreground' />

@@ -74,6 +74,7 @@ export function ToolBar() {
                     size='icon'
                     disabled={!page}
                     aria-label={t(`tools.${tool}`)}
+                    aria-pressed={active === tool}
                     data-active={active === tool}
                     className='relative text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-30 data-[active=true]:bg-accent data-[active=true]:text-accent-foreground'
                     onClick={() => setTool(tool)}
