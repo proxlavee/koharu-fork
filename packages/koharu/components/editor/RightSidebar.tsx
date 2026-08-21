@@ -19,6 +19,7 @@ export function RightSidebar() {
           variant={panel === 'properties' ? 'secondary' : 'ghost'}
           size='sm'
           className='h-7 flex-1 text-[10px]'
+          aria-pressed={panel === 'properties'}
           onClick={() => setPanel('properties')}
         >
           <SlidersHorizontal className='size-3' /> {t('agent.properties')}
@@ -27,6 +28,7 @@ export function RightSidebar() {
           variant={panel === 'agent' ? 'secondary' : 'ghost'}
           size='sm'
           className='h-7 flex-1 text-[10px]'
+          aria-pressed={panel === 'agent'}
           onClick={() => setPanel('agent')}
         >
           <Bot className='size-3' /> {t('agent.title')}
