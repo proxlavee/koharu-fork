@@ -33,7 +33,6 @@ import {
   isGroupLayer,
   isLockedLayer,
   isTextLayer,
-  layerChildren,
 } from '@/lib/document'
 import { pageKey, projectKey, queryClient, refresh, useFonts, usePage } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
@@ -478,10 +477,21 @@ function normalizeFontName(value: string): string {
 function displayedLayers(layers: Layer[], page: EntityId) {
   const indexes = new Map(layers.map((layer, index) => [layer.id, index]))
   const rows: { layer: Layer; index: number; depth: number }[] = []
+
+  const childrenMap = new Map<string, Layer[]>()
+  for (const layer of layers) {
+    if (layer.parent) {
+      if (!childrenMap.has(layer.parent)) {
+        childrenMap.set(layer.parent, [])
+      }
+      childrenMap.get(layer.parent)!.push(layer)
+    }
+  }
+
   const append = (layer: Layer, depth: number) => {
     rows.push({ layer, index: indexes.get(layer.id) ?? 0, depth })
     if (!isGroupLayer(layer)) return
-    const children = layerChildren(layers, layer.id)
+    const children = childrenMap.get(layer.id) || []
     const ordered = layer.role === 'text' ? children : [...children].reverse()
     for (const child of ordered) append(child, depth + 1)
   }

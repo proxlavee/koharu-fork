@@ -18,11 +18,23 @@ export function layerChildren(layers: Layer[], parent: string): Layer[] {
 
 export function expandLayerSelection(layers: Layer[], selected: string[]): string[] {
   const result: string[] = []
+  const layerMap = new Map(layers.map(l => [l.id, l]))
+  const childrenMap = new Map<string, Layer[]>()
+  for (const layer of layers) {
+    if (layer.parent) {
+      if (!childrenMap.has(layer.parent)) {
+        childrenMap.set(layer.parent, [])
+      }
+      childrenMap.get(layer.parent)!.push(layer)
+    }
+  }
+
   const visit = (id: string) => {
-    const layer = layers.find((candidate) => candidate.id === id)
+    const layer = layerMap.get(id)
     if (!layer) return
     if (isGroupLayer(layer)) {
-      for (const child of layerChildren(layers, id)) visit(child.id)
+      const children = childrenMap.get(id) || []
+      for (const child of children) visit(child.id)
     } else if (!result.includes(id)) {
       result.push(id)
     }
@@ -31,12 +43,14 @@ export function expandLayerSelection(layers: Layer[], selected: string[]): strin
   return result
 }
 
-export function effectiveLayerVisibility(layers: Layer[], layer: Layer) {
+export function effectiveLayerVisibility(layers: Layer[] | Map<string, Layer>, layer: Layer) {
   let visible = layer.visibility.visible
   let opacity = layer.visibility.opacity
   let parent = layer.parent
+  const layerMap = Array.isArray(layers) ? new Map(layers.map(l => [l.id, l])) : layers
+
   while (parent) {
-    const group = layers.find((candidate) => candidate.id === parent)
+    const group = layerMap.get(parent)
     if (!group || !isGroupLayer(group)) break
     visible &&= group.visibility.visible
     opacity *= group.visibility.opacity
