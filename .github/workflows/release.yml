@@ -46,9 +46,10 @@ jobs:
         run: |
           version="$GITHUB_REF_NAME"
           manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          if [[ "$version" != "$manifest_version" ]]; then
-            printf 'Release tag version %s does not match Cargo workspace version %s\n' \
-              "$version" "$manifest_version" >&2
+          changelog_version=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | head -n 1)
+          if [[ "$version" != "$manifest_version" || "$version" != "$changelog_version" ]]; then
+            printf 'Release tag %s, Cargo version %s, and changelog version %s must match\n' \
+              "$version" "$manifest_version" "$changelog_version" >&2
             exit 1
           fi
 
@@ -60,7 +61,7 @@ jobs:
         run: |
           {
             echo 'release_body<<EOF'
-            bun git-cliff --current --strip all --github-repo "$GITHUB_REPOSITORY"
+            awk '/^## \[/{ if (++release == 2) exit } { print }' CHANGELOG.md
             printf '\nThis Windows installer is unsigned and may trigger Microsoft Defender SmartScreen.\n'
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
@@ -84,4 +85,6 @@ jobs:
           releaseBody: ${{ steps.release_notes.outputs.release_body }}
           releaseDraft: false
           prerelease: false
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
           args: '--no-sign'
