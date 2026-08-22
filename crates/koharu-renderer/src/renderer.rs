@@ -40,7 +40,7 @@ use crate::{
     },
     images::{DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
-    text_renderer::{StrokeOptions, TextNodeDescriptor, TextRenderer},
+    text_renderer::{StrokeOptions, StrokeSizing, TextNodeDescriptor, TextRenderer},
 };
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
@@ -1458,9 +1458,18 @@ fn resolve_alignment(
 fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
     let typography = typography?;
     let width_px = typography.stroke_width.filter(|width| *width > 0.0)?;
+    let generated_auto_fit =
+        typography.auto_fit && matches!(&typography.origin, Origin::Generated(_));
     Some(StrokeOptions {
         color: typography.stroke_color.unwrap_or([u8::MAX; 4]),
         width_px,
+        sizing: if generated_auto_fit {
+            StrokeSizing::Generated {
+                reference_font_size: typography.size,
+            }
+        } else {
+            StrokeSizing::Absolute
+        },
     })
 }
 
@@ -1775,6 +1784,48 @@ mod tests {
         assert_eq!(
             resolve_writing_mode("繁體中文", bounds, Some(&typography), None),
             WritingMode::VerticalRl
+        );
+    }
+
+    #[test]
+    fn only_generated_auto_fit_strokes_follow_the_fitted_font_size() {
+        let typography = |origin, auto_fit| Typography {
+            origin,
+            preferred_font: None,
+            font_weight: None,
+            font_style: None,
+            size: Some(24.0),
+            auto_fit,
+            color: None,
+            stroke_color: Some([255; 4]),
+            stroke_width: Some(3.0),
+            alignment: None,
+            writing_mode: None,
+            extensions: BTreeMap::new(),
+        };
+        let generated = koharu_scene::Origin::Generated(Generation::new(
+            ProducerId::new("dev.koharu.test").unwrap(),
+        ));
+
+        assert_eq!(
+            resolve_stroke(Some(&typography(generated.clone(), true)))
+                .unwrap()
+                .sizing,
+            StrokeSizing::Generated {
+                reference_font_size: Some(24.0)
+            }
+        );
+        assert_eq!(
+            resolve_stroke(Some(&typography(generated, false)))
+                .unwrap()
+                .sizing,
+            StrokeSizing::Absolute
+        );
+        assert_eq!(
+            resolve_stroke(Some(&typography(koharu_scene::Origin::User, true)))
+                .unwrap()
+                .sizing,
+            StrokeSizing::Absolute
         );
     }
 

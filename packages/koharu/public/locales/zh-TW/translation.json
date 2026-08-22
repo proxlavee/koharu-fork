@@ -513,7 +513,7 @@
     "text": "文字"
   },
   "translationPackage": {
-    "exportedDescription": "已儲存 {{pages}} 頁中的 {{segments}} 個文字片段。請將完整檔案交給 Gemini，讓它依照整章脈絡進行翻譯。",
+    "exportedDescription": "已儲存 {{pages}} 頁中的 {{segments}} 個文字片段。請將完整檔案交給 Gemini；它只能替換 pages 中的字串、保持巢狀順序不變，並儲存完整 JSON 以便匯入。",
     "exportedTitle": "章節文字已匯出",
     "importedDescription": "已將 {{count}} 筆翻譯作為一次可復原的編輯套用。",
     "importedTitle": "脈絡翻譯已匯入"

@@ -43,4 +43,22 @@ Page changes publish a generation before the browser requests its lightweight ma
 
 Validate visual changes through the final Tauri window because WebGPU adapter availability, device loss, sizing, and display scaling depend on the system webview. Native PNG and PSD checks still verify the shared rasterizer's readback path independently.
 
+## Image-driven typesetting audit
+
+The Windows build artifact includes `typesetting-audit.exe` for checking translated balloon text without driving the desktop interface. It runs Koharu's detection and OCR stages over one image or a directory, preserves the application's natural page order, applies translations by page and text order, renders the actual native frames, and fails when translated balloon text overflows or falls below the configured size and source-size ratio.
+
+Run it once to create an ordered English and Turkish translation fixture:
+
+```powershell
+.\typesetting-audit.exe --input .\test-images --output .\audit
+```
+
+Replace each ordered source string under `translations.en-US` and `translations.tr-TR`, without adding, removing, or reordering entries. Then run the rendering pass:
+
+```powershell
+.\typesetting-audit.exe --input .\test-images --output .\audit --translations .\audit\typesetting-translations.json --include-inpainting
+```
+
+The second pass writes rendered PNGs per language and `typesetting-report.json`. A successful process exit means every detected translated balloon met the requested thresholds; the PNGs remain the visual evidence for bubble shape, placement, and final pixels. Keep source pages, completed fixtures, reports, and rendered outputs outside Git because they are local test data and generated artifacts.
+
 In debug builds, the CEF remote debugging endpoint is `http://127.0.0.1:4000`; use semantic CDP inspection for the DOM and canvas lifecycle, and native window capture when the final pixels matter.

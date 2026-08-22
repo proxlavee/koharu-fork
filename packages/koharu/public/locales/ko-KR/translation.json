@@ -513,7 +513,7 @@
     "text": "텍스트"
   },
   "translationPackage": {
-    "exportedDescription": "{{pages}}페이지의 텍스트 {{segments}}개를 저장했습니다. 챕터 전체 문맥으로 번역할 수 있도록 파일 전체를 Gemini에 전달하세요.",
+    "exportedDescription": "{{pages}}페이지의 텍스트 {{segments}}개를 저장했습니다. 전체 파일을 Gemini에 전달하세요. pages 안의 문자열만 바꾸고 중첩된 순서를 유지한 채 가져올 완전한 JSON을 저장해야 합니다.",
     "exportedTitle": "챕터 텍스트를 내보냈습니다",
     "importedDescription": "번역 {{count}}개를 실행 취소 가능한 하나의 편집으로 적용했습니다.",
     "importedTitle": "문맥 번역을 가져왔습니다"

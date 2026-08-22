@@ -27,6 +27,8 @@ jobs:
           key: test-x86_64-pc-windows-msvc
       - name: Run headless Rust tests
         run: cargo test --workspace --tests --locked
+      - name: Test typesetting audit contract
+        run: cargo test -p koharu-pipeline --bin typesetting-audit --locked
 
   ui:
     name: UI

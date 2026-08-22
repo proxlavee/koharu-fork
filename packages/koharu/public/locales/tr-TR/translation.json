@@ -513,7 +513,7 @@
     "text": "Metin"
   },
   "translationPackage": {
-    "exportedDescription": "{{pages}} sayfadaki {{segments}} metin parçası kaydedildi. Gemini'nin bölümün tamamını bağlam olarak kullanması için dosyanın tümünü verin.",
+    "exportedDescription": "{{pages}} sayfadaki {{segments}} metin kaydedildi. Dosyanın tamamını Gemini'ye verin. Yalnızca pages içindeki metinleri, iç içe sırayı bozmadan değiştirmeli ve içe aktarmak için JSON'un tamamını kaydetmelidir.",
     "exportedTitle": "Bölüm metni dışa aktarıldı",
     "importedDescription": "{{count}} çeviri, geri alınabilir tek bir düzenleme olarak uygulandı.",
     "importedTitle": "Bağlamlı çeviriler içe aktarıldı"

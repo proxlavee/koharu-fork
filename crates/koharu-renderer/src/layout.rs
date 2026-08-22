@@ -203,42 +203,36 @@ fn largest_fitting_font_size<T>(
     mut layout_at: impl FnMut(f32) -> Result<T>,
     fits: impl Fn(&T) -> bool,
 ) -> Result<Option<T>> {
-    const PROBES: usize = 8;
-    if maximum - minimum <= f32::EPSILON {
-        let candidate = layout_at(maximum)?;
-        return Ok(fits(&candidate).then_some(candidate));
+    if !minimum.is_finite() || !maximum.is_finite() || maximum < minimum {
+        return Err(anyhow::anyhow!(
+            "font size limits must be finite and ordered"
+        ));
     }
-    let step = (maximum - minimum) / PROBES as f32;
-    let mut larger_non_fit = None;
-    for probe in 0..=PROBES {
-        let size = if probe == PROBES {
-            minimum
-        } else {
-            maximum - step * probe as f32
-        };
+
+    let candidate = layout_at(maximum)?;
+    if fits(&candidate) {
+        return Ok(Some(candidate));
+    }
+    let mut last_size = maximum;
+    let mut whole_size = maximum.floor() as i64;
+    let minimum_whole_size = minimum.ceil() as i64;
+    while whole_size >= minimum_whole_size {
+        let size = whole_size as f32;
+        whole_size -= 1;
+        if (size - last_size).abs() <= f32::EPSILON {
+            continue;
+        }
         let candidate = layout_at(size)?;
         if fits(&candidate) {
-            let Some(mut high) = larger_non_fit else {
-                return Ok(Some(candidate));
-            };
-            let mut low = size;
-            let mut best = candidate;
-            let mut iterations = 0u32;
-            while high - low > 0.01 && iterations < 10 {
-                iterations += 1;
-                let midpoint = (low + high) * 0.5;
-                let candidate = layout_at(midpoint)?;
-                if fits(&candidate) {
-                    best = candidate;
-                    low = midpoint;
-                } else {
-                    high = midpoint;
-                }
-            }
-            return Ok(Some(best));
+            return Ok(Some(candidate));
         }
-
-        larger_non_fit = Some(size);
+        last_size = size;
+    }
+    if (minimum - last_size).abs() > f32::EPSILON {
+        let candidate = layout_at(minimum)?;
+        if fits(&candidate) {
+            return Ok(Some(candidate));
+        }
     }
     Ok(None)
 }
@@ -421,13 +415,21 @@ impl<'a> TextLayout<'a> {
         if self.comic_balloon.is_some() {
             // A balloon's usable width changes when the text reflows to a different
             // number of lines, so a smaller font can fail even though a larger one
-            // fits. Search from largest to smallest instead of assuming monotonicity.
+            // fits. Search every visible-pixel candidate without assuming that the
+            // contour result is monotonic.
             if self.hyphenation_policy == HyphenationPolicy::LastResort {
                 let mut unhyphenated = self.clone();
                 unhyphenated.hyphenation_policy = HyphenationPolicy::Disabled;
+                let mut rectangular = unhyphenated.clone();
+                rectangular.comic_balloon = None;
+                let clean_maximum = rectangular
+                    .run_auto(text)?
+                    .font_size
+                    .min(maximum)
+                    .max(minimum);
                 let clean = largest_fitting_font_size(
                     minimum,
-                    maximum,
+                    clean_maximum,
                     |size| unhyphenated.run_with_size(text, size),
                     fits,
                 )?;
@@ -456,13 +458,26 @@ impl<'a> TextLayout<'a> {
                     (None, Some(hyphenated)) => return Ok(hyphenated),
                     (None, None) => {}
                 }
-            } else if let Some(best) = largest_fitting_font_size(
-                minimum,
-                maximum,
-                |size| self.run_with_size(text, size),
-                fits,
-            )? {
-                return Ok(best);
+            } else {
+                let search_maximum = if self.hyphenation_policy == HyphenationPolicy::Disabled {
+                    let mut rectangular = self.clone();
+                    rectangular.comic_balloon = None;
+                    rectangular
+                        .run_auto(text)?
+                        .font_size
+                        .min(maximum)
+                        .max(minimum)
+                } else {
+                    maximum
+                };
+                if let Some(best) = largest_fitting_font_size(
+                    minimum,
+                    search_maximum,
+                    |size| self.run_with_size(text, size),
+                    fits,
+                )? {
+                    return Ok(best);
+                }
             }
             return self.run_with_size(text, minimum);
         }
@@ -2317,21 +2332,21 @@ mod tests {
     }
 
     #[test]
-    fn font_size_search_handles_non_monotonic_balloon_fit() -> anyhow::Result<()> {
+    fn font_size_search_finds_a_narrow_high_non_monotonic_fit() -> anyhow::Result<()> {
         let calls = Cell::new(0);
         let fitted = largest_fitting_font_size(
             9.0,
-            24.0,
+            40.0,
             |size| {
                 calls.set(calls.get() + 1);
                 Ok(size)
             },
-            |size| (10.0..=12.0).contains(size),
+            |size| *size == 37.0 || (12.0..=20.0).contains(size),
         )?
-        .expect("the larger fitting range should be found");
+        .expect("the narrow higher fitting range should be found");
 
-        assert!((11.99..=12.0).contains(&fitted));
-        assert!(calls.get() <= 18);
+        assert_eq!(fitted, 37.0);
+        assert_eq!(calls.get(), 4);
         Ok(())
     }
 
@@ -2369,6 +2384,49 @@ mod tests {
             "auto-fit left excessive vertical space: font size {}, height {}",
             fitted.font_size,
             fitted.height
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn irregular_tall_balloon_keeps_translated_dialogue_readable() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let width = 150.0;
+        let height = 260.0;
+        let minimum = 9.0;
+        let fitted = TextLayout::new(&font)
+            .with_max_font_size(72.0)
+            .with_min_font_size(minimum)
+            .with_line_height(1.2)
+            .with_hyphenation_policy(HyphenationPolicy::LastResort)
+            .with_max_width(width)
+            .with_max_height(height)
+            .with_comic_balloon(
+                width,
+                height,
+                vec![
+                    (60.0, 0.0),
+                    (112.0, 8.0),
+                    (145.0, 45.0),
+                    (150.0, 120.0),
+                    (138.0, 210.0),
+                    (105.0, 250.0),
+                    (40.0, 258.0),
+                    (8.0, 215.0),
+                    (0.0, 130.0),
+                    (12.0, 45.0),
+                ],
+                4.0,
+            )
+            .run(
+                "You told me this would happen before. What are we supposed to do about it now?",
+            )?;
+
+        assert!(!fitted.overflowed());
+        assert!(
+            fitted.font_size >= minimum + 3.0,
+            "unexpectedly small fitted size {}",
+            fitted.font_size
         );
         Ok(())
     }

@@ -291,7 +291,7 @@ describe('greenfield editor', () => {
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
   })
 
-  it('exports and imports one full-context translation package', async () => {
+  it('exports and imports ordered chapter translation text', async () => {
     const user = userEvent.setup()
     installProject()
     const exportPackage = vi.spyOn(commands, 'exportTranslationPackage').mockResolvedValue({

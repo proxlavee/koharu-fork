@@ -69,6 +69,9 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --tests --locked
 
+      - name: Test typesetting audit contract
+        run: cargo test -p koharu-pipeline --bin typesetting-audit --locked
+
       - name: Run UI tests
         run: bun run --filter @koharu/app test
 

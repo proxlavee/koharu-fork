@@ -407,7 +407,7 @@ fn write_region<'a>(
             preferred_font: None,
             font_weight: None,
             font_style: None,
-            size: None,
+            size: inferred.map(|value| value.font_size),
             auto_fit: true,
             color: inferred.map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
             stroke_color: inferred
@@ -484,6 +484,7 @@ struct InferredTypography {
     color: [u8; 3],
     stroke_color: Option<[u8; 3]>,
     stroke_width: Option<f32>,
+    font_size: f32,
     angle_degrees: f32,
     writing_mode: WritingMode,
 }
@@ -500,6 +501,13 @@ struct MaskPixel {
     y: u32,
     color: [u8; 3],
     inside_mask: bool,
+}
+
+struct InferredPaint {
+    color: [u8; 3],
+    stroke_color: Option<[u8; 3]>,
+    stroke_width: Option<f32>,
+    ink_pixels: Vec<MaskPixel>,
 }
 
 // BallonsTranslator normalizes vertical-line angles relative to upright text:
@@ -569,12 +577,29 @@ fn infer_typography(
         median_color(&background)
     };
     let (angle_degrees, vertical) = mask_angle(&points, detection.bbox);
-    let (color, stroke_color, stroke_width) =
-        infer_text_paint(&pixels, background, local_width, local_height);
+    let InferredPaint {
+        color,
+        stroke_color,
+        stroke_width,
+        ink_pixels,
+    } = infer_text_paint(&pixels, background, local_width, local_height);
+    let ink_points = ink_pixels
+        .iter()
+        .map(|pixel| MaskPoint {
+            x: f64::from(pixel.x) + 0.5,
+            y: f64::from(pixel.y) + 0.5,
+        })
+        .collect::<Vec<_>>();
+    let font_points = if ink_points.len() >= 8 {
+        &ink_points
+    } else {
+        &points
+    };
     Some(InferredTypography {
         color,
         stroke_color,
         stroke_width,
+        font_size: mask_font_size(font_points, angle_degrees, vertical),
         angle_degrees,
         writing_mode: if vertical {
             WritingMode::Vertical
@@ -582,6 +607,85 @@ fn infer_typography(
             WritingMode::Horizontal
         },
     })
+}
+
+// BallonsTranslator averages the cross-line dimensions of detected text-line
+// quadrilaterals. RF-DETR provides foreground pixels instead, so occupied runs
+// in the same rotated projection recover individual line heights without
+// counting the whitespace between lines.
+// https://github.com/dmMaze/BallonsTranslator/blob/c02102e89b7deb52cd3c01468d3f93134475b4cd/ballontranslator/utils/textblock.py#L587-L608
+fn mask_font_size(points: &[MaskPoint], angle_degrees: f32, vertical: bool) -> f32 {
+    let (sin, cos) = f64::from(angle_degrees).to_radians().sin_cos();
+    let (axis_x, axis_y) = if vertical { (cos, sin) } else { (-sin, cos) };
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    let projections = points
+        .iter()
+        .map(|point| point.x * axis_x + point.y * axis_y)
+        .inspect(|projection| {
+            minimum = minimum.min(*projection);
+            maximum = maximum.max(*projection);
+        })
+        .collect::<Vec<_>>();
+    if projections.is_empty() || !minimum.is_finite() || !maximum.is_finite() {
+        return 1.0;
+    }
+
+    let origin = minimum.floor();
+    let profile_len = (maximum.ceil() - origin).max(0.0) as usize + 1;
+    let mut profile = vec![0_u32; profile_len];
+    for projection in projections {
+        let index = (projection - origin)
+            .floor()
+            .clamp(0.0, (profile_len - 1) as f64) as usize;
+        profile[index] += 1;
+    }
+    let peak = profile.iter().copied().max().unwrap_or_default();
+    if peak == 0 {
+        return 1.0;
+    }
+    let occupancy_threshold = peak.div_ceil(32).max(1);
+    let mut occupied = profile
+        .iter()
+        .map(|count| *count >= occupancy_threshold)
+        .collect::<Vec<_>>();
+
+    let maximum_internal_gap = ((profile_len as f32 * 0.025).round() as usize).max(1);
+    let mut index = 0;
+    while index < occupied.len() {
+        if occupied[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < occupied.len() && !occupied[index] {
+            index += 1;
+        }
+        if start > 0 && index < occupied.len() && index - start <= maximum_internal_gap {
+            occupied[start..index].fill(true);
+        }
+    }
+
+    let minimum_run = ((profile_len as f32 * 0.01).ceil() as usize).max(1);
+    let mut run_lengths = Vec::new();
+    let mut index = 0;
+    while index < occupied.len() {
+        if !occupied[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < occupied.len() && occupied[index] {
+            index += 1;
+        }
+        if index - start >= minimum_run {
+            run_lengths.push(index - start);
+        }
+    }
+    if run_lengths.is_empty() {
+        return (maximum - minimum + 1.0) as f32;
+    }
+    run_lengths.iter().sum::<usize>() as f32 / run_lengths.len() as f32
 }
 
 fn mask_window([left, top, right, bottom]: [f32; 4], width: u32, height: u32) -> Option<[u32; 4]> {
@@ -709,14 +813,15 @@ fn infer_text_paint(
     background_seed: [u8; 3],
     width: u32,
     height: u32,
-) -> ([u8; 3], Option<[u8; 3]>, Option<f32>) {
+) -> InferredPaint {
     let clusters = color_clusters(pixels, background_seed);
     if let Some(outline) = infer_outline(&clusters, background_seed, width, height) {
-        return (
-            outline.fill_color,
-            Some(outline.stroke_color),
-            Some(outline.stroke_width),
-        );
+        return InferredPaint {
+            color: outline.fill_color,
+            stroke_color: Some(outline.stroke_color),
+            stroke_width: Some(outline.stroke_width),
+            ink_pixels: outline.ink_pixels,
+        };
     }
 
     let nonempty = clusters
@@ -726,11 +831,13 @@ fn infer_text_paint(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if nonempty.len() == 1 {
-        return (
-            normalize_text_color(clusters[nonempty[0]].color),
-            None,
-            None,
-        );
+        let cluster = &clusters[nonempty[0]];
+        return InferredPaint {
+            color: normalize_text_color(cluster.color),
+            stroke_color: None,
+            stroke_width: None,
+            ink_pixels: masked_cluster_pixels(cluster),
+        };
     }
 
     let background_index = nonempty
@@ -746,15 +853,22 @@ fn infer_text_paint(
     let color = fill
         .map(|index| representative_ink_color(&clusters[index]))
         .unwrap_or(clusters[background_index].color);
-    (normalize_text_color(color), None, None)
+    InferredPaint {
+        color: normalize_text_color(color),
+        stroke_color: None,
+        stroke_width: None,
+        ink_pixels: fill
+            .map(|index| masked_cluster_pixels(&clusters[index]))
+            .unwrap_or_default(),
+    }
 }
 
-#[derive(Clone, Copy)]
 struct OutlinePaint {
     fill_color: [u8; 3],
     stroke_color: [u8; 3],
     stroke_width: f32,
     score: u64,
+    ink_pixels: Vec<MaskPixel>,
 }
 
 fn infer_outline(
@@ -836,18 +950,38 @@ fn infer_outline(
                 .filter(|pixel| pixel.inside_mask)
                 .count();
             let evidence = enclosed_fill.len() + inside_fill;
+            let mut ink_pixels = enclosed_fill;
+            ink_pixels.extend(stroke_pixels);
             let candidate = OutlinePaint {
                 fill_color: normalized_fill,
                 stroke_color: normalized_stroke,
                 stroke_width,
                 score: u64::from(contrast) * evidence.min(4096) as u64,
+                ink_pixels,
             };
-            if best.is_none_or(|current: OutlinePaint| candidate.score > current.score) {
+            if best
+                .as_ref()
+                .is_none_or(|current: &OutlinePaint| candidate.score > current.score)
+            {
                 best = Some(candidate);
             }
         }
     }
     best
+}
+
+fn masked_cluster_pixels(cluster: &ColorCluster) -> Vec<MaskPixel> {
+    let inside = cluster
+        .pixels
+        .iter()
+        .copied()
+        .filter(|pixel| pixel.inside_mask)
+        .collect::<Vec<_>>();
+    if inside.len() >= 8 {
+        inside
+    } else {
+        cluster.pixels.clone()
+    }
 }
 
 fn reachable_without_cluster(
@@ -2262,6 +2396,7 @@ mod tests {
         assert_eq!(typography.color, Some([0, 0, 0, 255]));
         assert_eq!(typography.stroke_color, Some([255, 255, 255, 255]));
         assert_eq!(typography.stroke_width, Some(3.0));
+        assert_eq!(typography.size, Some(20.0));
     }
 
     #[test]
@@ -2522,6 +2657,7 @@ mod tests {
         assert_eq!(inferred.color, [24, 80, 160]);
         assert_eq!(inferred.stroke_color, None);
         assert_eq!(inferred.stroke_width, None);
+        assert!((inferred.font_size - 12.0).abs() < 2.0);
         assert_eq!(inferred.writing_mode, WritingMode::Horizontal);
     }
 
@@ -2532,6 +2668,7 @@ mod tests {
         let inferred = infer_typography(&image, &detection).unwrap();
 
         assert!((inferred.angle_degrees - 9.0).abs() < 1.0);
+        assert!((inferred.font_size - 12.0).abs() < 2.0);
         assert_eq!(inferred.writing_mode, WritingMode::Vertical);
     }
 
@@ -2577,6 +2714,7 @@ mod tests {
 
         assert_eq!(inferred.writing_mode, WritingMode::Horizontal);
         assert!((inferred.angle_degrees - 8.0).abs() < 1.0);
+        assert!((inferred.font_size - 5.0).abs() < 1.0);
     }
 
     #[test]

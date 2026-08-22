@@ -17,6 +17,11 @@ use crate::{
     script::is_chinese_or_japanese_text,
 };
 
+// Detected outlines are measured at the source font size, while translated
+// text may auto-fit smaller. Preserve that ratio but bound unusually broad
+// detected bands; explicitly authored widths remain absolute.
+const MAX_GENERATED_STROKE_FONT_RATIO: f32 = 0.12;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextNodeDescriptor {
     pub(crate) entity: koharu_scene::EntityId,
@@ -64,6 +69,33 @@ pub(crate) struct RenderedTextMetadata {
 pub(crate) struct StrokeOptions {
     pub color: [u8; 4],
     pub width_px: f32,
+    pub sizing: StrokeSizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum StrokeSizing {
+    Absolute,
+    Generated { reference_font_size: Option<f32> },
+}
+
+impl StrokeOptions {
+    fn for_font_size(self, font_size: f32) -> Self {
+        let StrokeSizing::Generated {
+            reference_font_size,
+        } = self.sizing
+        else {
+            return self;
+        };
+        let scaled_width = reference_font_size
+            .filter(|reference| reference.is_finite() && *reference > 0.0)
+            .map_or(self.width_px, |reference| {
+                self.width_px * font_size / reference
+            });
+        Self {
+            width_px: scaled_width.min((font_size * MAX_GENERATED_STROKE_FONT_RATIO).max(0.0)),
+            ..self
+        }
+    }
 }
 
 /// Paint options used when recording one laid-out text run into a Vello scene.
@@ -185,13 +217,7 @@ impl TextRenderer {
                 entity: descriptor.entity,
                 source,
             })?;
-        let automatic_maximum = || automatic_maximum(descriptor, bounds, is_bubble_text);
-        let maximum = if descriptor.auto_fit {
-            automatic_maximum()
-        } else {
-            descriptor.font_size.unwrap_or_else(automatic_maximum)
-        };
-        let minimum = descriptor.minimum_font_size.min(maximum);
+        let (minimum, maximum) = font_size_limits(descriptor, bounds);
         let mut layout = TextLayout::new(&fonts[0])
             .with_fallback_fonts(&fonts[1..])
             .with_writing_mode(descriptor.writing_mode)
@@ -270,7 +296,10 @@ impl TextRenderer {
         };
         let mut scene = PreparedScene::default();
         let mut resources = Vec::new();
-        if let Some(stroke) = descriptor.stroke {
+        if let Some(stroke) = descriptor
+            .stroke
+            .map(|stroke| stroke.for_font_size(layout.font_size))
+        {
             options.stroke = Some(stroke);
         }
         self.render(
@@ -304,7 +333,7 @@ impl TextRenderer {
             width: layout.width,
             height: layout.height,
         };
-        let stroke_padding = descriptor
+        let stroke_padding = options
             .stroke
             .map_or(0.0, |stroke| stroke.width_px.max(0.0));
         Ok(RenderedTextNode {
@@ -335,20 +364,26 @@ impl TextRenderer {
     }
 }
 
-fn automatic_maximum(
-    descriptor: &TextNodeDescriptor,
-    bounds: LayoutBox,
-    is_bubble_text: bool,
-) -> f32 {
-    if is_bubble_text {
-        if descriptor.writing_mode.is_vertical() {
-            bounds.height
-        } else {
-            bounds.width
-        }
-    } else {
+fn automatic_maximum(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> f32 {
+    if descriptor.point_text {
         24.0
+    } else if descriptor.writing_mode.is_vertical() {
+        bounds.height
+    } else {
+        bounds.width
     }
+}
+
+fn font_size_limits(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> (f32, f32) {
+    let maximum = descriptor
+        .font_size
+        .unwrap_or_else(|| automatic_maximum(descriptor, bounds));
+    let maximum = if descriptor.auto_fit {
+        maximum.max(descriptor.minimum_font_size)
+    } else {
+        maximum
+    };
+    (descriptor.minimum_font_size.min(maximum), maximum)
 }
 
 fn is_chinese_or_japanese_language(language: &str) -> bool {
@@ -461,7 +496,7 @@ mod tests {
     use crate::fonts::FontSystem;
 
     #[test]
-    fn automatic_size_preserves_free_text_default_and_balloon_extent() {
+    fn detected_size_caps_paragraph_growth_and_point_text_keeps_its_default() {
         let descriptor = TextNodeDescriptor {
             entity: EntityId::new(),
             text: "Hi".to_owned(),
@@ -494,8 +529,55 @@ mod tests {
             height: 120.0,
         };
 
-        assert_eq!(automatic_maximum(&descriptor, bounds, false), 24.0);
-        assert_eq!(automatic_maximum(&descriptor, bounds, true), 240.0);
+        assert_eq!(automatic_maximum(&descriptor, bounds), 240.0);
+        assert_eq!(font_size_limits(&descriptor, bounds), (9.0, 9.0));
+
+        let mut large_source = descriptor.clone();
+        large_source.font_size = Some(30.0);
+        assert_eq!(font_size_limits(&large_source, bounds), (9.0, 30.0));
+
+        let mut free_paragraph = descriptor.clone();
+        free_paragraph.font_size = None;
+        assert_eq!(font_size_limits(&free_paragraph, bounds), (9.0, 240.0));
+
+        let mut vertical_paragraph = free_paragraph.clone();
+        vertical_paragraph.writing_mode = WritingMode::VerticalRl;
+        assert_eq!(font_size_limits(&vertical_paragraph, bounds), (9.0, 120.0));
+
+        let mut point_text = free_paragraph;
+        point_text.point_text = true;
+        assert_eq!(automatic_maximum(&point_text, bounds), 24.0);
+
+        let mut explicit = descriptor;
+        explicit.auto_fit = false;
+        assert_eq!(font_size_limits(&explicit, bounds), (6.0, 6.0));
+    }
+
+    #[test]
+    fn generated_strokes_scale_and_cap_while_absolute_strokes_stay_fixed() {
+        let generated = StrokeOptions {
+            color: [255; 4],
+            width_px: 2.0,
+            sizing: StrokeSizing::Generated {
+                reference_font_size: Some(40.0),
+            },
+        };
+        let generated_without_reference = StrokeOptions {
+            width_px: 10.0,
+            sizing: StrokeSizing::Generated {
+                reference_font_size: None,
+            },
+            ..generated
+        };
+        let absolute = StrokeOptions {
+            width_px: 10.0,
+            sizing: StrokeSizing::Absolute,
+            ..generated
+        };
+
+        assert_eq!(generated.for_font_size(20.0).width_px, 1.0);
+        assert!((generated_without_reference.for_font_size(12.0).width_px - 1.44).abs() < 0.001);
+        assert_eq!(absolute.for_font_size(12.0).width_px, 10.0);
     }
 
     #[test]

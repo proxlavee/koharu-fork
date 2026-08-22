@@ -513,7 +513,7 @@
     "text": "Texto"
   },
   "translationPackage": {
-    "exportedDescription": "Se guardaron {{segments}} segmentos de texto de {{pages}} páginas. Entrega el archivo completo a Gemini para que traduzca con el contexto de todo el capítulo.",
+    "exportedDescription": "Se guardaron {{segments}} segmentos de texto de {{pages}} páginas. Entrega el archivo completo a Gemini. Debe reemplazar solo las cadenas de pages sin alterar su orden anidado y guardar el JSON completo para importarlo.",
     "exportedTitle": "Texto del capítulo exportado",
     "importedDescription": "Se aplicaron {{count}} traducciones como una única edición que se puede deshacer.",
     "importedTitle": "Traducciones contextuales importadas"

@@ -513,7 +513,7 @@
     "text": "テキスト"
   },
   "translationPackage": {
-    "exportedDescription": "{{pages}}ページの{{segments}}個のテキストを保存しました。章全体の文脈で翻訳できるよう、ファイル全体をGeminiに渡してください。",
+    "exportedDescription": "{{pages}}ページの{{segments}}個のテキストを保存しました。ファイル全体をGeminiに渡してください。pages内の文字列だけを置き換え、入れ子の順序を変えず、読み込み用に完全なJSONを保存する必要があります。",
     "exportedTitle": "章テキストを書き出しました",
     "importedDescription": "{{count}}件の翻訳を、取り消し可能な1回の編集として適用しました。",
     "importedTitle": "文脈翻訳を読み込みました"

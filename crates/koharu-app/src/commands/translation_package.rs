@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use anyhow::{Context as _, Result, bail};
 use koharu_desktop::Desktop;
-use koharu_scene::{EntityId, LanguageTag, Revision, Snapshot};
+use koharu_scene::{EntityId, LanguageTag, Snapshot};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::{Cef, State, WebviewWindow};
@@ -14,8 +12,9 @@ use super::{
 };
 
 const FORMAT: &str = "dev.koharu.context-translation";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+const INSTRUCTION: &str = "Read every page first. Replace only the strings in pages with tr-TR translations, preserve the exact nested array shape and order, and return the complete JSON only.";
 
 #[derive(Clone, Debug, Serialize, Type)]
 pub struct TranslationPackageSummary {
@@ -30,60 +29,19 @@ pub struct TranslationImportResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TranslationPackage {
     format: String,
     format_version: u32,
-    project: PackageProject,
-    exported_revision: Revision,
     target_language: String,
-    instructions: Vec<String>,
-    context: TranslationContext,
-    pages: Vec<PackagePage>,
+    instruction: String,
+    pages: Vec<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PackageProject {
-    id: String,
-    name: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct TranslationContext {
-    chapter_summary: String,
-    glossary: Vec<GlossaryEntry>,
-    character_voices: Vec<CharacterVoice>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct GlossaryEntry {
+#[derive(Clone, Debug)]
+struct OrderedTextSegment {
+    layer: EntityId,
     source: String,
-    translation: String,
-    note: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct CharacterVoice {
-    character: String,
-    voice: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PackagePage {
-    page_id: EntityId,
-    page_number: u32,
-    label: String,
-    segments: Vec<PackageSegment>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PackageSegment {
-    segment_id: EntityId,
-    layer_id: EntityId,
-    order: u32,
-    role: Option<String>,
-    source_language: Option<String>,
-    source: String,
-    translation: String,
 }
 
 #[tauri::command]
@@ -98,7 +56,7 @@ pub(crate) async fn export_translation_package(
         let project = project.as_ref().context("no project is open")?;
         (project.snapshot(), project.name.clone())
     };
-    let package = build_package(&snapshot, &project_name, &target_language)?;
+    let package = build_package(&snapshot, &target_language)?;
     let summary = package_summary(&package)?;
     let file_name = format!("{}-context-translation.txt", safe_file_stem(&project_name));
     let Some(file) = rfd::AsyncFileDialog::new()
@@ -148,12 +106,7 @@ pub(crate) async fn import_translation_package(
     let (commit, active_page, result) = {
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
-        let updates = validate_package(
-            &project.snapshot(),
-            &project.name,
-            &target_language,
-            &package,
-        )?;
+        let updates = validate_package(&project.snapshot(), &target_language, &package)?;
         let result = TranslationImportResult {
             page_count: u32::try_from(package.pages.len()).context("too many package pages")?,
             translation_count: u32::try_from(updates.len())
@@ -170,65 +123,47 @@ pub(crate) async fn import_translation_package(
     Ok(Some(result))
 }
 
-fn build_package(
-    snapshot: &Snapshot,
-    project_name: &str,
-    target_language: &str,
-) -> Result<TranslationPackage> {
+fn build_package(snapshot: &Snapshot, target_language: &str) -> Result<TranslationPackage> {
     LanguageTag::new(target_language)?;
-    let mut pages = Vec::new();
-    for (page_index, page_ref) in snapshot.pages().enumerate() {
-        let page = page_ref.page()?;
-        let mut segments = Vec::new();
-        if let Some(group) = page_ref.text_group()? {
-            for layer in group.text_layers()? {
-                let content = layer.content()?;
-                let Some(source) = content.source()? else {
-                    continue;
-                };
-                if source.text.value.trim().is_empty() {
-                    continue;
-                }
-                segments.push(PackageSegment {
-                    segment_id: content.id(),
-                    layer_id: layer.id(),
-                    order: next_number(segments.len(), "segments")?,
-                    role: content.role()?.map(|role| role.role),
-                    source_language: source.language.map(|language| language.to_string()),
-                    source: source.text.value,
-                    translation: String::new(),
-                });
-            }
-        }
-        pages.push(PackagePage {
-            page_id: page_ref.id(),
-            page_number: next_number(page_index, "pages")?,
-            label: page.label,
-            segments,
-        });
-    }
-    if pages.iter().all(|page| page.segments.is_empty()) {
+    let pages = ordered_text_segments(snapshot)?;
+    if pages.iter().all(Vec::is_empty) {
         bail!("the project has no OCR text; run detection and OCR before exporting");
     }
     Ok(TranslationPackage {
         format: FORMAT.to_owned(),
         format_version: FORMAT_VERSION,
-        project: PackageProject {
-            id: snapshot.project_id().to_string(),
-            name: project_name.to_owned(),
-        },
-        exported_revision: snapshot.revision(),
         target_language: target_language.to_owned(),
-        instructions: vec![
-            "Read every page and every segment before translating anything.".to_owned(),
-            "Use the complete chapter context to keep names, pronouns, terms, relationships, tone, and running jokes consistent across pages.".to_owned(),
-            "Fill every translation field in the target language. Do not leave a translation empty.".to_owned(),
-            "Edit only translation fields and the optional context notes. Do not change, add, remove, split, merge, or reorder pages or segments.".to_owned(),
-            "Return the complete JSON document without Markdown fences or commentary.".to_owned(),
-        ],
-        context: TranslationContext::default(),
-        pages,
+        instruction: INSTRUCTION.replacen("tr-TR", target_language, 1),
+        pages: pages
+            .into_iter()
+            .map(|page| page.into_iter().map(|segment| segment.source).collect())
+            .collect(),
     })
+}
+
+fn ordered_text_segments(snapshot: &Snapshot) -> Result<Vec<Vec<OrderedTextSegment>>> {
+    snapshot
+        .pages()
+        .map(|page| {
+            let mut segments = Vec::new();
+            if let Some(group) = page.text_group()? {
+                for layer in group.text_layers()? {
+                    let content = layer.content()?;
+                    let Some(source) = content.source()? else {
+                        continue;
+                    };
+                    if source.text.value.trim().is_empty() {
+                        continue;
+                    }
+                    segments.push(OrderedTextSegment {
+                        layer: layer.id(),
+                        source: source.text.value,
+                    });
+                }
+            }
+            Ok(segments)
+        })
+        .collect()
 }
 
 fn parse_package(contents: &str) -> Result<TranslationPackage> {
@@ -248,7 +183,6 @@ fn parse_package(contents: &str) -> Result<TranslationPackage> {
 
 fn validate_package(
     snapshot: &Snapshot,
-    project_name: &str,
     target_language: &str,
     package: &TranslationPackage,
 ) -> Result<Vec<TranslationUpdate>> {
@@ -263,66 +197,26 @@ fn validate_package(
             target_language
         );
     }
-    if package.project.id != snapshot.project_id().to_string()
-        || package.project.name != project_name
-    {
-        bail!("translation package belongs to a different project");
-    }
-    let expected = build_package(snapshot, project_name, target_language)?;
-    if package.pages.len() != expected.pages.len() {
+    let expected = ordered_text_segments(snapshot)?;
+    if package.pages.len() != expected.len() {
         bail!("translation package does not contain every project page");
-    }
-    let mut package_pages = HashMap::with_capacity(package.pages.len());
-    for page in &package.pages {
-        if package_pages.insert(page.page_id, page).is_some() {
-            bail!("translation package contains duplicate page IDs");
-        }
     }
     let language = LanguageTag::new(target_language)?;
     let mut updates = Vec::new();
-    for expected_page in &expected.pages {
-        let page = package_pages
-            .remove(&expected_page.page_id)
-            .context("translation package is missing a project page")?;
-        if page.page_number != expected_page.page_number || page.label != expected_page.label {
-            bail!("project page order or labels changed after the package was exported");
-        }
-        if page.segments.len() != expected_page.segments.len() {
+    for (expected_page, translated_page) in expected.iter().zip(&package.pages) {
+        if translated_page.len() != expected_page.len() {
             bail!("translation package has missing or extra text segments");
         }
-        let mut segments = HashMap::with_capacity(page.segments.len());
-        for segment in &page.segments {
-            if segments.insert(segment.segment_id, segment).is_some() {
-                bail!("translation package contains duplicate segment IDs");
-            }
-        }
-        for expected_segment in &expected_page.segments {
-            let segment = segments
-                .remove(&expected_segment.segment_id)
-                .context("translation package is missing a text segment")?;
-            if segment.layer_id != expected_segment.layer_id
-                || segment.order != expected_segment.order
-                || segment.role != expected_segment.role
-                || segment.source_language != expected_segment.source_language
-                || segment.source != expected_segment.source
-            {
-                bail!("source text or segment metadata changed after the package was exported");
-            }
-            if segment.translation.trim().is_empty() {
+        for (segment, translation) in expected_page.iter().zip(translated_page) {
+            if translation.trim().is_empty() {
                 bail!("every text segment must have a translation");
             }
             updates.push(TranslationUpdate {
-                layer: segment.layer_id,
-                text: segment.translation.clone(),
+                layer: segment.layer,
+                text: translation.clone(),
                 language: language.clone(),
             });
         }
-        if !segments.is_empty() {
-            bail!("translation package contains unknown text segments");
-        }
-    }
-    if !package_pages.is_empty() {
-        bail!("translation package contains unknown project pages");
     }
     Ok(updates)
 }
@@ -330,22 +224,9 @@ fn validate_package(
 fn package_summary(package: &TranslationPackage) -> Result<TranslationPackageSummary> {
     Ok(TranslationPackageSummary {
         page_count: u32::try_from(package.pages.len()).context("too many package pages")?,
-        segment_count: u32::try_from(
-            package
-                .pages
-                .iter()
-                .map(|page| page.segments.len())
-                .sum::<usize>(),
-        )
-        .context("too many package segments")?,
+        segment_count: u32::try_from(package.pages.iter().map(Vec::len).sum::<usize>())
+            .context("too many package segments")?,
     })
-}
-
-fn next_number(index: usize, what: &str) -> Result<u32> {
-    u32::try_from(index)
-        .ok()
-        .and_then(|index| index.checked_add(1))
-        .with_context(|| format!("too many {what}"))
 }
 
 fn safe_file_stem(value: &str) -> String {
@@ -408,6 +289,7 @@ mod tests {
                         )?;
                     }
                 }
+                edit.add_page(PageDraft::new("Page 3", 800.0, 1200.0), At::End)?;
                 Ok(())
             })
             .unwrap();
@@ -415,71 +297,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn package_carries_the_whole_chapter_and_accepts_reordered_output() {
+    async fn package_exports_only_ordered_source_strings() {
         let snapshot = sample_snapshot().await;
-        let mut package = build_package(&snapshot, "Chapter", "tr-TR").unwrap();
-        assert_eq!(package.pages.len(), 2);
-        assert_eq!(package.pages[0].segments.len(), 2);
-        assert_eq!(package.pages[1].segments.len(), 2);
-        assert!(
-            package
-                .pages
-                .iter()
-                .flat_map(|page| &page.segments)
-                .all(|segment| segment.translation.is_empty())
+        let package = build_package(&snapshot, "tr-TR").unwrap();
+        assert_eq!(package.pages.len(), 3);
+        assert_eq!(
+            package.pages,
+            vec![
+                ["Who are you?", "I'm Koharu."].map(str::to_owned).to_vec(),
+                ["Koharu, wait!", "I can't."].map(str::to_owned).to_vec(),
+                Vec::new(),
+            ]
         );
-        for (index, segment) in package
-            .pages
-            .iter_mut()
-            .flat_map(|page| &mut page.segments)
-            .enumerate()
-        {
-            segment.translation = format!("Çeviri {}", index + 1);
-        }
-        package.pages.reverse();
-        for page in &mut package.pages {
-            page.segments.reverse();
-        }
+        assert_eq!(package.instruction, INSTRUCTION);
 
-        let updates = validate_package(&snapshot, "Chapter", "tr-TR", &package).unwrap();
+        let serialized = serde_json::to_value(&package).unwrap();
+        let object = serialized.as_object().unwrap();
+        assert_eq!(object.len(), 5);
+        for key in [
+            "format",
+            "format_version",
+            "target_language",
+            "instruction",
+            "pages",
+        ] {
+            assert!(object.contains_key(key));
+        }
+        for removed_key in ["project", "exported_revision", "context", "segments"] {
+            assert!(!object.contains_key(removed_key));
+        }
+        assert_eq!(package_summary(&package).unwrap().segment_count, 4);
+        assert_eq!(package_summary(&package).unwrap().page_count, 3);
+    }
+
+    #[tokio::test]
+    async fn package_applies_translations_by_page_and_text_order() {
+        let snapshot = sample_snapshot().await;
+        let mut package = build_package(&snapshot, "tr-TR").unwrap();
+        package.pages = vec![
+            vec!["Sen kimsin?".to_owned(), "Ben Koharu.".to_owned()],
+            vec!["Koharu, bekle!".to_owned(), "Yapamam.".to_owned()],
+            Vec::new(),
+        ];
+
+        let updates = validate_package(&snapshot, "tr-TR", &package).unwrap();
         assert_eq!(updates.len(), 4);
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Sen kimsin?", "Ben Koharu.", "Koharu, bekle!", "Yapamam."]
+        );
         assert!(
             updates
                 .iter()
                 .all(|update| update.language.as_str() == "tr-TR")
         );
+
+        let expected_layers = ordered_text_segments(&snapshot)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|segment| segment.layer)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.layer)
+                .collect::<Vec<_>>(),
+            expected_layers
+        );
     }
 
     #[tokio::test]
-    async fn package_rejects_changed_source_and_incomplete_translations() {
+    async fn package_rejects_changed_shape_incomplete_text_and_old_version() {
         let snapshot = sample_snapshot().await;
-        let mut package = build_package(&snapshot, "Chapter", "tr-TR").unwrap();
-        for segment in package.pages.iter_mut().flat_map(|page| &mut page.segments) {
-            segment.translation = "Çeviri".to_owned();
+        let mut package = build_package(&snapshot, "tr-TR").unwrap();
+        for text in package.pages.iter_mut().flatten() {
+            *text = "Çeviri".to_owned();
         }
-        package.pages[0].segments[0].source = "Changed".to_owned();
+
+        let mut missing_page = package.clone();
+        missing_page.pages.pop();
         assert!(
-            validate_package(&snapshot, "Chapter", "tr-TR", &package)
+            validate_package(&snapshot, "tr-TR", &missing_page)
                 .unwrap_err()
                 .to_string()
-                .contains("source text")
+                .contains("every project page")
         );
 
-        package = build_package(&snapshot, "Chapter", "tr-TR").unwrap();
+        let mut missing_segment = package.clone();
+        missing_segment.pages[0].pop();
         assert!(
-            validate_package(&snapshot, "Chapter", "tr-TR", &package)
+            validate_package(&snapshot, "tr-TR", &missing_segment)
+                .unwrap_err()
+                .to_string()
+                .contains("missing or extra text segments")
+        );
+
+        let mut incomplete = package.clone();
+        incomplete.pages[0][0] = "  ".to_owned();
+        assert!(
+            validate_package(&snapshot, "tr-TR", &incomplete)
                 .unwrap_err()
                 .to_string()
                 .contains("must have a translation")
+        );
+
+        let mut wrong_target = package.clone();
+        wrong_target.target_language = "de-DE".to_owned();
+        assert!(
+            validate_package(&snapshot, "tr-TR", &wrong_target)
+                .unwrap_err()
+                .to_string()
+                .contains("current translation target")
+        );
+
+        package.format_version = 1;
+        assert!(
+            validate_package(&snapshot, "tr-TR", &package)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
         );
     }
 
     #[tokio::test]
     async fn parser_accepts_a_single_gemini_json_fence() {
         let snapshot = sample_snapshot().await;
-        let package = build_package(&snapshot, "Chapter", "tr-TR").unwrap();
+        let package = build_package(&snapshot, "tr-TR").unwrap();
         let json = serde_json::to_string(&package).unwrap();
         let parsed = parse_package(&format!("```json\n{json}\n```")).unwrap();
-        assert_eq!(parsed.project.id, package.project.id);
+        assert_eq!(parsed.pages, package.pages);
     }
 }

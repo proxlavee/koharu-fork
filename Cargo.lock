@@ -4736,6 +4736,7 @@ dependencies = [
 name = "koharu-pipeline"
 version = "0.79.0"
 dependencies = [
+ "alphanumeric-sort",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -4752,6 +4753,7 @@ dependencies = [
  "nvml-wrapper",
  "rayon",
  "serde",
+ "serde_json",
  "specta",
  "strum",
  "sysinfo",
