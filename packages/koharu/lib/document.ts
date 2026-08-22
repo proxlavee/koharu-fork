@@ -18,11 +18,28 @@ export function layerChildren(layers: Layer[], parent: string): Layer[] {
 
 export function expandLayerSelection(layers: Layer[], selected: string[]): string[] {
   const result: string[] = []
+  // Build a map of layers and a map of children to change O(n) traversals into O(1) lookups
+  // during selection expansion, significantly improving real-time rendering performance.
+  const layerMap = new Map<string, Layer>()
+  const childrenMap = new Map<string, Layer[]>()
+  for (const layer of layers) {
+    layerMap.set(layer.id, layer)
+    if (layer.parent) {
+      let children = childrenMap.get(layer.parent)
+      if (!children) {
+        children = []
+        childrenMap.set(layer.parent, children)
+      }
+      children.push(layer)
+    }
+  }
+
   const visit = (id: string) => {
-    const layer = layers.find((candidate) => candidate.id === id)
+    const layer = layerMap.get(id)
     if (!layer) return
     if (isGroupLayer(layer)) {
-      for (const child of layerChildren(layers, id)) visit(child.id)
+      const children = childrenMap.get(id) || []
+      for (const child of children) visit(child.id)
     } else if (!result.includes(id)) {
       result.push(id)
     }
@@ -31,12 +48,16 @@ export function expandLayerSelection(layers: Layer[], selected: string[]): strin
   return result
 }
 
-export function effectiveLayerVisibility(layers: Layer[], layer: Layer) {
+export function effectiveLayerVisibility(layers: Layer[] | ReadonlyMap<string, Layer>, layer: Layer) {
   let visible = layer.visibility.visible
   let opacity = layer.visibility.opacity
   let parent = layer.parent
+  // Provide backwards compatibility for arrays, but prefer ReadonlyMap to avoid O(n) lookup bottlenecks.
+  const getLayer = (id: string) => {
+    return Array.isArray(layers) ? layers.find((l) => l.id === id) : layers.get(id)
+  }
   while (parent) {
-    const group = layers.find((candidate) => candidate.id === parent)
+    const group = getLayer(parent)
     if (!group || !isGroupLayer(group)) break
     visible &&= group.visibility.visible
     opacity *= group.visibility.opacity
