@@ -1,3 +1,16 @@
+## [0.80.0](https://github.com/proxlavee/koharu-fork/compare/0.79.0..0.80.0) - 2026-08-22
+
+### ⛰️  Features
+
+- Preserve readable translated text and simplify contextual packages to ordered chapter strings - ([5666f5e](https://github.com/proxlavee/koharu-fork/commit/5666f5e5bb90a8bb29f2400630778e58a5b86250))
+- Add a Windows image-driven typesetting audit with English and Turkish reports - ([5666f5e](https://github.com/proxlavee/koharu-fork/commit/5666f5e5bb90a8bb29f2400630778e58a5b86250))
+
+### 🐛 Bug Fixes
+
+- *(runtime)* Improve accelerator detection - ([e7f0cbc](https://github.com/proxlavee/koharu-fork/commit/e7f0cbced69e7d621b06f32286d4105b70979409))
+- Limit the typesetting audit to required runtime downloads - ([5bbde4d](https://github.com/proxlavee/koharu-fork/commit/5bbde4d998a5318ef0316de0a940a8b6d6f8aef2))
+
+
 ## [0.79.0](https://github.com/proxlavee/koharu-fork/compare/0.78.0..0.79.0) - 2026-08-22
 
 ### ⛰️  Features
