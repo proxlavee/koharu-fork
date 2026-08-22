@@ -1,3 +1,28 @@
+## [0.79.0](https://github.com/proxlavee/koharu-fork/compare/0.78.0..0.79.0) - 2026-08-22
+
+### ⛰️  Features
+
+- *(translator)* Add uncensored Qwen 3.8 model - ([e4c3d06](https://github.com/proxlavee/koharu-fork/commit/e4c3d069f3c9221575ed20e28a6e4693b39dec2a))
+
+### 🐛 Bug Fixes
+
+- *(metrics)* Exclude telemetry from logs - ([299e883](https://github.com/proxlavee/koharu-fork/commit/299e883538402a092364457b7a383f0b209b79de))
+- *(runtime)* Isolate system HIP discovery - ([c1fce14](https://github.com/proxlavee/koharu-fork/commit/c1fce14c4f914b309fdc0acef29f3ecee45e69ea))
+- *(runtime)* Reject unsupported CUDA architectures - ([dc2c044](https://github.com/proxlavee/koharu-fork/commit/dc2c0442cc7d768e7b1ef37a75c463081d75f0c8))
+- *(translator)* Map Gemini thinking controls - ([f53631b](https://github.com/proxlavee/koharu-fork/commit/f53631b402f6a7fc981638f00176f1d5517796b5))
+- *(ui)* Preserve quick settings across navigation - ([5b38393](https://github.com/proxlavee/koharu-fork/commit/5b38393633be7b7cafbdf20de49c839c48632769))
+
+### 🚜 Refactor
+
+- Refine metrics - ([5f87445](https://github.com/proxlavee/koharu-fork/commit/5f87445e8739c17c627d403060d61bf58ba1067a))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bound unsigned Windows release publication - ([ea31842](https://github.com/proxlavee/koharu-fork/commit/ea3184245e221eb9c5785e0bac51e26476f9be93))
+- Remove unused params - ([c7d635c](https://github.com/proxlavee/koharu-fork/commit/c7d635c59f5608088eb28e41a7c23e1ced15854c))
+- Fix lint - ([68be117](https://github.com/proxlavee/koharu-fork/commit/68be11737b14e573928639e8e547612f08340428))
+
+
 ## [0.78.0](https://github.com/proxlavee/koharu-fork/compare/0.77.4..0.78.0) - 2026-08-20
 
 ### ⛰️  Features
