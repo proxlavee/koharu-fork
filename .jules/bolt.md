@@ -1,0 +1,3 @@
+## 2023-11-20 - Map over Array for recursive layer traversals
+**Learning:** During real-time Canvas gesture loops, recursive hit testing (`hitTestLayers`) and rendering path expansions (`expandLayerSelection`, `effectiveLayerVisibility`) heavily trigger array traversal lookups like `layers.find()`. Because React's document holds layer schemas as an array, these repeated O(n) calls quickly degraded to O(n²) bottlenecks.
+**Action:** When working with Koharu's document tree loops, always pre-calculate a `Map<string, Layer>` initially and lookup from the Map (O(1)). Provided functions like `effectiveLayerVisibility` should be refactored to consume a Map if they operate inside high-frequency event loops or recursions.

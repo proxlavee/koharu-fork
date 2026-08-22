@@ -398,12 +398,15 @@ export function CanvasWorkspace() {
   const clientPhysicalPoint = (clientX: number, clientY: number) =>
     physicalPoint(clientX, clientY, surface.current!.getBoundingClientRect())
 
-  const framesFor = (layers: string[]): TransformFrame[] =>
-    expandLayerSelection(page?.layers ?? [], layers).flatMap((id) => {
-      const layer = page?.layers.find((candidate) => candidate.id === id)
+  const framesFor = (layers: string[]): TransformFrame[] => {
+    const pageLayers = page?.layers ?? []
+    const layerMap = new Map(pageLayers.map((l) => [l.id, l]))
+    return expandLayerSelection(pageLayers, layers).flatMap((id) => {
+      const layer = layerMap.get(id)
       const frame = layer && selectableLayer(layer) ? controlFrame(layer, layerFrames) : null
       return frame ? [{ element: id, frame }] : []
     })
+  }
 
   const moveGesture = (
     pointer: number,
