@@ -4748,6 +4748,7 @@ dependencies = [
  "koharu-ml",
  "koharu-rasterizer",
  "koharu-renderer",
+ "koharu-runtime",
  "koharu-scene",
  "koharu-translator",
  "nvml-wrapper",

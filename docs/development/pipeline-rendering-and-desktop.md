@@ -45,7 +45,7 @@ Validate visual changes through the final Tauri window because WebGPU adapter av
 
 ## Image-driven typesetting audit
 
-The Windows build artifact includes `typesetting-audit.exe` for checking translated balloon text without driving the desktop interface. It runs Koharu's detection and OCR stages over one image or a directory, preserves the application's natural page order, applies translations by page and text order, renders the actual native frames, and fails when translated balloon text overflows or falls below the configured size and source-size ratio.
+The Windows build artifact includes `typesetting-audit.exe` for checking translated balloon text without driving the desktop interface. It initializes only the Torch runtime required by detection, OCR, and the optional LaMa inpainting pass; translation and diffusion runtimes are not installed. The tool processes one image or a directory, preserves the application's natural page order, applies translations by page and text order, renders the actual native frames, and fails when translated balloon text overflows or falls below the configured size and source-size ratio.
 
 Run it once to create an ordered English and Turkish translation fixture:
 

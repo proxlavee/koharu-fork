@@ -17,6 +17,7 @@ use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::{
     Frame, LayerKind, RenderBounds, RenderDiagnostic, Renderer, TypesettingConfig,
 };
+use koharu_runtime::{Device, Feature, Runtime};
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, Authored, EntityId, LanguageTag, PageDraft, Session,
     Snapshot, Translation,
@@ -207,10 +208,10 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&arguments.output)
         .with_context(|| format!("failed to create {}", arguments.output.display()))?;
 
-    initialize_runtime(arguments.runtime_attempts).await?;
+    let device = initialize_runtime(arguments.runtime_attempts).await?;
     let mut session = Session::memory().await?;
     let pages = add_pages(&mut session, &input_paths).await?;
-    run_analysis_pipeline(&arguments, &mut session, &pages).await?;
+    run_analysis_pipeline(&arguments, device, &mut session, &pages).await?;
     let segments = collect_segments(&session.snapshot(), &pages)?;
     ensure!(
         segments.iter().any(|page| !page.is_empty()),
@@ -359,11 +360,15 @@ fn is_supported_image(path: &Path) -> bool {
     )
 }
 
-async fn initialize_runtime(attempts: u32) -> Result<()> {
+async fn initialize_runtime(attempts: u32) -> Result<Device> {
     let mut delay = Duration::from_secs(1);
     for attempt in 1..=attempts {
-        match koharu_ml::init().await {
-            Ok(()) => return Ok(()),
+        let initialized = match Runtime::discover([Feature::Torch]) {
+            Ok(runtime) => runtime.initialize().await,
+            Err(error) => Err(error),
+        };
+        match initialized {
+            Ok(device) => return Ok(device),
             Err(error) if attempt == attempts => {
                 return Err(error).context(format!(
                     "failed to initialize native runtimes after {attempts} attempts"
@@ -428,6 +433,7 @@ async fn add_pages(session: &mut Session, paths: &[PathBuf]) -> Result<Vec<Input
 
 async fn run_analysis_pipeline(
     arguments: &Arguments,
+    runtime_device: Device,
     session: &mut Session,
     pages: &[InputPage],
 ) -> Result<()> {
@@ -436,7 +442,11 @@ async fn run_analysis_pipeline(
     let pipeline = Pipeline::from_config(
         Config::memory(config),
         Config::memory(ProvidersConfig::default()),
-        koharu_ml::device(arguments.cpu),
+        if arguments.cpu {
+            Device::cpu()
+        } else {
+            runtime_device
+        },
     )?;
     let operation = if arguments.include_inpainting {
         Operation::Stages {
