@@ -437,8 +437,10 @@ async fn run_analysis_pipeline(
     session: &mut Session,
     pages: &[InputPage],
 ) -> Result<()> {
-    let mut config = PipelineConfig::default();
-    config.ocr = arguments.ocr.into();
+    let config = PipelineConfig {
+        ocr: arguments.ocr.into(),
+        ..PipelineConfig::default()
+    };
     let pipeline = Pipeline::from_config(
         Config::memory(config),
         Config::memory(ProvidersConfig::default()),
