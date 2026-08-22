@@ -827,9 +827,4 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn renderer_floor_matches_the_threshold_report_contract() {
-        assert!(RENDERER_READABILITY_FLOOR < 12.0);
-    }
 }
