@@ -1,3 +1,10 @@
+## [0.80.1](https://github.com/proxlavee/koharu-fork/compare/0.80.0..0.80.1) - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- Initialize audit pipeline configuration directly - ([5dbe6b9](https://github.com/proxlavee/koharu-fork/commit/5dbe6b9b00812411df99e251234fd6433c0b30cc))
+
+
 ## [0.80.0](https://github.com/proxlavee/koharu-fork/compare/0.79.0..0.80.0) - 2026-08-22
 
 ### ⛰️  Features
