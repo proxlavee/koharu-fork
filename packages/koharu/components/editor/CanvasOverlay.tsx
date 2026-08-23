@@ -52,15 +52,21 @@ export function CanvasOverlay({
   )
   const selectedIds = useMemo(() => new Set(expandedSelection), [expandedSelection])
   const multipleSelected = expandedSelection.length > 1
+  // Precompute map to optimize effectiveLayerVisibility traversing (avoids O(N²) loop)
+  const layerMap = useMemo(() => {
+    const map = new Map<string, typeof page.layers[0]>()
+    for (const layer of page.layers) map.set(layer.id, layer)
+    return map
+  }, [page.layers])
   const layers = useMemo(
     () =>
       page.layers.flatMap((layer) => {
-        const visibility = effectiveLayerVisibility(page.layers, layer)
+        const visibility = effectiveLayerVisibility(layerMap, layer)
         if (!visibility.visible || visibility.opacity <= 0) return []
         const frame = previews[layer.id] ?? controlFrame(layer, frames)
         return frame ? [{ layer, frame, opacity: visibility.opacity }] : []
       }),
-    [page.layers, previews, frames],
+    [page.layers, layerMap, previews, frames],
   )
   const selectedLayer =
     expandedSelection.length === 1
