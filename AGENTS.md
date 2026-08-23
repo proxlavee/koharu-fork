@@ -9,6 +9,22 @@ Document only durable, repository-specific constraints here. Do not record curre
 - Keep responsibilities self-contained. Defaults and provider-specific behavior belong to the component that owns them rather than a central list of special cases.
 - Remove dead abstractions and one-use helpers when direct code is clearer.
 
+## Deliberate Execution
+
+- Maintain a multi-step plan for non-trivial work and update it after each material milestone. Append new feedback to the ordered plan unless the user explicitly replaces or reprioritizes the active task.
+- Before changing behavior, trace the affected workflow across scene ownership, application commands, generated bridges, desktop UI, retained rendering, persistence, and export as applicable. Resolve ambiguous requirements from repository evidence or ask before choosing behavior that would change the product contract.
+- Never suppress, bypass, downgrade, or silently accept formatting, lint, type, compile, test, runtime, or behavioral failures. Fix the cause or report the exact blocker and the unverified claim.
+- Static checks do not prove a desktop workflow or rendered result. Exercise the smallest real behavior that crosses the changed ownership boundary, and obtain final-window or exported-pixel evidence for rendering changes when the target environment is available. End-to-end runs remain opt-in under the Verification section.
+- Before handoff, inspect the complete diff and worktree, then reread every edited file and user-facing explanation from start to finish. Recheck requirements, dependent flows, edge cases, generated-source boundaries, and every validation result after correcting any issue found.
+
+## Real-Use Completeness
+
+- Keep the page lifecycle connected from import through detection, OCR, translation, typesetting, review, and export. A surfaced control must reach its owning command and scene mutation, provide progress or actionable failure, and affect the retained canvas and export where promised.
+- Preserve scene provenance and edit history. Generated processing must not overwrite user-authored content, and user-visible mutations must participate coherently in undo, redo, cancellation, persistence, and incremental rendering.
+- Keep ordered chapter translation export and import complete and fail closed on mismatched pages, segment counts, or ordering. Never guess which source segment a translation belongs to.
+- Selection and batch actions must operate on the visible intended entities and leave an understandable selection state. Destructive page or layer edits must remain recoverable through the project's history model rather than creating an unrecoverable UI dead end.
+- Do not ship placeholder controls, no-op handlers, disconnected settings, or success messages that precede the native operation. When Windows, CEF, WebGPU, or accelerator behavior cannot be exercised locally, provide a reproducible validation path and do not call that behavior verified until its evidence exists.
+
 ## Source Boundaries
 
 - Keep safe public APIs separate from unsafe FFI, dynamic loading, and build integration.
