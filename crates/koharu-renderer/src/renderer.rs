@@ -48,7 +48,6 @@ const MAX_SURFACE_PIXELS: u64 = 268_435_456;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
-const MINIMUM_FONT_SIZE: f32 = 9.0;
 
 #[derive(Clone)]
 pub struct Renderer {
@@ -816,6 +815,15 @@ impl Traversal<'_> {
             dependencies.insert(RenderDependency::Font(family.clone()));
         }
         let is_bubble = balloon_contour.is_some();
+        let (font_size, source_font_size) = match typography.as_ref() {
+            Some(typography)
+                if typography.auto_fit && matches!(&typography.origin, Origin::Generated(_)) =>
+            {
+                (None, typography.size)
+            }
+            Some(typography) => (typography.size, None),
+            None => (None, None),
+        };
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -831,8 +839,9 @@ impl Traversal<'_> {
                 .as_ref()
                 .and_then(|value| value.font_style)
                 .map(Into::into),
-            font_size: typography.as_ref().and_then(|value| value.size),
-            minimum_font_size: MINIMUM_FONT_SIZE,
+            font_size,
+            source_font_size,
+            minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,

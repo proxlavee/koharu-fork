@@ -36,6 +36,7 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) font_weight: Option<u16>,
     pub(crate) font_style: Option<FontStyle>,
     pub(crate) font_size: Option<f32>,
+    pub(crate) source_font_size: Option<f32>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
@@ -217,6 +218,7 @@ impl TextRenderer {
                 entity: descriptor.entity,
                 source,
             })?;
+        let readability_minimum = readability_minimum(descriptor);
         let (minimum, maximum) = font_size_limits(descriptor, bounds);
         let mut layout = TextLayout::new(&fonts[0])
             .with_fallback_fonts(&fonts[1..])
@@ -311,11 +313,11 @@ impl TextRenderer {
             transform,
         );
         let mut diagnostics = Vec::new();
-        if layout.font_size + f32::EPSILON < descriptor.minimum_font_size {
+        if layout.font_size + f32::EPSILON < readability_minimum {
             diagnostics.push(RenderDiagnostic::TextBelowReadableSize {
                 entity: descriptor.entity,
                 font_size: layout.font_size,
-                minimum_font_size: descriptor.minimum_font_size,
+                minimum_font_size: readability_minimum,
             });
         }
         if layout.overflowed() {
@@ -374,16 +376,35 @@ fn automatic_maximum(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> f32 
     }
 }
 
+fn readability_minimum(descriptor: &TextNodeDescriptor) -> f32 {
+    descriptor
+        .source_font_size
+        .map_or(descriptor.minimum_font_size, |size| {
+            descriptor
+                .minimum_font_size
+                .max(size * crate::MINIMUM_SOURCE_FONT_RATIO)
+        })
+}
+
 fn font_size_limits(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> (f32, f32) {
-    let maximum = descriptor
-        .font_size
-        .unwrap_or_else(|| automatic_maximum(descriptor, bounds));
-    let maximum = if descriptor.auto_fit {
-        maximum.max(descriptor.minimum_font_size)
+    if descriptor.auto_fit {
+        let maximum = descriptor
+            .font_size
+            .or_else(|| {
+                if descriptor.balloon_contour.is_none() {
+                    descriptor.source_font_size
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| automatic_maximum(descriptor, bounds));
+        (readability_minimum(descriptor).min(maximum), maximum)
     } else {
-        maximum
-    };
-    (descriptor.minimum_font_size.min(maximum), maximum)
+        let size = descriptor
+            .font_size
+            .unwrap_or_else(|| automatic_maximum(descriptor, bounds));
+        (size, size)
+    }
 }
 
 fn is_chinese_or_japanese_language(language: &str) -> bool {
@@ -493,24 +514,25 @@ mod tests {
     use koharu_scene::EntityId;
 
     use super::*;
-    use crate::fonts::FontSystem;
+    use crate::fonts::{FontRequest, FontSystem, Fonts};
 
-    #[test]
-    fn detected_size_caps_paragraph_growth_and_point_text_keeps_its_default() {
+    #[tokio::test]
+    async fn automatic_paragraphs_use_frame_capacity_and_fixed_sizes_stay_exact() {
         let descriptor = TextNodeDescriptor {
             entity: EntityId::new(),
             text: "Hi".to_owned(),
             language: None,
             width: 240.0,
             height: 120.0,
-            balloon_contour: None,
+            balloon_contour: Some(vec![(0.0, 0.0), (240.0, 0.0), (240.0, 120.0), (0.0, 120.0)]),
             flow_contour: None,
             preferred_font: Some("Arial".to_owned()),
             font_families: vec!["Arial".to_owned()],
             font_weight: None,
             font_style: None,
-            font_size: Some(6.0),
-            minimum_font_size: 9.0,
+            font_size: None,
+            source_font_size: Some(6.0),
+            minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: true,
             alignment: TextAlign::Center,
             writing_mode: WritingMode::Horizontal,
@@ -530,19 +552,63 @@ mod tests {
         };
 
         assert_eq!(automatic_maximum(&descriptor, bounds), 240.0);
-        assert_eq!(font_size_limits(&descriptor, bounds), (9.0, 9.0));
+        assert_eq!(
+            font_size_limits(&descriptor, bounds),
+            (crate::MINIMUM_READABLE_FONT_SIZE, 240.0)
+        );
 
         let mut large_source = descriptor.clone();
-        large_source.font_size = Some(30.0);
-        assert_eq!(font_size_limits(&large_source, bounds), (9.0, 30.0));
+        large_source.source_font_size = Some(30.0);
+        assert_eq!(font_size_limits(&large_source, bounds), (15.0, 240.0));
+
+        let mut generated_free_text = large_source.clone();
+        generated_free_text.balloon_contour = None;
+        assert_eq!(font_size_limits(&generated_free_text, bounds), (15.0, 30.0));
+
+        let mut authored_maximum = descriptor.clone();
+        authored_maximum.font_size = Some(30.0);
+        authored_maximum.source_font_size = None;
+        assert_eq!(font_size_limits(&authored_maximum, bounds), (12.0, 30.0));
+
+        authored_maximum.font_size = Some(6.0);
+        assert_eq!(font_size_limits(&authored_maximum, bounds), (6.0, 6.0));
 
         let mut free_paragraph = descriptor.clone();
         free_paragraph.font_size = None;
-        assert_eq!(font_size_limits(&free_paragraph, bounds), (9.0, 240.0));
+        assert_eq!(
+            font_size_limits(&free_paragraph, bounds),
+            (crate::MINIMUM_READABLE_FONT_SIZE, 240.0)
+        );
 
         let mut vertical_paragraph = free_paragraph.clone();
         vertical_paragraph.writing_mode = WritingMode::VerticalRl;
-        assert_eq!(font_size_limits(&vertical_paragraph, bounds), (9.0, 120.0));
+        assert_eq!(
+            font_size_limits(&vertical_paragraph, bounds),
+            (crate::MINIMUM_READABLE_FONT_SIZE, 120.0)
+        );
+
+        let family = FontSystem::new()
+            .first_font()
+            .unwrap()
+            .family_name()
+            .to_owned();
+        let fonts = Fonts::new();
+        fonts
+            .prepare(&[FontRequest {
+                family: family.clone(),
+                weight: None,
+                style: None,
+            }])
+            .await
+            .unwrap();
+        let mut render_descriptor = descriptor.clone();
+        render_descriptor.preferred_font = Some(family.clone());
+        render_descriptor.font_families = vec![family];
+        let rendered = TextRenderer::new()
+            .render_descriptor(&render_descriptor, &fonts)
+            .unwrap();
+        assert!(rendered.metadata.font_size > descriptor.minimum_font_size);
+        assert!(rendered.diagnostics.is_empty());
 
         let mut point_text = free_paragraph;
         point_text.point_text = true;
@@ -550,6 +616,8 @@ mod tests {
 
         let mut explicit = descriptor;
         explicit.auto_fit = false;
+        explicit.font_size = Some(6.0);
+        explicit.source_font_size = None;
         assert_eq!(font_size_limits(&explicit, bounds), (6.0, 6.0));
     }
 

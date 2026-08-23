@@ -27,6 +27,7 @@ const LINE_BREAK_HYPHEN_PENALTY: f32 = 2_000.0;
 const LINE_BREAK_OVERFLOW_MULTIPLIER: f32 = 10_000.0;
 const COMIC_LINE_OVERFLOW_PENALTY: f32 = 1_000_000.0;
 const COMIC_MAX_LINES: usize = 64;
+const COMIC_BLOCK_SEARCH_MAX_INTERVALS: usize = 32;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HyphenationPolicy {
@@ -1656,7 +1657,33 @@ fn comic_line_breaks(
                 left.overflowed
                     .cmp(&right.overflowed)
                     .then_with(|| left.profiles.len().cmp(&right.profiles.len()))
+                    // Contour widths already exclude the required air. Maximizing the
+                    // worst remaining line clearance selects the balloon body without
+                    // classifying or cutting off a speech tail.
+                    .then_with(|| {
+                        minimum_line_clearance(segments, right)
+                            .total_cmp(&minimum_line_clearance(segments, left))
+                    })
                     .then_with(|| left.cost.total_cmp(&right.cost))
+                    .then_with(|| {
+                        balloon
+                            .block_origin_distance(
+                                left,
+                                writing_mode,
+                                line_height,
+                                line_ink,
+                                block_extent,
+                                block_air,
+                            )
+                            .total_cmp(&balloon.block_origin_distance(
+                                right,
+                                writing_mode,
+                                line_height,
+                                line_ink,
+                                block_extent,
+                                block_air,
+                            ))
+                    })
             })
     };
 
@@ -1789,6 +1816,34 @@ fn breaks_overflow(segments: &[LineBreakMeasure], breaks: &[usize], widths: &[f3
     false
 }
 
+fn minimum_line_clearance(segments: &[LineBreakMeasure], result: &LineBreakResult) -> f32 {
+    let mut start = 0usize;
+    let mut clearance = f32::INFINITY;
+    for (line, end) in result.breaks.iter().copied().enumerate() {
+        if end <= start || end > segments.len() {
+            return f32::NEG_INFINITY;
+        }
+        let mut advance = segments[start..end]
+            .iter()
+            .map(|segment| segment.advance)
+            .sum::<f32>();
+        advance -= segments[end - 1].trailing_advance;
+        if end < segments.len() {
+            advance += segments[end - 1].break_suffix_advance;
+        }
+        let Some(width) = result.profiles.get(line).map(|profile| profile.width) else {
+            return f32::NEG_INFINITY;
+        };
+        clearance = clearance.min(width - advance);
+        start = end;
+    }
+    if start == segments.len() {
+        clearance
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
 impl ComicBalloon {
     fn air(&self, ink_height: f32) -> f32 {
         self.minimum_air.max(ink_height)
@@ -1841,27 +1896,58 @@ impl ComicBalloon {
         };
         let inline_radius = inline_extent * 0.5 - inline_air;
         let block_size = line_ink.thickness() + line_count.saturating_sub(1) as f32 * line_height;
-        if inline_radius <= 0.0 {
+        if line_count == 0 || inline_radius <= 0.0 {
             return Vec::new();
         }
-        let Some(block_origin) =
-            self.centered_block_origin(writing_mode, block_extent, block_air, block_size)
+        let Some((first_origin, last_origin)) =
+            self.block_origin_range(writing_mode, block_extent, block_air, block_size)
         else {
             return Vec::new();
         };
-        self.line_profiles_at_origin(
-            writing_mode,
-            line_count,
-            line_height,
-            line_ink,
-            block_extent,
-            inline_extent,
-            block_air,
-            inline_air,
-            block_origin,
-        )
-        .into_iter()
-        .collect()
+
+        // Font size, line breaks, and block position are coupled inside an irregular
+        // balloon. In particular, centering against a long speech tail can place one
+        // or more lines in the tail and force an otherwise unnecessary shrink. Search
+        // across the feasible block-origin interval at typographic resolution. The
+        // fixed interval cap keeps auto-fit work bounded for unusually large pages.
+        let centered_origin = (first_origin + last_origin) * 0.5;
+        let travel = (last_origin - first_origin).max(0.0);
+        let target_step = (line_ink.thickness().min(line_height) * 0.5).max(1.0);
+        let intervals = if travel <= f32::EPSILON {
+            0
+        } else {
+            ((travel / target_step).ceil() as usize).clamp(1, COMIC_BLOCK_SEARCH_MAX_INTERVALS)
+        };
+        let mut origins = Vec::with_capacity(intervals.saturating_add(2));
+        origins.push(centered_origin);
+        if intervals > 0 {
+            for index in 0..=intervals {
+                let origin = first_origin + travel * index as f32 / intervals as f32;
+                if origins
+                    .iter()
+                    .all(|candidate| (candidate - origin).abs() > f32::EPSILON)
+                {
+                    origins.push(origin);
+                }
+            }
+        }
+
+        origins
+            .into_iter()
+            .filter_map(|block_origin| {
+                self.line_profiles_at_origin(
+                    writing_mode,
+                    line_count,
+                    line_height,
+                    line_ink,
+                    block_extent,
+                    inline_extent,
+                    block_air,
+                    inline_air,
+                    block_origin,
+                )
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1924,12 +2010,10 @@ impl ComicBalloon {
         if common_right <= common_left {
             return None;
         }
-        let contour_center = spans
-            .iter()
-            .map(|(left, right, _)| (left + right) * 0.5)
-            .sum::<f32>()
-            / spans.len() as f32;
-        let shared_center = contour_center.clamp(common_left, common_right);
+        // For one shared axis, the worst half-width is
+        // min(axis - max(left), min(right) - axis). Its unique max-min
+        // solution is the midpoint of the common interval.
+        let shared_center = (common_left + common_right) * 0.5;
         spans
             .into_iter()
             .map(|(left, right, block_baseline)| {
@@ -1943,13 +2027,13 @@ impl ComicBalloon {
             .collect()
     }
 
-    fn centered_block_origin(
+    fn block_origin_range(
         &self,
         writing_mode: WritingMode,
         block_extent: f32,
         block_air: f32,
         block_size: f32,
-    ) -> Option<f32> {
+    ) -> Option<(f32, f32)> {
         let mut first = block_air;
         let mut last = block_extent - block_air;
         for contour in self
@@ -1968,8 +2052,36 @@ impl ComicBalloon {
             first = first.max(minimum + air);
             last = last.min(maximum - air);
         }
-        ((last - first) + f32::EPSILON >= block_size)
-            .then_some(first + (last - first - block_size) * 0.5)
+        let last_origin = last - block_size;
+        (last_origin + f32::EPSILON >= first).then_some((first, last_origin.max(first)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn block_origin_distance(
+        &self,
+        result: &LineBreakResult,
+        writing_mode: WritingMode,
+        line_height: f32,
+        line_ink: InkBand,
+        block_extent: f32,
+        block_air: f32,
+    ) -> f32 {
+        let line_count = result.profiles.len();
+        let block_size = line_ink.thickness() + line_count.saturating_sub(1) as f32 * line_height;
+        let Some((first, last)) =
+            self.block_origin_range(writing_mode, block_extent, block_air, block_size)
+        else {
+            return f32::INFINITY;
+        };
+        let Some(origin) = result
+            .profiles
+            .iter()
+            .map(|profile| profile.block_baseline - line_ink.before)
+            .min_by(f32::total_cmp)
+        else {
+            return 0.0;
+        };
+        (origin - (first + last) * 0.5).abs()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2642,7 +2754,37 @@ mod tests {
     }
 
     #[test]
-    fn comic_profiles_stay_centered_when_wider_space_is_elsewhere() {
+    fn comic_profiles_maximize_the_narrowest_shared_axis_clearance() {
+        let balloon = comic_balloon(
+            200.0,
+            110.0,
+            vec![(0.0, 0.0), (100.0, 0.0), (200.0, 110.0), (90.0, 110.0)],
+            0.0,
+        );
+        let profiles = balloon
+            .line_profiles_at_origin(
+                WritingMode::Horizontal,
+                2,
+                80.0,
+                InkBand {
+                    before: 10.0,
+                    after: 10.0,
+                },
+                110.0,
+                200.0,
+                0.0,
+                0.0,
+                5.0,
+            )
+            .unwrap();
+
+        assert_approx_eq(profiles[0].center_offset, profiles[1].center_offset);
+        assert_approx_eq(profiles[0].width, profiles[1].width);
+        assert!(profiles[0].width > 18.0);
+    }
+
+    #[test]
+    fn comic_profiles_keep_a_centered_candidate_when_wider_space_is_elsewhere() {
         let balloon = comic_balloon(
             100.0,
             200.0,
@@ -2674,6 +2816,134 @@ mod tests {
         assert!((profiles[0].block_baseline - 80.0).abs() < 0.01);
         assert!((profiles[2].block_baseline - 120.0).abs() < 0.01);
         assert!(profiles.iter().all(|profile| profile.width <= 50.01));
+    }
+
+    #[test]
+    fn comic_breaks_use_the_balloon_body_instead_of_its_tail() {
+        let segments = [LineBreakMeasure {
+            advance: 60.0,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory: false,
+        }; 6];
+        let balloon = comic_balloon(
+            160.0,
+            220.0,
+            vec![
+                (0.0, 0.0),
+                (160.0, 0.0),
+                (160.0, 100.0),
+                (90.0, 100.0),
+                (80.0, 220.0),
+                (70.0, 100.0),
+                (0.0, 100.0),
+            ],
+            0.0,
+        );
+
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            WritingMode::Horizontal,
+            20.0,
+            InkBand {
+                before: 10.0,
+                after: 10.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert_eq!(result.breaks, [2, 4, 6]);
+        assert!(!result.overflowed);
+        assert!(result.profiles.iter().all(|profile| profile.width >= 120.0));
+        assert!(result.profiles[0].block_baseline < 80.0);
+    }
+
+    #[test]
+    fn comic_short_line_prefers_body_clearance_over_tail_center() {
+        let segments = [LineBreakMeasure {
+            advance: 10.0,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory: false,
+        }];
+        let balloon = comic_balloon(
+            160.0,
+            220.0,
+            vec![
+                (0.0, 0.0),
+                (160.0, 0.0),
+                (160.0, 100.0),
+                (90.0, 100.0),
+                (80.0, 220.0),
+                (70.0, 100.0),
+                (0.0, 100.0),
+            ],
+            0.0,
+        );
+
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            WritingMode::Horizontal,
+            20.0,
+            InkBand {
+                before: 10.0,
+                after: 10.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert!(!result.overflowed);
+        assert!(result.profiles[0].width >= 120.0);
+        assert!(result.profiles[0].block_baseline <= 90.0 + f32::EPSILON);
+    }
+
+    #[test]
+    fn vertical_comic_breaks_use_the_balloon_body_instead_of_its_tail() {
+        let segments = [LineBreakMeasure {
+            advance: 60.0,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory: false,
+        }; 6];
+        let balloon = comic_balloon(
+            220.0,
+            160.0,
+            vec![
+                (0.0, 0.0),
+                (0.0, 160.0),
+                (100.0, 160.0),
+                (100.0, 90.0),
+                (220.0, 80.0),
+                (100.0, 70.0),
+                (100.0, 0.0),
+            ],
+            0.0,
+        );
+
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            WritingMode::VerticalRl,
+            20.0,
+            InkBand {
+                before: 10.0,
+                after: 10.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert_eq!(result.breaks, [2, 4, 6]);
+        assert!(!result.overflowed);
+        assert!(result.profiles.iter().all(|profile| profile.width >= 120.0));
+        assert!(result.profiles[0].block_baseline <= 90.0 + f32::EPSILON);
     }
 
     #[test]
@@ -2713,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    fn comic_profiles_never_offer_an_off_center_origin() {
+    fn comic_profiles_offer_off_center_origins_for_irregular_capacity() {
         let balloon = ComicBalloon {
             width: 100.0,
             height: 160.0,
@@ -2736,8 +3006,11 @@ mod tests {
         let candidates =
             balloon.line_profile_candidates(WritingMode::Horizontal, 5, 20.0, line_ink, 0.0, 0.0);
 
-        assert_eq!(candidates.len(), 1);
+        assert!(candidates.len() > 1);
         assert!((candidates[0][0].block_baseline - 40.0).abs() < 0.01);
+        assert!(candidates.iter().any(|profiles| {
+            (profiles[0].block_baseline - candidates[0][0].block_baseline).abs() >= 10.0
+        }));
     }
 
     #[test]

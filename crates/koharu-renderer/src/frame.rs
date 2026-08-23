@@ -616,6 +616,51 @@ fn element_frame(layer: &Layer) -> Option<PreparedElementFrame> {
     geometry_frame(layer.geometry())
 }
 
+fn geometry_frame(geometry: &Geometry) -> Option<PreparedElementFrame> {
+    let points = &geometry.points;
+    if points.is_empty()
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return None;
+    }
+    if points.len() == 4 {
+        let top = (points[1].x - points[0].x, points[1].y - points[0].y);
+        let right = (points[2].x - points[1].x, points[2].y - points[1].y);
+        let width = top.0.hypot(top.1);
+        let height = right.0.hypot(right.1);
+        if width > f64::EPSILON && height > f64::EPSILON {
+            let center_x = points.iter().map(|point| point.x).sum::<f64>() * 0.25;
+            let center_y = points.iter().map(|point| point.y).sum::<f64>() * 0.25;
+            return Some(PreparedElementFrame {
+                x: (center_x - width * 0.5) as f32,
+                y: (center_y - height * 0.5) as f32,
+                width: width as f32,
+                height: height as f32,
+                angle_degrees: top.1.atan2(top.0).to_degrees() as f32,
+            });
+        }
+    }
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for point in points {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    (width > f64::EPSILON && height > f64::EPSILON).then_some(PreparedElementFrame {
+        x: min_x as f32,
+        y: min_y as f32,
+        width: width as f32,
+        height: height as f32,
+        angle_degrees: 0.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,49 +706,4 @@ mod tests {
         assert_eq!((*width, *height), (PREPARED_RASTER_TILE_DIMENSION + 1, 1));
         assert_eq!(bytes.as_ref(), b"encoded-wide-image");
     }
-}
-
-fn geometry_frame(geometry: &Geometry) -> Option<PreparedElementFrame> {
-    let points = &geometry.points;
-    if points.is_empty()
-        || points
-            .iter()
-            .any(|point| !point.x.is_finite() || !point.y.is_finite())
-    {
-        return None;
-    }
-    if points.len() == 4 {
-        let top = (points[1].x - points[0].x, points[1].y - points[0].y);
-        let right = (points[2].x - points[1].x, points[2].y - points[1].y);
-        let width = top.0.hypot(top.1);
-        let height = right.0.hypot(right.1);
-        if width > f64::EPSILON && height > f64::EPSILON {
-            let center_x = points.iter().map(|point| point.x).sum::<f64>() * 0.25;
-            let center_y = points.iter().map(|point| point.y).sum::<f64>() * 0.25;
-            return Some(PreparedElementFrame {
-                x: (center_x - width * 0.5) as f32,
-                y: (center_y - height * 0.5) as f32,
-                width: width as f32,
-                height: height as f32,
-                angle_degrees: top.1.atan2(top.0).to_degrees() as f32,
-            });
-        }
-    }
-    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for point in points {
-        min_x = min_x.min(point.x);
-        min_y = min_y.min(point.y);
-        max_x = max_x.max(point.x);
-        max_y = max_y.max(point.y);
-    }
-    let width = max_x - min_x;
-    let height = max_y - min_y;
-    (width > f64::EPSILON && height > f64::EPSILON).then_some(PreparedElementFrame {
-        x: min_x as f32,
-        y: min_y as f32,
-        width: width as f32,
-        height: height as f32,
-        angle_degrees: 0.0,
-    })
 }
