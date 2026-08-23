@@ -1,3 +1,15 @@
+## [0.80.2](https://github.com/proxlavee/koharu-fork/compare/0.80.1..0.80.2) - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- *(audit)* Initialize selected OCR runtimes - ([657d256](https://github.com/proxlavee/koharu-fork/commit/657d256ff4812d2f04e71d33a95fbcf5d928bc42))
+- *(renderer)* Maximize readable balloon typesetting - ([87017d2](https://github.com/proxlavee/koharu-fork/commit/87017d289848f84b55c98a8d0641fe51b5874f38))
+
+### 📚 Documentation
+
+- Define complete verification rules - ([840f04b](https://github.com/proxlavee/koharu-fork/commit/840f04b1454f8671fa3ea63cd417d6f8a59cb301))
+
+
 ## [0.80.1](https://github.com/proxlavee/koharu-fork/compare/0.80.0..0.80.1) - 2026-08-22
 
 ### 🐛 Bug Fixes
