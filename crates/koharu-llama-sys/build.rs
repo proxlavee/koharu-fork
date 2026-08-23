@@ -39,6 +39,7 @@ fn main() -> Result<()> {
                 .allowlist_function(FUNCTION_ALLOWLIST)
                 .allowlist_type(TYPE_ALLOWLIST)
                 .allowlist_var(VARIABLE_ALLOWLIST)
+                .opaque_type("^_IO_FILE$")
                 .prepend_enum_name(false)
         })
         .write_to_file(PathBuf::from(env::var("OUT_DIR")?).join("bindings.rs"))

@@ -45,29 +45,42 @@ static READY: OnceCell<Device> = OnceCell::const_new();
 pub async fn init() -> anyhow::Result<()> {
     READY
         .get_or_try_init(|| async {
-            let runtime = Runtime::discover([Feature::Torch, Feature::Llama, Feature::Diffusion])?;
-            let device = runtime
-                .initialize()
+            initialize([Feature::Torch, Feature::Llama, Feature::Diffusion])
                 .await
-                .context("failed to initialize runtimes")?;
-
-            LLAMA
-                .get_or_try_init(|| async {
-                    koharu_llama::send_logs_to_tracing(koharu_llama::LogOptions::default());
-                    LlamaBackend::init().context("failed to initialize llama.cpp backend")
-                })
-                .await?;
-            DIFFUSION
-                .get_or_try_init(|| async {
-                    koharu_diffusion::send_logs_to_tracing()
-                        .context("failed to redirect stable-diffusion.cpp logs")?;
-                    Ok::<(), anyhow::Error>(())
-                })
-                .await?;
-            Ok::<Device, anyhow::Error>(device)
+                .context("failed to initialize runtimes")
         })
         .await?;
     Ok(())
+}
+
+/// Installs and activates only the requested native runtimes and their ML backend state.
+pub async fn initialize(features: impl IntoIterator<Item = Feature>) -> anyhow::Result<Device> {
+    let features = features.into_iter().collect::<Vec<_>>();
+    anyhow::ensure!(
+        !features.is_empty(),
+        "at least one ML runtime feature is required"
+    );
+    let runtime = Runtime::discover(features.iter().copied())?;
+    let device = runtime.initialize().await?;
+
+    if features.contains(&Feature::Llama) {
+        LLAMA
+            .get_or_try_init(|| async {
+                koharu_llama::send_logs_to_tracing(koharu_llama::LogOptions::default());
+                LlamaBackend::init().context("failed to initialize llama.cpp backend")
+            })
+            .await?;
+    }
+    if features.contains(&Feature::Diffusion) {
+        DIFFUSION
+            .get_or_try_init(|| async {
+                koharu_diffusion::send_logs_to_tracing()
+                    .context("failed to redirect stable-diffusion.cpp logs")?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+    }
+    Ok(device)
 }
 
 /// Returns the runtime-owned device selected for every model backend.

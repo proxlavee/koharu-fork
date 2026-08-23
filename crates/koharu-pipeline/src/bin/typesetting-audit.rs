@@ -15,9 +15,10 @@ use koharu_pipeline::{
 };
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_renderer::{
-    Frame, LayerKind, RenderBounds, RenderDiagnostic, Renderer, TypesettingConfig,
+    Frame, LayerKind, MINIMUM_READABLE_FONT_SIZE, MINIMUM_SOURCE_FONT_RATIO, RenderBounds,
+    RenderDiagnostic, Renderer, TypesettingConfig,
 };
-use koharu_runtime::{Device, Feature, Runtime};
+use koharu_runtime::{Device, Feature};
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, Authored, EntityId, LanguageTag, PageDraft, Session,
     Snapshot, Translation,
@@ -29,7 +30,6 @@ const FIXTURE_FORMAT: &str = "dev.koharu.typesetting-audit";
 const FIXTURE_VERSION: u32 = 1;
 const REPORT_FORMAT: &str = "dev.koharu.typesetting-audit-report";
 const REPORT_VERSION: u32 = 1;
-const RENDERER_READABILITY_FLOOR: f32 = 9.0;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -66,11 +66,11 @@ struct Arguments {
     include_inpainting: bool,
 
     /// Require translated balloon text to render at or above this size.
-    #[arg(long, default_value_t = 12.0)]
+    #[arg(long, default_value_t = MINIMUM_READABLE_FONT_SIZE)]
     minimum_font_size: f32,
 
     /// Require translated balloon text to retain this fraction of its detected source size.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = MINIMUM_SOURCE_FONT_RATIO)]
     minimum_source_ratio: f32,
 
     /// Maximum attempts to initialize native runtimes before failing the audit.
@@ -208,7 +208,8 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&arguments.output)
         .with_context(|| format!("failed to create {}", arguments.output.display()))?;
 
-    let device = initialize_runtime(arguments.runtime_attempts).await?;
+    let features = runtime_features(arguments.ocr);
+    let device = initialize_runtime(arguments.runtime_attempts, &features).await?;
     let mut session = Session::memory().await?;
     let pages = add_pages(&mut session, &input_paths).await?;
     run_analysis_pipeline(&arguments, device, &mut session, &pages).await?;
@@ -360,13 +361,18 @@ fn is_supported_image(path: &Path) -> bool {
     )
 }
 
-async fn initialize_runtime(attempts: u32) -> Result<Device> {
+fn runtime_features(ocr: OcrChoice) -> Vec<Feature> {
+    let mut features = vec![Feature::Torch];
+    if matches!(ocr, OcrChoice::PaddleOcrVl1_6) {
+        features.push(Feature::Llama);
+    }
+    features
+}
+
+async fn initialize_runtime(attempts: u32, features: &[Feature]) -> Result<Device> {
     let mut delay = Duration::from_secs(1);
     for attempt in 1..=attempts {
-        let initialized = match Runtime::discover([Feature::Torch]) {
-            Ok(runtime) => runtime.initialize().await,
-            Err(error) => Err(error),
-        };
+        let initialized = koharu_ml::initialize(features.iter().copied()).await;
         match initialized {
             Ok(device) => return Ok(device),
             Err(error) if attempt == attempts => {
@@ -669,7 +675,7 @@ fn audit_page(
             )
         });
         let at_renderer_readability_floor =
-            segment.balloon && metadata.font_size <= RENDERER_READABILITY_FLOOR + f32::EPSILON;
+            segment.balloon && metadata.font_size <= MINIMUM_READABLE_FONT_SIZE + f32::EPSILON;
         let source_ratio = segment
             .source_font_size
             .filter(|size| size.is_finite() && *size > 0.0)
@@ -810,6 +816,16 @@ mod tests {
         assert_eq!(safe_component("tr-TR"), "tr-TR");
         assert_eq!(safe_component("../bad name"), ".._bad_name");
         assert_eq!(safe_component(".."), "output");
+    }
+
+    #[test]
+    fn runtime_features_follow_the_selected_ocr_backend() {
+        assert_eq!(
+            runtime_features(OcrChoice::PaddleOcrVl1_6),
+            vec![Feature::Torch, Feature::Llama]
+        );
+        assert_eq!(runtime_features(OcrChoice::MangaOcr), vec![Feature::Torch]);
+        assert_eq!(runtime_features(OcrChoice::BaberuOcr), vec![Feature::Torch]);
     }
 
     #[test]
