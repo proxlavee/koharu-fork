@@ -24,7 +24,7 @@
     "git-cliff": "^2.13.1",
     "kill-port": "^2.0.1",
     "oxfmt": "^0.56.0",
-    "sponsorkit": "^17.1.1",
+    "sponsorkit": "^18.0.0",
     "typescript": "^7.0.2"
   }
 }
