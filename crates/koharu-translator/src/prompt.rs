@@ -60,7 +60,7 @@ pub(crate) fn output_schema(expected: usize) -> Value {
                         },
                         "text": {
                             "type": "string",
-                            "description": "The translation of the input segment with this ID."
+                            "description": "The semantic translation of the input segment with this ID, without manual line wrapping or layout-driven word splitting."
                         }
                     },
                     "required": ["id", "text"],
@@ -87,6 +87,7 @@ fn translation_system_prompt(request: &TranslationRequest) -> String {
             - Preserve meaning, character voice, emotional tone, relationship nuance, emphasis, and sound effects.
             - Localize idioms and sound effects naturally while keeping wording concise enough for speech bubbles.
             - Use surrounding segments only for disambiguation and continuity; never merge or split segments.
+            - Return semantic text without manual line wrapping or layout-driven word splits. Do not insert newlines, soft hyphens, or hyphens merely to fit a bubble; preserve a hyphen only when it carries meaning in natural {target}, such as an intentional stutter or established hyphenated form.
             - Write every translated `text` value only in {target}; do not include source text, notes, explanations, or alternatives.
             - Never preserve or repeat original-language text; translate names, terms, and sound effects using natural {target} conventions.
 
@@ -259,6 +260,8 @@ mod tests {
         let prompt = translation_system_prompt(&request);
         assert!(prompt.contains("from Japanese into natural Korean"));
         assert!(prompt.contains("Copy every input ID exactly once"));
+        assert!(prompt.contains("without manual line wrapping or layout-driven word splits"));
+        assert!(prompt.contains("preserve a hyphen only when it carries meaning"));
         assert!(prompt.contains("Use informal speech."));
     }
 
@@ -270,6 +273,12 @@ mod tests {
         assert_eq!(translations["maxItems"], 3);
         assert_eq!(translations["items"]["properties"]["id"]["minimum"], 0);
         assert_eq!(translations["items"]["properties"]["id"]["maximum"], 2);
+        assert!(
+            translations["items"]["properties"]["text"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("without manual line wrapping or layout-driven word splitting")
+        );
         assert_eq!(translations["items"]["additionalProperties"], false);
         assert_eq!(schema["additionalProperties"], false);
     }

@@ -28,6 +28,18 @@ const LINE_BREAK_OVERFLOW_MULTIPLIER: f32 = 10_000.0;
 const COMIC_LINE_OVERFLOW_PENALTY: f32 = 1_000_000.0;
 const COMIC_MAX_LINES: usize = 64;
 const COMIC_BLOCK_SEARCH_MAX_INTERVALS: usize = 32;
+const COMIC_BLOCK_REFINEMENT_ITERATIONS: usize = 8;
+const COMIC_BLOCK_REFINEMENT_TOLERANCE: f32 = 0.25;
+const COMIC_CENTER_ERROR_TOLERANCE_EM: f32 = 0.5;
+const COMIC_CENTER_RASTER_TOLERANCE: f32 = 1.0;
+const COMIC_CENTER_FONT_REDUCTION_COST: f32 = 1.0;
+const COMIC_INLINE_WALL_CLEARANCE_GLYPHS: f32 = 0.5;
+const COMIC_QUALITY_FONT_REDUCTION_RATIO: f32 = 0.2;
+const COMIC_QUALITY_FONT_REDUCTION_MIN: f32 = 2.0;
+const COMIC_QUALITY_FONT_REDUCTION_MAX: f32 = 4.0;
+const COMIC_FRAGMENTATION_FONT_REDUCTION_RATIO: f32 = 0.25;
+const COMIC_HIGH_FRAGMENTATION_FONT_REDUCTION_RATIO: f32 = 1.0 / 3.0;
+const COMIC_HIGH_FRAGMENTATION_WORDS_PER_HYPHEN: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HyphenationPolicy {
@@ -99,6 +111,26 @@ impl LayoutRun<'_> {
     pub(crate) const fn placement_offset_y(&self) -> f32 {
         self.placement_offset_y
     }
+
+    pub(crate) fn discretionary_hyphen_count(&self, text: &str) -> usize {
+        discretionary_hyphen_count(text, &self.lines)
+    }
+
+    pub(crate) fn natural_pause_break_count(&self, text: &str) -> usize {
+        self.lines
+            .iter()
+            .take(self.lines.len().saturating_sub(1))
+            .filter(|line| natural_pause_at(text, line.range.end))
+            .count()
+    }
+
+    pub(crate) fn weak_line_break_count(&self, text: &str) -> usize {
+        self.lines
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(self.discretionary_hyphen_count(text))
+            .saturating_sub(self.natural_pause_break_count(text))
+    }
 }
 
 #[derive(Clone)]
@@ -169,6 +201,7 @@ struct ComicBalloon {
     height: f32,
     contours: Vec<ContourConstraint>,
     minimum_air: f32,
+    preferred_block_center: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +229,7 @@ pub struct TextLayout<'a> {
     letter_spacing: f32,
     word_spacing: f32,
     cjk_punctuation_layout: bool,
+    natural_line_breaks: bool,
 }
 
 fn largest_fitting_font_size<T>(
@@ -238,6 +272,44 @@ fn largest_fitting_font_size<T>(
     Ok(None)
 }
 
+fn largest_monotonic_fitting_font_size<T>(
+    minimum: f32,
+    maximum: f32,
+    mut layout_at: impl FnMut(f32) -> Result<T>,
+    fits: impl Fn(&T) -> bool,
+) -> Result<Option<T>> {
+    if !minimum.is_finite() || !maximum.is_finite() || maximum < minimum {
+        return Err(anyhow::anyhow!(
+            "font size limits must be finite and ordered"
+        ));
+    }
+
+    let maximum_layout = layout_at(maximum)?;
+    if fits(&maximum_layout) {
+        return Ok(Some(maximum_layout));
+    }
+    let mut best = layout_at(minimum)?;
+    if !fits(&best) {
+        return Ok(None);
+    }
+
+    let mut low = minimum;
+    let mut high = maximum;
+    let mut iterations = 0u32;
+    while high - low > 0.01 && iterations < 16 {
+        iterations += 1;
+        let size = (low + high) * 0.5;
+        let layout = layout_at(size)?;
+        if fits(&layout) {
+            best = layout;
+            low = size;
+        } else {
+            high = size;
+        }
+    }
+    Ok(Some(best))
+}
+
 impl<'a> TextLayout<'a> {
     #[must_use]
     pub fn new(font: &'a Font) -> Self {
@@ -259,6 +331,7 @@ impl<'a> TextLayout<'a> {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             cjk_punctuation_layout: false,
+            natural_line_breaks: false,
         }
     }
 
@@ -283,6 +356,11 @@ impl<'a> TextLayout<'a> {
     pub fn with_min_font_size(mut self, size: f32) -> Self {
         self.font_size = None;
         self.min_font_size = Some(size);
+        self
+    }
+
+    pub(crate) fn with_natural_line_breaks(mut self) -> Self {
+        self.natural_line_breaks = true;
         self
     }
 
@@ -319,6 +397,7 @@ impl<'a> TextLayout<'a> {
                 air_scale: 1.0,
             }],
             minimum_air: minimum_air.max(0.0),
+            preferred_block_center: None,
         });
         self
     }
@@ -338,13 +417,21 @@ impl<'a> TextLayout<'a> {
                 .enumerate()
                 .map(|(index, points)| ContourConstraint {
                     points,
-                    // The physical wall owns one em of air. A partition is shared by
-                    // two flows, so each side contributes half for one em total.
+                    // The physical wall owns one representative-glyph clearance. A
+                    // partition is shared by two flows, so each side contributes half.
                     air_scale: if index == 0 { 1.0 } else { 0.5 },
                 })
                 .collect(),
             minimum_air: minimum_air.max(0.0),
+            preferred_block_center: None,
         });
+        self
+    }
+
+    pub(crate) fn with_comic_preferred_block_center(mut self, center: f32) -> Self {
+        if let Some(balloon) = &mut self.comic_balloon {
+            balloon.preferred_block_center = center.is_finite().then_some(center);
+        }
         self
     }
 
@@ -398,6 +485,33 @@ impl<'a> TextLayout<'a> {
         self.run_auto(text)
     }
 
+    /// Finds the largest fitting size for a rectangular layout whose validity is
+    /// monotonic as the font shrinks. The caller supplies the usable content box
+    /// at each size so font-relative paint such as an outline can be reserved
+    /// before wrapping rather than diagnosed after layout.
+    pub(crate) fn run_largest_fitting_with_bounds(
+        &self,
+        text: &str,
+        minimum: f32,
+        maximum: f32,
+        bounds_at: impl Fn(f32) -> (f32, f32),
+        fits: impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        largest_monotonic_fitting_font_size(
+            minimum,
+            maximum,
+            |size| {
+                let (width, height) = bounds_at(size);
+                self.clone()
+                    .with_font_size(size)
+                    .with_max_width(width.max(0.5))
+                    .with_max_height(height.max(0.5))
+                    .run(text)
+            },
+            fits,
+        )
+    }
+
     fn run_auto(&self, text: &str) -> Result<LayoutRun<'a>> {
         let max_height = self.max_height.unwrap_or(f32::INFINITY);
         let max_width = self.max_width.unwrap_or(f32::INFINITY);
@@ -418,67 +532,27 @@ impl<'a> TextLayout<'a> {
             // number of lines, so a smaller font can fail even though a larger one
             // fits. Search every visible-pixel candidate without assuming that the
             // contour result is monotonic.
-            if self.hyphenation_policy == HyphenationPolicy::LastResort {
-                let mut unhyphenated = self.clone();
-                unhyphenated.hyphenation_policy = HyphenationPolicy::Disabled;
-                let mut rectangular = unhyphenated.clone();
-                rectangular.comic_balloon = None;
-                let clean_maximum = rectangular
-                    .run_auto(text)?
-                    .font_size
-                    .min(maximum)
-                    .max(minimum);
-                let clean = largest_fitting_font_size(
-                    minimum,
-                    clean_maximum,
-                    |size| unhyphenated.run_with_size(text, size),
-                    fits,
-                )?;
-                // Avoiding a word break is no longer useful once it pins the text to
-                // the configured readability floor. Compare raster-size buckets so
-                // hyphenation must recover a visible pixel, not a tuned percentage.
-                if clean
-                    .as_ref()
-                    .is_some_and(|best| best.font_size.floor() > minimum.floor())
-                {
-                    return Ok(clean.unwrap());
-                }
-                let hyphenated = largest_fitting_font_size(
+            let search_maximum = if matches!(
+                self.hyphenation_policy,
+                HyphenationPolicy::Disabled | HyphenationPolicy::LastResort
+            ) {
+                self.comic_rectangular_search_maximum(
+                    text,
                     minimum,
                     maximum,
-                    |size| self.run_with_size(text, size),
-                    fits,
-                )?;
-                match (clean, hyphenated) {
-                    (Some(clean), Some(hyphenated))
-                        if hyphenated.font_size.floor() > clean.font_size.floor() =>
-                    {
-                        return Ok(hyphenated);
-                    }
-                    (Some(clean), _) => return Ok(clean),
-                    (None, Some(hyphenated)) => return Ok(hyphenated),
-                    (None, None) => {}
-                }
+                    self.hyphenation_policy,
+                )?
             } else {
-                let search_maximum = if self.hyphenation_policy == HyphenationPolicy::Disabled {
-                    let mut rectangular = self.clone();
-                    rectangular.comic_balloon = None;
-                    rectangular
-                        .run_auto(text)?
-                        .font_size
-                        .min(maximum)
-                        .max(minimum)
-                } else {
-                    maximum
-                };
-                if let Some(best) = largest_fitting_font_size(
-                    minimum,
-                    search_maximum,
-                    |size| self.run_with_size(text, size),
-                    fits,
-                )? {
-                    return Ok(best);
-                }
+                maximum
+            };
+            let largest = largest_fitting_font_size(
+                minimum,
+                search_maximum,
+                |size| self.run_with_size(text, size),
+                fits,
+            )?;
+            if let Some(best) = self.prefer_centered_comic_layout(text, minimum, largest, fits)? {
+                return Ok(best);
             }
             return self.run_with_size(text, minimum);
         }
@@ -508,6 +582,241 @@ impl<'a> TextLayout<'a> {
             }
         }
         Ok(best)
+    }
+
+    fn prefer_centered_comic_layout(
+        &self,
+        text: &str,
+        minimum: f32,
+        largest: Option<LayoutRun<'a>>,
+        fits: impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        let Some(largest) = largest else {
+            return Ok(None);
+        };
+        if self.comic_center_error(&largest) <= COMIC_CENTER_RASTER_TOLERANCE
+            && discretionary_hyphen_count(text, &largest.lines) == 0
+        {
+            return Ok(Some(largest));
+        }
+
+        // Font size, line breaks, contour capacity, and block position are coupled.
+        // Centering uses only the ordinary small size window. When discretionary
+        // splits dominate a sparse caption, inspect a proportional window as well,
+        // but accept its smaller candidates only when they actually remove a split.
+        // This preserves a large setting when a split is genuinely necessary while
+        // allowing short captions to use another clean line like a letterer would.
+        let largest_hyphens = discretionary_hyphen_count(text, &largest.lines);
+        let ordinary_quality_floor =
+            (largest.font_size - quality_font_reduction(largest.font_size)).max(minimum);
+        let quality_floor = (largest.font_size
+            - fragmentation_quality_font_reduction(text, largest.font_size, largest_hyphens))
+        .max(minimum);
+        let mut next_size = largest.font_size.floor() as i64;
+        if (next_size as f32 - largest.font_size).abs() <= f32::EPSILON {
+            next_size -= 1;
+        }
+        let quality_minimum_whole_size = quality_floor.ceil() as i64;
+        let mut quality_candidates = vec![largest.clone()];
+        let mut last_checked_size = largest.font_size;
+        while next_size >= quality_minimum_whole_size {
+            let candidate = self.run_with_size(text, next_size as f32)?;
+            last_checked_size = next_size as f32;
+            next_size -= 1;
+            if !fits(&candidate) {
+                continue;
+            }
+            quality_candidates.push(candidate);
+        }
+        if (quality_floor - last_checked_size).abs() > f32::EPSILON {
+            let candidate = self.run_with_size(text, quality_floor)?;
+            last_checked_size = quality_floor;
+            if fits(&candidate) {
+                quality_candidates.push(candidate);
+            }
+        }
+
+        let ordinary_candidates = quality_candidates
+            .iter()
+            .filter(|candidate| candidate.font_size + f32::EPSILON >= ordinary_quality_floor)
+            .cloned()
+            .collect::<Vec<_>>();
+        let ordinary_choice = self.preferred_comic_quality(text, &ordinary_candidates);
+        let extended_choice = self.preferred_comic_quality(text, &quality_candidates);
+        let quality_choice = if discretionary_hyphen_count(text, &extended_choice.lines)
+            < discretionary_hyphen_count(text, &ordinary_choice.lines)
+        {
+            extended_choice
+        } else {
+            ordinary_choice
+        };
+
+        if !self.comic_layout_is_source_local(&quality_choice)
+            && self
+                .comic_balloon
+                .as_ref()
+                .is_some_and(|balloon| balloon.preferred_block_center.is_some())
+        {
+            // A preserved OCR anchor is provenance, not merely an aesthetic
+            // centering hint. Touching narration boxes can form one concave region;
+            // a larger setting may then jump into a roomier lobe and collide with a
+            // neighboring caption. Search below the ordinary quality window for the
+            // largest readable setting that remains local to the source block. If no
+            // local setting exists, retain the bounded quality choice instead of
+            // collapsing blindly to the readability floor.
+            let minimum_whole_size = minimum.ceil() as i64;
+            while next_size >= minimum_whole_size {
+                let candidate = self.run_with_size(text, next_size as f32)?;
+                last_checked_size = next_size as f32;
+                next_size -= 1;
+                if fits(&candidate) && self.comic_layout_is_source_local(&candidate) {
+                    return Ok(Some(candidate));
+                }
+            }
+            if (minimum - last_checked_size).abs() > f32::EPSILON {
+                let candidate = self.run_with_size(text, minimum)?;
+                if fits(&candidate) && self.comic_layout_is_source_local(&candidate) {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+
+        Ok(Some(quality_choice))
+    }
+
+    fn preferred_comic_quality(&self, text: &str, candidates: &[LayoutRun<'a>]) -> LayoutRun<'a> {
+        let largest = candidates
+            .iter()
+            .max_by(|left, right| left.font_size.total_cmp(&right.font_size))
+            .expect("comic quality selection requires a fitted candidate");
+        let accepted_error = self
+            .comic_center_error_em(largest)
+            .max(COMIC_CENTER_ERROR_TOLERANCE_EM);
+        let source_anchor = self
+            .comic_balloon
+            .as_ref()
+            .is_some_and(|balloon| balloon.preferred_block_center.is_some());
+        let has_source_local = source_anchor
+            && candidates
+                .iter()
+                .any(|candidate| self.comic_layout_is_source_local(candidate));
+        let mut eligible = candidates
+            .iter()
+            .filter(|candidate| {
+                (!has_source_local || self.comic_layout_is_source_local(candidate))
+                    && self.comic_center_error_em(candidate) <= accepted_error + f32::EPSILON
+            })
+            .collect::<Vec<_>>();
+        let Some(minimum_hyphens) = eligible
+            .iter()
+            .map(|candidate| discretionary_hyphen_count(text, &candidate.lines))
+            .min()
+        else {
+            return largest.clone();
+        };
+        eligible.retain(|candidate| {
+            discretionary_hyphen_count(text, &candidate.lines) == minimum_hyphens
+        });
+        eligible.sort_by(|left, right| right.font_size.total_cmp(&left.font_size));
+        let largest_equally_clean = eligible[0];
+        let best_centered = eligible
+            .iter()
+            .copied()
+            .min_by(|left, right| {
+                self.comic_center_quality(left, largest_equally_clean.font_size)
+                    .total_cmp(&self.comic_center_quality(right, largest_equally_clean.font_size))
+                    .then_with(|| right.font_size.total_cmp(&left.font_size))
+            })
+            .expect("eligible comic candidates are non-empty");
+        if self.comic_center_quality(best_centered, largest_equally_clean.font_size)
+            + COMIC_CENTER_RASTER_TOLERANCE
+            <= self.comic_center_quality(largest_equally_clean, largest_equally_clean.font_size)
+        {
+            best_centered.clone()
+        } else {
+            largest_equally_clean.clone()
+        }
+    }
+
+    fn comic_layout_is_source_local(&self, layout: &LayoutRun<'_>) -> bool {
+        self.comic_balloon
+            .as_ref()
+            .is_some_and(|balloon| balloon.preferred_block_center.is_some())
+            && self.comic_center_error_em(layout) <= COMIC_CENTER_ERROR_TOLERANCE_EM
+    }
+
+    fn comic_center_error_em(&self, layout: &LayoutRun<'_>) -> f32 {
+        self.comic_center_error(layout) / layout.font_size.max(0.5)
+    }
+
+    fn comic_center_error(&self, layout: &LayoutRun<'_>) -> f32 {
+        let balloon = self
+            .comic_balloon
+            .as_ref()
+            .expect("comic centeredness requires a balloon");
+        let block_extent = if self.writing_mode.is_vertical() {
+            balloon.width
+        } else {
+            balloon.height
+        };
+        let placement_offset = if self.writing_mode.is_vertical() {
+            layout.placement_offset_x
+        } else {
+            layout.placement_offset_y
+        };
+        let actual_center = block_extent * 0.5 + placement_offset;
+        let preferred_center = balloon.preferred_block_center(self.writing_mode, block_extent);
+        (actual_center - preferred_center).abs()
+    }
+
+    fn comic_center_quality(&self, layout: &LayoutRun<'_>, largest_font_size: f32) -> f32 {
+        self.comic_center_error(layout)
+            + (largest_font_size - layout.font_size).max(0.0) * COMIC_CENTER_FONT_REDUCTION_COST
+    }
+
+    fn comic_rectangular_search_maximum(
+        &self,
+        text: &str,
+        minimum: f32,
+        maximum: f32,
+        policy: HyphenationPolicy,
+    ) -> Result<f32> {
+        let balloon = self
+            .comic_balloon
+            .as_ref()
+            .expect("rectangular comic preflight requires a balloon");
+        let mut rectangle = self.clone();
+        rectangle.hyphenation_policy = policy;
+        rectangle.comic_balloon = Some(ComicBalloon {
+            width: balloon.width,
+            height: balloon.height,
+            contours: vec![ContourConstraint {
+                points: vec![
+                    (0.0, 0.0),
+                    (balloon.width, 0.0),
+                    (balloon.width, balloon.height),
+                    (0.0, balloon.height),
+                ],
+                air_scale: 1.0,
+            }],
+            minimum_air: balloon.minimum_air,
+            preferred_block_center: balloon.preferred_block_center,
+        });
+        let max_width = self.max_width.unwrap_or(f32::INFINITY);
+        let max_height = self.max_height.unwrap_or(f32::INFINITY);
+        let fits = |layout: &LayoutRun<'_>| {
+            !layout.overflowed()
+                && layout.width <= max_width + f32::EPSILON
+                && layout.height <= max_height + f32::EPSILON
+        };
+        let upper = largest_monotonic_fitting_font_size(
+            minimum,
+            maximum,
+            |size| rectangle.run_with_size(text, size),
+            fits,
+        )?
+        .map_or(minimum, |layout| layout.font_size.ceil());
+        Ok(upper.clamp(minimum, maximum))
     }
 
     fn run_with_size(&self, text: &str, font_size: f32) -> Result<LayoutRun<'a>> {
@@ -701,8 +1010,8 @@ impl<'a> TextLayout<'a> {
                 runs: segment_runs,
                 advance: segment_advance,
                 trailing_advance,
-                break_penalty: if self.comic_balloon.is_some() {
-                    comic_break_penalty(text, segment.next_offset)
+                break_penalty: if self.comic_balloon.is_some() || self.natural_line_breaks {
+                    natural_break_penalty(text, segment.next_offset)
                 } else {
                     0.0
                 },
@@ -727,10 +1036,20 @@ impl<'a> TextLayout<'a> {
         } else {
             fallback_ink
         };
-        let balloon_air = self
-            .comic_balloon
-            .as_ref()
-            .map_or(0.0, |balloon| balloon.air(line_ink.thickness()));
+
+        let (balloon_air_x, balloon_air_y) =
+            self.comic_balloon.as_ref().map_or((0.0, 0.0), |balloon| {
+                let inline_air = balloon.air(
+                    self.representative_inline_extent(&shaped_segments, line_ink)
+                        * COMIC_INLINE_WALL_CLEARANCE_GLYPHS,
+                );
+                let block_air = balloon.air(line_ink.thickness());
+                if self.writing_mode.is_vertical() {
+                    (block_air, inline_air)
+                } else {
+                    (inline_air, block_air)
+                }
+            });
 
         let mut lines: Vec<LayoutLine<'a>> = Vec::new();
         let mut line_profiles = Vec::new();
@@ -745,8 +1064,8 @@ impl<'a> TextLayout<'a> {
                 max_extent,
                 line_height,
                 line_ink,
-                balloon_air,
-                balloon_air,
+                balloon_air_x,
+                balloon_air_y,
                 &bidi_info,
                 &mut lines,
                 &mut line_profiles,
@@ -765,8 +1084,8 @@ impl<'a> TextLayout<'a> {
                     max_extent,
                     line_height,
                     line_ink,
-                    balloon_air,
-                    balloon_air,
+                    balloon_air_x,
+                    balloon_air_y,
                     &bidi_info,
                     &mut lines,
                     &mut line_profiles,
@@ -782,8 +1101,8 @@ impl<'a> TextLayout<'a> {
                     max_extent,
                     line_height,
                     line_ink,
-                    balloon_air,
-                    balloon_air,
+                    balloon_air_x,
+                    balloon_air_y,
                     &bidi_info,
                     &mut lines,
                     &mut line_profiles,
@@ -999,6 +1318,44 @@ impl<'a> TextLayout<'a> {
             before: (-minimum).max(0.0),
             after: maximum.max(0.0),
         })
+    }
+
+    fn representative_inline_extent(
+        &self,
+        segments: &[ShapedSegment<'a>],
+        line_ink: InkBand,
+    ) -> f32 {
+        // Comic lettering convention expresses wall clearance in letter-sized terms.
+        // This returns one representative glyph; the caller assigns half of it to
+        // each physical side wall. Use the shaped text's median advance instead of a
+        // font-wide average, which substantially overstates compact Latin lettering.
+        let mut extents = Vec::new();
+        for glyph in segments
+            .iter()
+            .flat_map(|segment| segment.runs.iter())
+            .flat_map(|run| run.shaped.glyphs.iter())
+        {
+            let extent = if self.writing_mode.is_vertical() {
+                glyph.y_advance.abs()
+            } else {
+                glyph.x_advance.abs()
+            };
+            if extent.is_finite() && extent > f32::EPSILON {
+                extents.push(extent);
+            }
+        }
+        extents.sort_by(f32::total_cmp);
+        let representative = extents
+            .get(extents.len() / 2)
+            .copied()
+            .unwrap_or_else(|| line_ink.thickness());
+        if self.writing_mode.is_vertical() {
+            representative
+        } else {
+            // A punctuation-heavy string must still retain visible wall air even
+            // when most inline advances are much narrower than an ordinary letter.
+            representative.max(line_ink.thickness() * 0.5)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1401,6 +1758,56 @@ impl<'a> TextLayout<'a> {
     }
 }
 
+pub(crate) fn quality_font_reduction(font_size: f32) -> f32 {
+    (font_size * COMIC_QUALITY_FONT_REDUCTION_RATIO)
+        .max(COMIC_QUALITY_FONT_REDUCTION_MIN)
+        .min(COMIC_QUALITY_FONT_REDUCTION_MAX)
+}
+
+pub(crate) fn fragmentation_quality_font_reduction(
+    text: &str,
+    font_size: f32,
+    discretionary_hyphens: usize,
+) -> f32 {
+    let ordinary_reduction = quality_font_reduction(font_size);
+    if discretionary_hyphens == 0 {
+        return ordinary_reduction;
+    }
+    let word_count = text
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count();
+    let high_fragmentation = word_count > 0
+        && word_count
+            <= discretionary_hyphens.saturating_mul(COMIC_HIGH_FRAGMENTATION_WORDS_PER_HYPHEN);
+    let fragmentation_reduction = ordinary_reduction * discretionary_hyphens as f32;
+    if high_fragmentation {
+        ordinary_reduction.max(font_size * COMIC_HIGH_FRAGMENTATION_FONT_REDUCTION_RATIO)
+    } else {
+        fragmentation_reduction.min(font_size * COMIC_FRAGMENTATION_FONT_REDUCTION_RATIO)
+    }
+}
+
+fn discretionary_hyphen_count(text: &str, lines: &[LayoutLine<'_>]) -> usize {
+    lines
+        .windows(2)
+        .filter(|pair| {
+            let boundary = pair[0].range.end;
+            boundary == pair[1].range.start
+                && boundary > 0
+                && boundary < text.len()
+                && text[..boundary]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphabetic)
+                && text[boundary..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphabetic)
+        })
+        .count()
+}
+
 fn extend_advance(advance: f32, extra: f32) -> f32 {
     if advance < 0.0 {
         advance - extra
@@ -1504,6 +1911,30 @@ fn optimal_uniform_line_breaks(
         };
     }
 
+    // Overflow is a feasibility constraint, not an aesthetic tradeoff. A finite
+    // badness can otherwise prefer one slightly overfull line to several ragged
+    // legal lines, which makes auto-fit shrink despite an available layout.
+    uniform_line_breaks_pass(segments, max_extent, allow_hyphenation, false)
+        .or_else(|| uniform_line_breaks_pass(segments, max_extent, allow_hyphenation, true))
+        .unwrap_or_else(|| LineBreakResult {
+            breaks: vec![len],
+            profiles: vec![LineProfile {
+                width: max_extent,
+                center_offset: 0.0,
+                block_baseline: 0.0,
+            }],
+            overflowed: true,
+            cost: f32::INFINITY,
+        })
+}
+
+fn uniform_line_breaks_pass(
+    segments: &[LineBreakMeasure],
+    max_extent: f32,
+    allow_hyphenation: bool,
+    allow_overflow: bool,
+) -> Option<LineBreakResult> {
+    let len = segments.len();
     let mut dp = vec![f32::INFINITY; len + 1];
     let mut prev = vec![None; len + 1];
     dp[0] = 0.0;
@@ -1525,6 +1956,14 @@ fn optimal_uniform_line_breaks(
             if hyphenated_break && !allow_hyphenation {
                 continue;
             }
+            let overflowed = line_advance > max_extent + f32::EPSILON;
+            let stop = segments[end - 1].is_mandatory || advance > max_extent;
+            if overflowed && !allow_overflow {
+                if stop {
+                    break;
+                }
+                continue;
+            }
             let mut cost = dp[start] + line_break_badness(line_advance, max_extent);
             if hyphenated_break {
                 cost += LINE_BREAK_HYPHEN_PENALTY;
@@ -1537,45 +1976,21 @@ fn optimal_uniform_line_breaks(
                 dp[end] = cost;
                 prev[end] = Some(start);
             }
-            if segments[end - 1].is_mandatory || advance > max_extent {
+            if stop {
                 break;
             }
         }
     }
 
     if !dp[len].is_finite() {
-        return LineBreakResult {
-            breaks: vec![len],
-            profiles: vec![LineProfile {
-                width: max_extent,
-                center_offset: 0.0,
-                block_baseline: 0.0,
-            }],
-            overflowed: segments.iter().map(|segment| segment.advance).sum::<f32>()
-                - segments
-                    .last()
-                    .map_or(0.0, |segment| segment.trailing_advance)
-                > max_extent,
-            cost: f32::INFINITY,
-        };
+        return None;
     }
 
     let mut breaks = Vec::new();
     let mut index = len;
     while index > 0 {
         breaks.push(index);
-        let Some(previous) = prev[index] else {
-            return LineBreakResult {
-                breaks: vec![len],
-                profiles: vec![LineProfile {
-                    width: max_extent,
-                    center_offset: 0.0,
-                    block_baseline: 0.0,
-                }],
-                overflowed: true,
-                cost: f32::INFINITY,
-            };
-        };
+        let previous = prev[index]?;
         index = previous;
     }
     breaks.reverse();
@@ -1588,12 +2003,13 @@ fn optimal_uniform_line_breaks(
         };
         breaks.len()
     ];
-    LineBreakResult {
+    debug_assert!(allow_overflow || !overflowed);
+    Some(LineBreakResult {
         breaks,
         profiles,
         overflowed,
         cost: dp[len],
-    }
+    })
 }
 
 fn comic_line_breaks(
@@ -1616,6 +2032,7 @@ fn comic_line_breaks(
     } else {
         air_y
     };
+    let preferred_block_center = balloon.preferred_block_center(writing_mode, block_extent);
     let available_block_extent = (block_extent - block_air * 2.0).max(0.0);
     let maximum_lines = if line_ink.thickness() <= available_block_extent {
         1 + ((available_block_extent - line_ink.thickness()) / line_height).floor() as usize
@@ -1635,54 +2052,54 @@ fn comic_line_breaks(
     }
 
     let select = |allow_hyphenation: bool| {
-        (1..=maximum_lines)
+        let mut candidates = (1..=maximum_lines)
             .flat_map(|line_count| {
-                balloon
-                    .line_profile_candidates(
-                        writing_mode,
-                        line_count,
-                        line_height,
-                        line_ink,
-                        air_x,
-                        air_y,
-                    )
-                    .into_iter()
-                    .filter_map(move |profiles| {
-                        let result =
-                            exact_profiled_line_breaks(segments, profiles, allow_hyphenation)?;
-                        Some(result)
-                    })
+                profiled_comic_line_break_candidates(
+                    segments,
+                    balloon,
+                    writing_mode,
+                    line_count,
+                    line_height,
+                    line_ink,
+                    air_x,
+                    air_y,
+                    allow_hyphenation,
+                )
+            })
+            .collect::<Vec<_>>();
+        if candidates.iter().any(|candidate| !candidate.overflowed) {
+            candidates.retain(|candidate| !candidate.overflowed);
+        }
+        let best_center_distance = candidates
+            .iter()
+            .map(|candidate| {
+                block_center_distance(candidate, line_height, line_ink, preferred_block_center)
+            })
+            .min_by(f32::total_cmp)?;
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                block_center_distance(candidate, line_height, line_ink, preferred_block_center)
+                    <= best_center_distance + COMIC_CENTER_RASTER_TOLERANCE
             })
             .min_by(|left, right| {
-                left.overflowed
-                    .cmp(&right.overflowed)
+                left.cost
+                    .total_cmp(&right.cost)
+                    .then_with(|| {
+                        block_center_distance(left, line_height, line_ink, preferred_block_center)
+                            .total_cmp(&block_center_distance(
+                                right,
+                                line_height,
+                                line_ink,
+                                preferred_block_center,
+                            ))
+                    })
+                    // Break cost already accounts for the number of lines. Keep the
+                    // explicit comparison only as a deterministic tie-breaker.
                     .then_with(|| left.profiles.len().cmp(&right.profiles.len()))
-                    // Contour widths already exclude the required air. Maximizing the
-                    // worst remaining line clearance selects the balloon body without
-                    // classifying or cutting off a speech tail.
                     .then_with(|| {
                         minimum_line_clearance(segments, right)
                             .total_cmp(&minimum_line_clearance(segments, left))
-                    })
-                    .then_with(|| left.cost.total_cmp(&right.cost))
-                    .then_with(|| {
-                        balloon
-                            .block_origin_distance(
-                                left,
-                                writing_mode,
-                                line_height,
-                                line_ink,
-                                block_extent,
-                                block_air,
-                            )
-                            .total_cmp(&balloon.block_origin_distance(
-                                right,
-                                writing_mode,
-                                line_height,
-                                line_ink,
-                                block_extent,
-                                block_air,
-                            ))
                     })
             })
     };
@@ -1705,10 +2122,139 @@ fn comic_line_breaks(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn profiled_comic_line_break_candidates(
+    segments: &[LineBreakMeasure],
+    balloon: &ComicBalloon,
+    writing_mode: WritingMode,
+    line_count: usize,
+    line_height: f32,
+    line_ink: InkBand,
+    air_x: f32,
+    air_y: f32,
+    allow_hyphenation: bool,
+) -> Vec<LineBreakResult> {
+    let origins = balloon.line_profile_origins(
+        writing_mode,
+        line_count,
+        line_height,
+        line_ink,
+        air_x,
+        air_y,
+    );
+    if origins.is_empty() {
+        return Vec::new();
+    }
+
+    let vertical = writing_mode.is_vertical();
+    let (block_extent, inline_extent, block_air, inline_air) = if vertical {
+        (balloon.width, balloon.height, air_x, air_y)
+    } else {
+        (balloon.height, balloon.width, air_y, air_x)
+    };
+    let block_size = line_ink.thickness() + line_count.saturating_sub(1) as f32 * line_height;
+    let preferred_center = balloon.preferred_block_center(writing_mode, block_extent);
+    let Some((first_origin, last_origin)) =
+        balloon.block_origin_range(writing_mode, block_extent, block_air, block_size)
+    else {
+        return Vec::new();
+    };
+    let preferred_origin = (preferred_center - block_size * 0.5).clamp(first_origin, last_origin);
+
+    let evaluate = |block_origin| {
+        balloon
+            .line_profiles_at_origin(
+                writing_mode,
+                line_count,
+                line_height,
+                line_ink,
+                block_extent,
+                inline_extent,
+                block_air,
+                inline_air,
+                block_origin,
+            )
+            .and_then(|profiles| exact_profiled_line_breaks(segments, profiles, allow_hyphenation))
+    };
+
+    let mut sampled = origins
+        .into_iter()
+        .map(|origin| (origin, evaluate(origin)))
+        .collect::<Vec<_>>();
+    sampled.sort_by(|left, right| left.0.total_cmp(&right.0));
+    sampled.dedup_by(|left, right| (left.0 - right.0).abs() <= f32::EPSILON);
+
+    let mut brackets = Vec::with_capacity(2);
+    let mut inner_miss = None;
+    for (origin, result) in sampled
+        .iter()
+        .rev()
+        .filter(|(origin, _)| *origin <= preferred_origin + f32::EPSILON)
+    {
+        if result.as_ref().is_some_and(|result| !result.overflowed) {
+            if let Some(miss) = inner_miss {
+                brackets.push((miss, *origin));
+            }
+            break;
+        }
+        inner_miss = Some(*origin);
+    }
+    inner_miss = None;
+    for (origin, result) in sampled
+        .iter()
+        .filter(|(origin, _)| *origin + f32::EPSILON >= preferred_origin)
+    {
+        if result.as_ref().is_some_and(|result| !result.overflowed) {
+            if let Some(miss) = inner_miss {
+                brackets.push((miss, *origin));
+            }
+            break;
+        }
+        inner_miss = Some(*origin);
+    }
+
+    let mut candidates = sampled
+        .into_iter()
+        .filter_map(|(_, result)| result)
+        .collect::<Vec<_>>();
+    for (mut miss, mut fit) in brackets {
+        let mut refined = None;
+        for _ in 0..COMIC_BLOCK_REFINEMENT_ITERATIONS {
+            if (fit - miss).abs() <= COMIC_BLOCK_REFINEMENT_TOLERANCE {
+                break;
+            }
+            let midpoint = (miss + fit) * 0.5;
+            match evaluate(midpoint) {
+                Some(result) if !result.overflowed => {
+                    fit = midpoint;
+                    refined = Some(result);
+                }
+                _ => miss = midpoint,
+            }
+        }
+        if let Some(result) = refined {
+            candidates.push(result);
+        }
+    }
+    candidates
+}
+
 fn exact_profiled_line_breaks(
     segments: &[LineBreakMeasure],
     profiles: Vec<LineProfile>,
     allow_hyphenation: bool,
+) -> Option<LineBreakResult> {
+    // Preserve the same hard-fit contract as the uniform breaker. The fallback
+    // pass still produces a useful least-bad layout when the profile cannot fit.
+    exact_profiled_line_breaks_pass(segments, &profiles, allow_hyphenation, false)
+        .or_else(|| exact_profiled_line_breaks_pass(segments, &profiles, allow_hyphenation, true))
+}
+
+fn exact_profiled_line_breaks_pass(
+    segments: &[LineBreakMeasure],
+    profiles: &[LineProfile],
+    allow_hyphenation: bool,
+    allow_overflow: bool,
 ) -> Option<LineBreakResult> {
     let len = segments.len();
     let line_count = profiles.len();
@@ -1740,7 +2286,15 @@ fn exact_profiled_line_breaks(
                 }
                 let line_advance = advance - segments[end - 1].trailing_advance + suffix;
                 let width = profiles[line].width.max(1.0);
+                let overfull = line_advance > width + f32::EPSILON;
                 let overflow = (line_advance - width).max(0.0) / width;
+                let stop = segments[end - 1].is_mandatory || advance > width;
+                if overfull && !allow_overflow {
+                    if stop {
+                        break;
+                    }
+                    continue;
+                }
                 let slack = (width - line_advance).max(0.0) / width;
                 let mut cost = dp[line][start]
                     + slack * slack * 1_000.0
@@ -1755,7 +2309,7 @@ fn exact_profiled_line_breaks(
                     dp[line + 1][end] = cost;
                     previous[line + 1][end] = Some(start);
                 }
-                if segments[end - 1].is_mandatory || advance > width {
+                if stop {
                     break;
                 }
             }
@@ -1782,9 +2336,10 @@ fn exact_profiled_line_breaks(
         .map(|profile| profile.width)
         .collect::<Vec<_>>();
     let overflowed = breaks_overflow(segments, &breaks, &widths);
+    debug_assert!(allow_overflow || !overflowed);
     Some(LineBreakResult {
         breaks,
-        profiles,
+        profiles: profiles.to_vec(),
         overflowed,
         cost,
     })
@@ -1844,9 +2399,28 @@ fn minimum_line_clearance(segments: &[LineBreakMeasure], result: &LineBreakResul
     }
 }
 
+fn block_center_distance(
+    result: &LineBreakResult,
+    line_height: f32,
+    line_ink: InkBand,
+    preferred_center: f32,
+) -> f32 {
+    let Some(origin) = result
+        .profiles
+        .iter()
+        .map(|profile| profile.block_baseline - line_ink.before)
+        .min_by(f32::total_cmp)
+    else {
+        return f32::INFINITY;
+    };
+    let block_size =
+        line_ink.thickness() + result.profiles.len().saturating_sub(1) as f32 * line_height;
+    (origin + block_size * 0.5 - preferred_center).abs()
+}
+
 impl ComicBalloon {
-    fn air(&self, ink_height: f32) -> f32 {
-        self.minimum_air.max(ink_height)
+    fn air(&self, representative_extent: f32) -> f32 {
+        self.minimum_air.max(representative_extent)
     }
 
     fn inline_extent(&self, writing_mode: WritingMode, air_x: f32, air_y: f32) -> f32 {
@@ -1879,6 +2453,7 @@ impl ComicBalloon {
         .next()
     }
 
+    #[cfg(test)]
     fn line_profile_candidates(
         &self,
         writing_mode: WritingMode,
@@ -1888,6 +2463,51 @@ impl ComicBalloon {
         air_x: f32,
         air_y: f32,
     ) -> Vec<Vec<LineProfile>> {
+        let origins = self.line_profile_origins(
+            writing_mode,
+            line_count,
+            line_height,
+            line_ink,
+            air_x,
+            air_y,
+        );
+        if origins.is_empty() {
+            return Vec::new();
+        }
+        let vertical = writing_mode.is_vertical();
+        let (block_extent, inline_extent, block_air, inline_air) = if vertical {
+            (self.width, self.height, air_x, air_y)
+        } else {
+            (self.height, self.width, air_y, air_x)
+        };
+
+        origins
+            .into_iter()
+            .filter_map(|block_origin| {
+                self.line_profiles_at_origin(
+                    writing_mode,
+                    line_count,
+                    line_height,
+                    line_ink,
+                    block_extent,
+                    inline_extent,
+                    block_air,
+                    inline_air,
+                    block_origin,
+                )
+            })
+            .collect()
+    }
+
+    fn line_profile_origins(
+        &self,
+        writing_mode: WritingMode,
+        line_count: usize,
+        line_height: f32,
+        line_ink: InkBand,
+        air_x: f32,
+        air_y: f32,
+    ) -> Vec<f32> {
         let vertical = writing_mode.is_vertical();
         let (block_extent, inline_extent, block_air, inline_air) = if vertical {
             (self.width, self.height, air_x, air_y)
@@ -1906,11 +2526,11 @@ impl ComicBalloon {
         };
 
         // Font size, line breaks, and block position are coupled inside an irregular
-        // balloon. In particular, centering against a long speech tail can place one
-        // or more lines in the tail and force an otherwise unnecessary shrink. Search
-        // across the feasible block-origin interval at typographic resolution. The
-        // fixed interval cap keeps auto-fit work bounded for unusually large pages.
-        let centered_origin = (first_origin + last_origin) * 0.5;
+        // balloon. Seed the exact area-weighted body center, then search the remaining
+        // feasible interval so a centered candidate that overflows can still move.
+        let preferred_center = self.preferred_block_center(writing_mode, block_extent);
+        let preferred_origin =
+            (preferred_center - block_size * 0.5).clamp(first_origin, last_origin);
         let travel = (last_origin - first_origin).max(0.0);
         let target_step = (line_ink.thickness().min(line_height) * 0.5).max(1.0);
         let intervals = if travel <= f32::EPSILON {
@@ -1919,7 +2539,7 @@ impl ComicBalloon {
             ((travel / target_step).ceil() as usize).clamp(1, COMIC_BLOCK_SEARCH_MAX_INTERVALS)
         };
         let mut origins = Vec::with_capacity(intervals.saturating_add(2));
-        origins.push(centered_origin);
+        origins.push(preferred_origin);
         if intervals > 0 {
             for index in 0..=intervals {
                 let origin = first_origin + travel * index as f32 / intervals as f32;
@@ -1933,21 +2553,6 @@ impl ComicBalloon {
         }
 
         origins
-            .into_iter()
-            .filter_map(|block_origin| {
-                self.line_profiles_at_origin(
-                    writing_mode,
-                    line_count,
-                    line_height,
-                    line_ink,
-                    block_extent,
-                    inline_extent,
-                    block_air,
-                    inline_air,
-                    block_origin,
-                )
-            })
-            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2056,32 +2661,20 @@ impl ComicBalloon {
         (last_origin + f32::EPSILON >= first).then_some((first, last_origin.max(first)))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn block_origin_distance(
-        &self,
-        result: &LineBreakResult,
-        writing_mode: WritingMode,
-        line_height: f32,
-        line_ink: InkBand,
-        block_extent: f32,
-        block_air: f32,
-    ) -> f32 {
-        let line_count = result.profiles.len();
-        let block_size = line_ink.thickness() + line_count.saturating_sub(1) as f32 * line_height;
-        let Some((first, last)) =
-            self.block_origin_range(writing_mode, block_extent, block_air, block_size)
-        else {
-            return f32::INFINITY;
-        };
-        let Some(origin) = result
-            .profiles
+    fn preferred_block_center(&self, writing_mode: WritingMode, block_extent: f32) -> f32 {
+        if let Some(center) = self.preferred_block_center {
+            return center.clamp(0.0, block_extent);
+        }
+        // The last valid constraint is the assigned flow cell when one exists;
+        // otherwise it is the physical balloon. A polygon centroid weights a narrow
+        // speech tail by its area instead of allowing one extreme vertex to drag the
+        // phrase away from the body.
+        self.contours
             .iter()
-            .map(|profile| profile.block_baseline - line_ink.before)
-            .min_by(f32::total_cmp)
-        else {
-            return 0.0;
-        };
-        (origin - (first + last) * 0.5).abs()
+            .rev()
+            .find_map(|contour| polygon_block_centroid(&contour.points, writing_mode))
+            .unwrap_or(block_extent * 0.5)
+            .clamp(0.0, block_extent)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2155,6 +2748,34 @@ impl ComicBalloon {
     }
 }
 
+fn polygon_block_centroid(contour: &[(f32, f32)], writing_mode: WritingMode) -> Option<f32> {
+    if contour.len() < 3 {
+        return None;
+    }
+    let mut twice_area = 0.0;
+    let mut block_moment = 0.0;
+    for index in 0..contour.len() {
+        let first = contour[index];
+        let second = contour[(index + 1) % contour.len()];
+        let cross = first.0 * second.1 - second.0 * first.1;
+        let first_block = if writing_mode.is_vertical() {
+            first.0
+        } else {
+            first.1
+        };
+        let second_block = if writing_mode.is_vertical() {
+            second.0
+        } else {
+            second.1
+        };
+        twice_area += cross;
+        block_moment += (first_block + second_block) * cross;
+    }
+    (twice_area.abs() > f32::EPSILON)
+        .then(|| block_moment / (3.0 * twice_area))
+        .filter(|center| center.is_finite())
+}
+
 fn polygon_inline_spans(
     contour: &[(f32, f32)],
     writing_mode: WritingMode,
@@ -2187,12 +2808,56 @@ fn polygon_inline_spans(
         .collect()
 }
 
-fn comic_break_penalty(text: &str, boundary: usize) -> f32 {
+fn is_natural_pause_character(character: char) -> bool {
+    matches!(
+        character,
+        '.' | '!'
+            | '?'
+            | '…'
+            | '‼'
+            | '⁇'
+            | '⁈'
+            | '⁉'
+            | ','
+            | ';'
+            | ':'
+            | '—'
+            | '–'
+            | '~'
+            | '〜'
+            | '～'
+    )
+}
+
+pub(crate) fn has_internal_natural_pause(text: &str) -> bool {
+    text.char_indices().any(|(offset, character)| {
+        if !is_natural_pause_character(character) {
+            return false;
+        }
+        !text[offset + character.len_utf8()..]
+            .trim_start_matches(is_natural_pause_character)
+            .trim_start()
+            .is_empty()
+    })
+}
+
+fn natural_pause_at(text: &str, boundary: usize) -> bool {
+    let boundary = boundary.min(text.len());
+    text[..boundary]
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(is_natural_pause_character)
+}
+
+fn natural_break_penalty(text: &str, boundary: usize) -> f32 {
     let boundary = boundary.min(text.len());
     let before = text[..boundary].trim_end();
     let after = text[boundary..].trim_start();
     match before.chars().next_back() {
-        Some('.' | '!' | '?' | '…' | '‼' | '⁇' | '⁈' | '⁉') => return 0.0,
+        Some('.' | '!' | '?' | '…' | '‼' | '⁇' | '⁈' | '⁉' | '~' | '〜' | '～') => {
+            return 0.0;
+        }
         Some(',' | ';' | ':' | '—' | '–') => return 20.0,
         _ => {}
     }
@@ -2362,6 +3027,7 @@ mod tests {
                 air_scale: 1.0,
             }],
             minimum_air,
+            preferred_block_center: None,
         }
     }
 
@@ -2399,6 +3065,41 @@ mod tests {
             .run("Fits")?;
 
         assert_eq!(fitted.font_size, preferred_size);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_auto_size_preserves_a_source_painted_footprint() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let preferred_size = 80.0;
+        let builder = TextLayout::new(&font).with_line_height(1.2);
+        let unrestricted = builder
+            .clone()
+            .with_font_size(preferred_size)
+            .with_max_width(1_000.0)
+            .run("Şup♡")?;
+        let maximum_area = unrestricted.width * unrestricted.height * 0.4;
+
+        let fitted = builder
+            .run_largest_fitting_with_bounds(
+                "Şup♡",
+                12.0,
+                preferred_size,
+                |_| (1_000.0, 1_000.0),
+                |layout| {
+                    let dilation = layout.font_size * 0.1;
+                    (layout.width + dilation * 2.0) * (layout.height + dilation * 2.0)
+                        <= maximum_area
+                },
+            )?
+            .expect("the minimum setting fits the painted footprint");
+
+        assert!(fitted.font_size < preferred_size);
+        let dilation = fitted.font_size * 0.1;
+        assert!(
+            (fitted.width + dilation * 2.0) * (fitted.height + dilation * 2.0)
+                <= maximum_area + 0.1
+        );
         Ok(())
     }
 
@@ -2581,6 +3282,75 @@ mod tests {
         let result = line_breaks_with_policy(&segments, 50.0, HyphenationPolicy::Disabled);
 
         assert_eq!(result.breaks, [1, 2]);
+        assert!(!result.overflowed);
+    }
+
+    #[test]
+    fn uniform_breaks_reject_overflow_when_legal_breaks_fit() {
+        let segments = [
+            LineBreakMeasure {
+                advance: 51.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+            LineBreakMeasure {
+                advance: 50.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+        ];
+
+        let result = optimal_uniform_line_breaks(&segments, 100.0, false);
+
+        assert_eq!(result.breaks, [1, 2]);
+        assert!(!result.overflowed);
+    }
+
+    #[test]
+    fn profiled_breaks_reject_overflow_when_legal_breaks_fit() {
+        let segments = [
+            LineBreakMeasure {
+                advance: 51.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+            LineBreakMeasure {
+                advance: 50.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+            LineBreakMeasure {
+                advance: 1.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+        ];
+        let profiles = vec![
+            LineProfile {
+                width: 100.0,
+                center_offset: 0.0,
+                block_baseline: 0.0,
+            },
+            LineProfile {
+                width: 100.0,
+                center_offset: 0.0,
+                block_baseline: 20.0,
+            },
+        ];
+
+        let result = exact_profiled_line_breaks(&segments, profiles, false).unwrap();
+
+        assert_eq!(result.breaks, [1, 3]);
         assert!(!result.overflowed);
     }
 
@@ -2784,7 +3554,7 @@ mod tests {
     }
 
     #[test]
-    fn comic_profiles_keep_a_centered_candidate_when_wider_space_is_elsewhere() {
+    fn comic_profiles_seed_the_area_centroid_when_wider_space_is_elsewhere() {
         let balloon = comic_balloon(
             100.0,
             200.0,
@@ -2798,6 +3568,8 @@ mod tests {
             ],
             0.0,
         );
+        let preferred_center =
+            balloon.preferred_block_center(WritingMode::Horizontal, balloon.height);
 
         let profiles = balloon
             .line_profiles(
@@ -2813,9 +3585,72 @@ mod tests {
             )
             .unwrap();
 
-        assert!((profiles[0].block_baseline - 80.0).abs() < 0.01);
-        assert!((profiles[2].block_baseline - 120.0).abs() < 0.01);
+        let block_center = profiles[0].block_baseline + 20.0;
+        assert_approx_eq(block_center, preferred_center);
         assert!(profiles.iter().all(|profile| profile.width <= 50.01));
+    }
+
+    #[test]
+    fn comic_profiles_prefer_the_preserved_source_block_center() {
+        let mut balloon = comic_balloon(
+            100.0,
+            200.0,
+            vec![(0.0, 0.0), (100.0, 0.0), (100.0, 200.0), (0.0, 200.0)],
+            0.0,
+        );
+        balloon.preferred_block_center = Some(70.0);
+
+        let profiles = balloon
+            .line_profiles(
+                WritingMode::Horizontal,
+                3,
+                20.0,
+                InkBand {
+                    before: 10.0,
+                    after: 10.0,
+                },
+                0.0,
+                0.0,
+            )
+            .unwrap();
+
+        let block_center = profiles[0].block_baseline + 20.0;
+        assert_approx_eq(block_center, 70.0);
+    }
+
+    #[test]
+    fn comic_breaks_refine_the_nearest_fit_toward_the_source_center() {
+        let segments = [LineBreakMeasure {
+            advance: 65.0,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory: false,
+        }];
+        let mut balloon = comic_balloon(
+            100.0,
+            100.0,
+            vec![(50.0, 0.0), (100.0, 50.0), (50.0, 100.0), (0.0, 50.0)],
+            0.0,
+        );
+        balloon.preferred_block_center = Some(70.0);
+
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            WritingMode::Horizontal,
+            20.0,
+            InkBand {
+                before: 10.0,
+                after: 10.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert!(!result.overflowed);
+        let center = result.profiles[0].block_baseline;
+        assert!((57.25..=57.75).contains(&center), "refined center {center}");
     }
 
     #[test]
@@ -2904,6 +3739,96 @@ mod tests {
     }
 
     #[test]
+    fn comic_breaks_do_not_chase_a_one_pixel_edge_advantage() {
+        let segments = [LineBreakMeasure {
+            advance: 40.0,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory: false,
+        }];
+        let balloon = comic_balloon(
+            100.0,
+            200.0,
+            vec![(1.0, 0.0), (99.0, 0.0), (100.0, 200.0), (0.0, 200.0)],
+            0.0,
+        );
+
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            WritingMode::Horizontal,
+            20.0,
+            InkBand {
+                before: 10.0,
+                after: 10.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert!(!result.overflowed);
+        assert!((result.profiles[0].block_baseline - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn comic_breaks_center_before_preferring_fewer_lines() {
+        let segments = [
+            LineBreakMeasure {
+                advance: 40.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+            LineBreakMeasure {
+                advance: 35.0,
+                trailing_advance: 0.0,
+                break_suffix_advance: 0.0,
+                break_penalty: 0.0,
+                is_mandatory: false,
+            },
+        ];
+        let balloon = comic_balloon(
+            100.0,
+            200.0,
+            vec![
+                (0.0, 0.0),
+                (100.0, 0.0),
+                (100.0, 60.0),
+                (70.0, 80.0),
+                (70.0, 120.0),
+                (100.0, 140.0),
+                (100.0, 200.0),
+                (0.0, 200.0),
+                (0.0, 140.0),
+                (30.0, 120.0),
+                (30.0, 80.0),
+                (0.0, 60.0),
+            ],
+            0.0,
+        );
+
+        let result = comic_line_breaks(
+            &segments,
+            &balloon,
+            WritingMode::Horizontal,
+            20.0,
+            InkBand {
+                before: 10.0,
+                after: 10.0,
+            },
+            (0.0, 0.0),
+            HyphenationPolicy::Disabled,
+        );
+
+        assert_eq!(result.breaks, [1, 2]);
+        assert!(!result.overflowed);
+        assert_approx_eq(result.profiles[0].block_baseline, 90.0);
+        assert_approx_eq(result.profiles[1].block_baseline, 110.0);
+    }
+
+    #[test]
     fn vertical_comic_breaks_use_the_balloon_body_instead_of_its_tail() {
         let segments = [LineBreakMeasure {
             advance: 60.0,
@@ -2962,6 +3887,7 @@ mod tests {
                 },
             ],
             minimum_air: 0.0,
+            preferred_block_center: None,
         };
 
         let profiles = balloon
@@ -2998,16 +3924,20 @@ mod tests {
                 },
             ],
             minimum_air: 0.0,
+            preferred_block_center: None,
         };
         let line_ink = InkBand {
             before: 5.0,
             after: 5.0,
         };
+        let preferred_center =
+            balloon.preferred_block_center(WritingMode::Horizontal, balloon.height);
         let candidates =
             balloon.line_profile_candidates(WritingMode::Horizontal, 5, 20.0, line_ink, 0.0, 0.0);
 
         assert!(candidates.len() > 1);
-        assert!((candidates[0][0].block_baseline - 40.0).abs() < 0.01);
+        let first_block_center = candidates[0][0].block_baseline + 40.0;
+        assert_approx_eq(first_block_center, preferred_center);
         assert!(candidates.iter().any(|profiles| {
             (profiles[0].block_baseline - candidates[0][0].block_baseline).abs() >= 10.0
         }));
@@ -3038,6 +3968,7 @@ mod tests {
                 },
             ],
             minimum_air: 0.0,
+            preferred_block_center: None,
         };
 
         assert_eq!(
@@ -3062,6 +3993,7 @@ mod tests {
                 },
             ],
             minimum_air: 0.0,
+            preferred_block_center: None,
         };
 
         assert_eq!(
@@ -3105,25 +4037,177 @@ mod tests {
     }
 
     #[test]
-    fn comic_auto_fit_uses_a_smaller_clean_setting_before_hyphenating() -> anyhow::Result<()> {
+    fn comic_auto_fit_hyphenates_one_word_for_a_larger_raster_size() -> anyhow::Result<()> {
         let font = any_system_font();
+        let text = "prosperity";
+        let layout = |policy| {
+            TextLayout::new(&font)
+                .with_min_font_size(9.0)
+                .with_max_font_size(24.0)
+                .with_hyphenation_language_tag("en")
+                .with_hyphenation_policy(policy)
+                .with_alignment(TextAlign::Center)
+                .with_max_width(80.0)
+                .with_max_height(100.0)
+                .with_comic_balloon(
+                    80.0,
+                    100.0,
+                    vec![(0.0, 0.0), (80.0, 0.0), (80.0, 100.0), (0.0, 100.0)],
+                    0.0,
+                )
+                .run(text)
+        };
+        let clean = layout(HyphenationPolicy::Disabled)?;
+        let last_resort = layout(HyphenationPolicy::LastResort)?;
+
+        assert!(
+            last_resort.font_size.floor() > clean.font_size.floor(),
+            "clean size {}, LastResort size {}",
+            clean.font_size,
+            last_resort.font_size
+        );
+        assert!(last_resort.lines.windows(2).any(|lines| {
+            let boundary = lines[0].range.end;
+            boundary > 0
+                && boundary < text.len()
+                && text[..boundary]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphabetic)
+                && text[lines[1].range.start..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphabetic)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn comic_quality_prefers_clean_words_inside_the_small_size_window() {
+        let font = any_system_font();
+        let text = "prosperity";
+        let candidate = |font_size, ranges: &[std::ops::Range<usize>]| LayoutRun {
+            lines: ranges
+                .iter()
+                .cloned()
+                .map(|range| LayoutLine {
+                    range,
+                    ..LayoutLine::default()
+                })
+                .collect(),
+            width: 60.0,
+            height: 60.0,
+            font_size,
+            overflowed: false,
+            placement_offset_x: 0.0,
+            placement_offset_y: 0.0,
+        };
+        let larger = candidate(20.0, &[0..4, 4..7, 7..text.len()]);
+        let clean = candidate(18.0, &[0..text.len()]);
+        let layout = TextLayout::new(&font).with_comic_balloon(
+            80.0,
+            80.0,
+            vec![(0.0, 0.0), (80.0, 0.0), (80.0, 80.0), (0.0, 80.0)],
+            0.0,
+        );
+        let selected = layout.preferred_comic_quality(text, &[larger, clean]);
+
+        assert_eq!(selected.font_size, 18.0);
+        assert_eq!(discretionary_hyphen_count(text, &selected.lines), 0);
+        assert_eq!(quality_font_reduction(20.0), 4.0);
+        assert_eq!(quality_font_reduction(40.0), 4.0);
+        assert_approx_eq(
+            fragmentation_quality_font_reduction("one split", 40.0, 1),
+            40.0 / 3.0,
+        );
+        assert_eq!(
+            fragmentation_quality_font_reduction("one split inside a longer caption", 40.0, 1),
+            4.0
+        );
+        assert_approx_eq(
+            fragmentation_quality_font_reduction("several fragmented words", 40.0, 3),
+            40.0 / 3.0,
+        );
+    }
+
+    #[test]
+    fn comic_quality_uses_only_a_small_font_trade_for_materially_better_centering() {
+        let font = any_system_font();
+        let candidate = |font_size, placement_offset_y| LayoutRun {
+            lines: vec![LayoutLine {
+                range: 0..4,
+                ..LayoutLine::default()
+            }],
+            width: 40.0,
+            height: 20.0,
+            font_size,
+            overflowed: false,
+            placement_offset_x: 0.0,
+            placement_offset_y,
+        };
+        let larger = candidate(20.0, 0.0);
+        let centered = candidate(19.0, 9.0);
+        let too_small = candidate(17.0, 10.0);
         let layout = TextLayout::new(&font)
-            .with_min_font_size(9.0)
-            .with_max_font_size(24.0)
-            .with_hyphenation_policy(HyphenationPolicy::LastResort)
-            .with_alignment(TextAlign::Center)
-            .with_max_width(80.0)
-            .with_max_height(100.0)
             .with_comic_balloon(
                 80.0,
-                100.0,
-                vec![(0.0, 0.0), (80.0, 0.0), (80.0, 100.0), (0.0, 100.0)],
+                80.0,
+                vec![(0.0, 0.0), (80.0, 0.0), (80.0, 80.0), (0.0, 80.0)],
                 0.0,
             )
-            .run("prosperity")?;
+            .with_comic_preferred_block_center(50.0);
 
-        assert_eq!(layout.lines.len(), 1);
-        assert!(layout.font_size < 24.0);
+        let selected = layout.preferred_comic_quality("text", &[larger, centered, too_small]);
+
+        assert_eq!(selected.font_size, 19.0);
+        assert_eq!(layout.comic_center_error(&selected), 1.0);
+    }
+
+    #[test]
+    fn comic_auto_fit_keeps_text_in_the_source_lobe_of_a_touching_region() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "Başta Haruto'ya karşı iğrenti duymuştum ama";
+        let width = 255.0;
+        let height = 637.0;
+        let source_center = 491.0;
+        let contour = vec![
+            (99.0, 0.0),
+            (255.0, 0.0),
+            (255.0, 338.0),
+            (142.0, 338.0),
+            (142.0, 637.0),
+            (0.0, 637.0),
+            (0.0, 338.0),
+            (99.0, 338.0),
+        ];
+        let base = || {
+            TextLayout::new(&font)
+                .with_min_font_size(12.0)
+                .with_max_font_size(27.0)
+                .with_line_height(1.2)
+                .with_hyphenation_language_tag("tr-TR")
+                .with_hyphenation_policy(HyphenationPolicy::LastResort)
+                .with_alignment(TextAlign::Center)
+                .with_max_width(width)
+                .with_max_height(height)
+                .with_comic_balloon(width, height, contour.clone(), 0.0)
+        };
+        let unconstrained = base().run(text)?;
+        let source_local = base()
+            .with_comic_preferred_block_center(source_center)
+            .run(text)?;
+        let unconstrained_center = height * 0.5 + unconstrained.placement_offset_y();
+        let source_local_center = height * 0.5 + source_local.placement_offset_y();
+
+        assert!(!source_local.overflowed());
+        assert!(
+            (source_local_center - source_center).abs()
+                <= source_local.font_size * COMIC_CENTER_ERROR_TOLERANCE_EM + 0.01
+        );
+        assert!(
+            unconstrained_center + unconstrained.font_size * 2.0 < source_local_center,
+            "unconstrained center {unconstrained_center}, source-local center {source_local_center}"
+        );
         Ok(())
     }
 
@@ -3190,9 +4274,13 @@ mod tests {
         segments[2].break_penalty = 500.0;
 
         assert_eq!(optimal_line_breaks(&segments, 90.0), vec![2, 5]);
-        assert!(comic_break_penalty("Stop! Now", 6) < comic_break_penalty("go and", 3));
-        assert!(comic_break_penalty("go and", 3) < comic_break_penalty("hello world", 6));
-        assert!(comic_break_penalty("hello world", 6) < comic_break_penalty("the word", 4));
+        assert!(natural_break_penalty("Stop! Now", 6) < natural_break_penalty("go and", 3));
+        assert!(natural_break_penalty("go and", 3) < natural_break_penalty("hello world", 6));
+        assert!(natural_break_penalty("hello world", 6) < natural_break_penalty("the word", 4));
+        assert!(has_internal_natural_pause("Wait~ Next"));
+        assert!(natural_pause_at("Wait~ Next", 6));
+        assert!(has_internal_natural_pause("Wait... Next"));
+        assert!(!has_internal_natural_pause("Finished..."));
     }
 
     #[test]
@@ -3327,6 +4415,67 @@ mod tests {
     }
 
     #[test]
+    fn comic_rectangular_preflight_preserves_alternate_legal_line_counts() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let minimum = 10.0;
+        let maximum = 48.0;
+        let spacing = -2.0;
+        let preflight_line = "letter letter letter letter";
+        let measured = TextLayout::new(&font)
+            .with_font_size(minimum)
+            .with_spacing(spacing, 0.0)
+            .run(preflight_line)?;
+        let width = (measured.lines[0].advance + measured.width) * 0.5;
+        assert!(measured.lines[0].advance < width && width < measured.width);
+        let height = 240.0;
+        let text = "letter letter letter letter letter letter letter letter";
+        let rectangle = vec![(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)];
+        let base = || {
+            TextLayout::new(&font)
+                .with_max_width(width)
+                .with_max_height(height)
+                .with_spacing(spacing, 0.0)
+                .with_hyphenation_policy(HyphenationPolicy::Disabled)
+        };
+        let uniform = base()
+            .with_max_font_size(maximum)
+            .with_min_font_size(minimum)
+            .run(text)?;
+        assert_eq!(uniform.font_size, minimum);
+        assert!(uniform.overflowed());
+
+        let comic = base().with_comic_balloon(width, height, rectangle, 0.0);
+        let minimum_comic = comic.clone().with_font_size(minimum).run(text)?;
+        let envelope = comic.comic_rectangular_search_maximum(
+            text,
+            minimum,
+            maximum,
+            HyphenationPolicy::Disabled,
+        )?;
+        let fitted = comic
+            .with_max_font_size(maximum)
+            .with_min_font_size(minimum)
+            .run(text)?;
+
+        assert!(
+            !fitted.overflowed(),
+            "measured advance {}, measured ink {}, width {}, minimum comic {}x{} lines={} overflow={}, fitted size {} lines={}",
+            measured.lines[0].advance,
+            measured.width,
+            width,
+            minimum_comic.width,
+            minimum_comic.height,
+            minimum_comic.lines.len(),
+            minimum_comic.overflowed(),
+            fitted.font_size,
+            fitted.lines.len(),
+        );
+        assert!(fitted.font_size.floor() > minimum);
+        assert!(envelope + f32::EPSILON >= fitted.font_size.ceil());
+        Ok(())
+    }
+
+    #[test]
     fn comic_auto_fit_hyphenates_at_the_readability_floor() -> anyhow::Result<()> {
         let font = any_system_font();
         let text = "For the villagers, it's a common occurrence.";
@@ -3338,12 +4487,12 @@ mod tests {
                 .with_hyphenation_language_tag("en")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
-                .with_max_width(68.0)
-                .with_max_height(218.0)
+                .with_max_width(60.0)
+                .with_max_height(180.0)
                 .with_comic_balloon(
-                    68.0,
-                    218.0,
-                    vec![(0.0, 0.0), (68.0, 0.0), (68.0, 218.0), (0.0, 218.0)],
+                    60.0,
+                    180.0,
+                    vec![(0.0, 0.0), (60.0, 0.0), (60.0, 180.0), (0.0, 180.0)],
                     4.0,
                 )
                 .run(text)
@@ -3352,7 +4501,54 @@ mod tests {
         let last_resort = layout(HyphenationPolicy::LastResort)?;
 
         assert_eq!(clean.font_size.floor(), 9.0);
-        assert!(last_resort.font_size.floor() > clean.font_size.floor());
+        assert!(
+            last_resort.font_size.floor() > clean.font_size.floor(),
+            "clean size {} ({} lines), LastResort size {} ({} lines)",
+            clean.font_size,
+            clean.lines.len(),
+            last_resort.font_size,
+            last_resort.lines.len()
+        );
+        assert!(last_resort.lines.windows(2).any(|lines| {
+            let before = text[..lines[0].range.end].chars().next_back();
+            let after = text[lines[1].range.start..].chars().next();
+            matches!((before, after), (Some(left), Some(right)) if left.is_alphabetic() && right.is_alphabetic())
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn turkish_comic_auto_fit_recovers_a_larger_raster_size() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "Artan hayat pahalılığı karşısında sorumluluklarımızı düşünmeliyiz.";
+        let layout = |policy| {
+            TextLayout::new(&font)
+                .with_max_font_size(80.0)
+                .with_min_font_size(9.0)
+                .with_line_height(1.2)
+                .with_hyphenation_language_tag("tr-TR")
+                .with_hyphenation_policy(policy)
+                .with_alignment(TextAlign::Center)
+                .with_max_width(68.0)
+                .with_max_height(180.0)
+                .with_comic_balloon(
+                    68.0,
+                    180.0,
+                    vec![(0.0, 0.0), (68.0, 0.0), (68.0, 180.0), (0.0, 180.0)],
+                    4.0,
+                )
+                .run(text)
+        };
+        let clean = layout(HyphenationPolicy::Disabled)?;
+        let last_resort = layout(HyphenationPolicy::LastResort)?;
+
+        assert!(!last_resort.overflowed());
+        assert!(
+            last_resort.font_size.floor() > clean.font_size.floor(),
+            "clean size {}, LastResort size {}",
+            clean.font_size,
+            last_resort.font_size
+        );
         assert!(last_resort.lines.windows(2).any(|lines| {
             let before = text[..lines[0].range.end].chars().next_back();
             let after = text[lines[1].range.start..].chars().next();
@@ -3368,17 +4564,17 @@ mod tests {
         let text = "A cat tower?";
         let layout = |policy| {
             TextLayout::new(&font)
-                .with_max_font_size(80.0)
+                .with_max_font_size(24.0)
                 .with_min_font_size(8.0)
                 .with_hyphenation_language_tag("en")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
-                .with_max_width(80.0)
-                .with_max_height(160.0)
+                .with_max_width(220.0)
+                .with_max_height(120.0)
                 .with_comic_balloon(
-                    80.0,
-                    160.0,
-                    vec![(0.0, 0.0), (80.0, 0.0), (80.0, 160.0), (0.0, 160.0)],
+                    220.0,
+                    120.0,
+                    vec![(0.0, 0.0), (220.0, 0.0), (220.0, 120.0), (0.0, 120.0)],
                     4.0,
                 )
                 .run(text)
@@ -3387,7 +4583,15 @@ mod tests {
         let hyphenated = layout(HyphenationPolicy::LastResort)?;
 
         assert!(!hyphenated.overflowed());
-        assert!((hyphenated.font_size - unhyphenated.font_size).abs() < 0.01);
+        assert_eq!(unhyphenated.font_size, 24.0);
+        assert!(
+            (hyphenated.font_size - unhyphenated.font_size).abs() < 0.01,
+            "clean size {} ({} lines), LastResort size {} ({} lines)",
+            unhyphenated.font_size,
+            unhyphenated.lines.len(),
+            hyphenated.font_size,
+            hyphenated.lines.len()
+        );
         let tower = text.find("tower").unwrap();
         assert!(
             !hyphenated
@@ -3493,12 +4697,99 @@ mod tests {
     }
 
     #[test]
-    fn comic_balloon_air_uses_the_visible_ink_height_and_explicit_floor() {
+    fn comic_balloon_air_preserves_the_representative_extent_and_explicit_floor() {
         let balloon = comic_balloon(100.0, 100.0, Vec::new(), 4.0);
 
         assert_approx_eq(balloon.air(12.0), 12.0);
         assert_approx_eq(balloon.air(24.0), 24.0);
         assert_approx_eq(balloon.air(3.0), 4.0);
+    }
+
+    #[test]
+    fn comic_wall_air_uses_axis_specific_font_extents() -> anyhow::Result<()> {
+        let mut fonts = FontSystem::new();
+        let font = ["Arial", "DejaVu Sans", "Liberation Sans"]
+            .into_iter()
+            .find_map(|family| fonts.query_family(family).ok())
+            .expect("a proportional Latin test font should be available");
+        let font_size = 24.0;
+        let metrics = font
+            .skrifa_ref()?
+            .metrics(Size::new(font_size), font.location());
+        let average_width = metrics
+            .average_width
+            .expect("test font should expose an OpenType average width");
+
+        let horizontal_plain = TextLayout::new(&font).with_font_size(font_size).run("H")?;
+        let horizontal_advance = horizontal_plain.lines[0].advance;
+        assert!(horizontal_plain.height - 2.0 > average_width + 0.25);
+        let horizontal_width = horizontal_advance + average_width * 2.0 + 0.5;
+        let horizontal_height = font_size * 5.0;
+        let horizontal = TextLayout::new(&font)
+            .with_font_size(font_size)
+            .with_max_width(horizontal_width)
+            .with_max_height(horizontal_height)
+            .with_comic_balloon(
+                horizontal_width,
+                horizontal_height,
+                vec![
+                    (0.0, 0.0),
+                    (horizontal_width, 0.0),
+                    (horizontal_width, horizontal_height),
+                    (0.0, horizontal_height),
+                ],
+                0.0,
+            )
+            .run("H")?;
+        assert!(!horizontal.overflowed());
+
+        let vertical_plain = TextLayout::new(&font)
+            .with_font_size(font_size)
+            .with_writing_mode(WritingMode::VerticalRl)
+            .run("H")?;
+        let vertical_advance = vertical_plain.lines[0].advance;
+        assert!(vertical_advance > average_width + 0.25);
+        let vertical_width = font_size * 5.0;
+        let insufficient_height = vertical_advance + average_width * 2.0 + 0.5;
+        let constrained = TextLayout::new(&font)
+            .with_font_size(font_size)
+            .with_writing_mode(WritingMode::VerticalRl)
+            .with_max_width(vertical_width)
+            .with_max_height(insufficient_height)
+            .with_comic_balloon(
+                vertical_width,
+                insufficient_height,
+                vec![
+                    (0.0, 0.0),
+                    (vertical_width, 0.0),
+                    (vertical_width, insufficient_height),
+                    (0.0, insufficient_height),
+                ],
+                0.0,
+            )
+            .run("H")?;
+        assert!(constrained.overflowed());
+
+        let sufficient_height = vertical_advance * 3.0 + 0.5;
+        let vertical = TextLayout::new(&font)
+            .with_font_size(font_size)
+            .with_writing_mode(WritingMode::VerticalRl)
+            .with_max_width(vertical_width)
+            .with_max_height(sufficient_height)
+            .with_comic_balloon(
+                vertical_width,
+                sufficient_height,
+                vec![
+                    (0.0, 0.0),
+                    (vertical_width, 0.0),
+                    (vertical_width, sufficient_height),
+                    (0.0, sufficient_height),
+                ],
+                0.0,
+            )
+            .run("H")?;
+        assert!(!vertical.overflowed());
+        Ok(())
     }
 
     #[test]

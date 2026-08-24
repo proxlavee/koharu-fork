@@ -28,6 +28,7 @@ target/
 
 # Datasets
 /data
+/test-images/
 
 # model results
 /runs
