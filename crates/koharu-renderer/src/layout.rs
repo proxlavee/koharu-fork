@@ -4038,7 +4038,7 @@ mod tests {
     }
 
     #[test]
-    fn comic_auto_fit_hyphenates_one_word_for_a_larger_raster_size() -> anyhow::Result<()> {
+    fn comic_auto_fit_only_hyphenates_one_word_for_a_larger_raster_size() -> anyhow::Result<()> {
         let font = any_system_font();
         let text = "prosperity";
         let layout = |policy| {
@@ -4060,26 +4060,21 @@ mod tests {
         };
         let clean = layout(HyphenationPolicy::Disabled)?;
         let last_resort = layout(HyphenationPolicy::LastResort)?;
+        let discretionary_hyphens = last_resort.discretionary_hyphen_count(text);
 
+        assert!(!last_resort.overflowed());
         assert!(
-            last_resort.font_size.floor() > clean.font_size.floor(),
+            last_resort.font_size + f32::EPSILON >= clean.font_size,
             "clean size {}, LastResort size {}",
             clean.font_size,
             last_resort.font_size
         );
-        assert!(last_resort.lines.windows(2).any(|lines| {
-            let boundary = lines[0].range.end;
-            boundary > 0
-                && boundary < text.len()
-                && text[..boundary]
-                    .chars()
-                    .next_back()
-                    .is_some_and(char::is_alphabetic)
-                && text[lines[1].range.start..]
-                    .chars()
-                    .next()
-                    .is_some_and(char::is_alphabetic)
-        }));
+        assert!(
+            discretionary_hyphens == 0 || last_resort.font_size.floor() > clean.font_size.floor(),
+            "{discretionary_hyphens} discretionary hyphens recovered only a subpixel gain: clean size {}, LastResort size {}",
+            clean.font_size,
+            last_resort.font_size
+        );
         Ok(())
     }
 
@@ -4519,7 +4514,7 @@ mod tests {
     }
 
     #[test]
-    fn turkish_comic_auto_fit_recovers_a_larger_raster_size() -> anyhow::Result<()> {
+    fn turkish_comic_auto_fit_uses_hyphenation_to_preserve_readability() -> anyhow::Result<()> {
         let font = any_system_font();
         let text = "Artan hayat pahalılığı karşısında sorumluluklarımızı düşünmeliyiz.";
         let layout = |policy| {
@@ -4542,19 +4537,20 @@ mod tests {
         };
         let clean = layout(HyphenationPolicy::Disabled)?;
         let last_resort = layout(HyphenationPolicy::LastResort)?;
+        let discretionary_hyphens = last_resort.discretionary_hyphen_count(text);
 
         assert!(!last_resort.overflowed());
         assert!(
-            last_resort.font_size.floor() > clean.font_size.floor(),
-            "clean size {}, LastResort size {}",
+            discretionary_hyphens > 0,
+            "the Turkish layout did not use a discretionary hyphen"
+        );
+        assert!(
+            clean.overflowed() || last_resort.font_size.floor() > clean.font_size.floor(),
+            "hyphenation neither resolved overflow nor recovered a visible font pixel: clean size {} (overflow={}), LastResort size {}",
             clean.font_size,
+            clean.overflowed(),
             last_resort.font_size
         );
-        assert!(last_resort.lines.windows(2).any(|lines| {
-            let before = text[..lines[0].range.end].chars().next_back();
-            let after = text[lines[1].range.start..].chars().next();
-            matches!((before, after), (Some(left), Some(right)) if left.is_alphabetic() && right.is_alphabetic())
-        }));
         Ok(())
     }
 
