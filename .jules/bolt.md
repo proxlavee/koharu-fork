@@ -1,0 +1,3 @@
+## 2025-05-18 - Replacing O(N^2) Layer Lookups with Hash Maps
+**Learning:** In operations dealing with layered document data structures (`expandLayerSelection`, `effectiveLayerVisibility`, `hitTestLayers`), using array iteration methods like `find()` and `filter()` within recursive or looping bounds resulted in serious O(N^2) bottlenecks when traversing complex hierarchies.
+**Action:** Next time working with similar hierarchical node traversals where nodes have parental relationships defined by IDs, always construct a `Map<string, Node>` and/or `Map<string, Node[]>` before the traversal pass. This guarantees O(1) resolutions for traversing up (parents) and down (children), preventing rendering bottlenecks as scene graphs grow.
