@@ -1759,9 +1759,10 @@ impl<'a> TextLayout<'a> {
 }
 
 pub(crate) fn quality_font_reduction(font_size: f32) -> f32 {
-    (font_size * COMIC_QUALITY_FONT_REDUCTION_RATIO)
-        .max(COMIC_QUALITY_FONT_REDUCTION_MIN)
-        .min(COMIC_QUALITY_FONT_REDUCTION_MAX)
+    (font_size * COMIC_QUALITY_FONT_REDUCTION_RATIO).clamp(
+        COMIC_QUALITY_FONT_REDUCTION_MIN,
+        COMIC_QUALITY_FONT_REDUCTION_MAX,
+    )
 }
 
 pub(crate) fn fragmentation_quality_font_reduction(

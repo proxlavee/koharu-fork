@@ -392,18 +392,6 @@ fn replaceable_text_entity(
         }
         return match entity_lifecycle(snapshot, entity)? {
             Some(origin) if generated_by(&origin, producer) => Ok(true),
-            Some(Origin::User) => {
-                let Some(presents) = snapshot.relation_from::<Presents>(entity)? else {
-                    return Ok(false);
-                };
-                promoted_machine_graph_is_replaceable(
-                    snapshot,
-                    entity,
-                    presents.value().target,
-                    presents.id(),
-                    producer,
-                )
-            }
             _ => Ok(false),
         };
     }
@@ -413,21 +401,6 @@ fn replaceable_text_entity(
         }
         return match entity_lifecycle(snapshot, entity)? {
             Some(origin) if generated_by(&origin, producer) => Ok(true),
-            Some(Origin::User) => {
-                let presents = snapshot
-                    .relations_to_as::<Presents>(entity)
-                    .collect::<Vec<_>>();
-                if presents.len() != 1 {
-                    return Ok(false);
-                }
-                promoted_machine_graph_is_replaceable(
-                    snapshot,
-                    presents[0].value().source,
-                    entity,
-                    presents[0].id(),
-                    producer,
-                )
-            }
             _ => Ok(false),
         };
     }
@@ -475,46 +448,6 @@ fn generated_component_or_absent<T: Component>(
     Ok(snapshot
         .component::<T>(entity)?
         .is_none_or(|value| matches!(value.origin(), Some(Origin::Generated(_)))))
-}
-
-fn promoted_machine_graph_is_replaceable(
-    snapshot: &koharu_scene::Snapshot,
-    layer: EntityId,
-    content: EntityId,
-    presents: koharu_scene::RelationId,
-    producer: &ProducerId,
-) -> Result<bool> {
-    if !matches!(entity_lifecycle(snapshot, layer)?, Some(Origin::User))
-        || !matches!(entity_lifecycle(snapshot, content)?, Some(Origin::User))
-        || !machine_owned_layer_components(snapshot, layer, producer)?
-        || !machine_owned_content_components(snapshot, content, producer)?
-        || !generated_by(&snapshot.relation(presents)?.value().origin, producer)
-    {
-        return Ok(false);
-    }
-
-    let Some(recognized) = snapshot.relation_from::<RecognizedFrom>(content)? else {
-        return Ok(false);
-    };
-    if !generated_by(
-        &snapshot.relation(recognized.id())?.value().origin,
-        producer,
-    ) || !entity_owned_by(snapshot, recognized.value().target, producer)?
-    {
-        return Ok(false);
-    }
-
-    let fits = snapshot.relation_from::<FitsTo>(layer)?;
-    let flows = snapshot.relation_from::<FlowsIn>(layer)?;
-    let automatic = match (fits, flows) {
-        (Some(relation), None) => relation,
-        (None, Some(relation)) => relation,
-        _ => return Ok(false),
-    };
-    Ok(
-        generated_by(&snapshot.relation(automatic.id())?.value().origin, producer)
-            && entity_owned_by(snapshot, automatic.value().target, producer)?,
-    )
 }
 
 async fn write_page(
@@ -2352,7 +2285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detection_reprocesses_a_promoted_graph_only_while_its_state_remains_generated() {
+    async fn detection_protects_a_user_promoted_graph_before_component_edits() {
         let mut session = Session::memory().await.unwrap();
         let mut page = None;
         let create = session
@@ -2403,31 +2336,11 @@ mod tests {
             None,
         );
 
-        assert!(!processor.skip(&input).unwrap());
-
-        let user_translation = snapshot
-            .patch(|edit| {
-                edit.set(
-                    content,
-                    &Translation {
-                        text: Authored::user("edited translation".to_owned()),
-                        language: None,
-                    },
-                )
-            })
-            .unwrap();
-        let snapshot = session.commit(user_translation).await.unwrap().snapshot;
-        let input = StageInput::new(
-            snapshot,
-            page,
-            None,
-            None,
-            std::sync::Arc::new(crate::ImageCache::default()),
-            None,
-        );
-
         let error = processor.skip(&input).unwrap_err().to_string();
-        assert!(error.contains("translation"), "{error}");
+        assert!(
+            error.contains("user-owned layer placement or lifecycle"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -2501,18 +2414,6 @@ mod tests {
             .unwrap();
         let snapshot = session
             .commit(translation.finish().unwrap())
-            .await
-            .unwrap()
-            .snapshot;
-
-        let promoted_machine_graph = snapshot
-            .patch(|edit| {
-                edit.promote_entity_to_user(owned_graph.2)?;
-                edit.promote_entity_to_user(owned_graph.1)
-            })
-            .unwrap();
-        let snapshot = session
-            .commit(promoted_machine_graph)
             .await
             .unwrap()
             .snapshot;
