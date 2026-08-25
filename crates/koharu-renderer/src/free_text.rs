@@ -36,6 +36,21 @@ pub(crate) struct FreeTextSpace {
     obstacles: Vec<SpatialRegion>,
 }
 
+struct InlineCorridor<'a> {
+    source: EntityId,
+    source_site: (f32, f32),
+    source_target_frame: GeometryFrame,
+    writing_mode: WritingMode,
+    container: &'a [(f32, f32)],
+    panels_are_obstacles: bool,
+    clearance: f32,
+}
+
+struct InlineLimits {
+    minimum: f32,
+    maximum: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FreeTextCandidate {
     /// Candidate layout rectangle in the detected source frame's local space.
@@ -129,18 +144,18 @@ impl FreeTextSpace {
             inline_extent(source_frame, source_writing_mode),
             block_extent(source_frame, source_writing_mode),
         );
+        let corridor = InlineCorridor {
+            source,
+            source_site: source_center,
+            source_target_frame,
+            writing_mode: target_writing_mode,
+            container: &container,
+            panels_are_obstacles: panel.is_none(),
+            clearance: clearance.max(0.0),
+        };
         let mut push_candidate = |target_frame: GeometryFrame, expand_inline: bool| {
-            let Some(frame) = self.fit_inline_corridor(
-                source,
-                source_center,
-                source_target_frame,
-                target_frame,
-                target_writing_mode,
-                &container,
-                panel.is_none(),
-                clearance,
-                expand_inline,
-            ) else {
+            let Some(frame) = self.fit_inline_corridor(&corridor, target_frame, expand_inline)
+            else {
                 return;
             };
             let center = (
@@ -203,16 +218,12 @@ impl FreeTextSpace {
 
     fn fit_inline_corridor(
         &self,
-        source: EntityId,
-        source_site: (f32, f32),
-        source_target_frame: GeometryFrame,
+        corridor: &InlineCorridor<'_>,
         target_frame: GeometryFrame,
-        target_writing_mode: WritingMode,
-        container: &[(f32, f32)],
-        panels_are_obstacles: bool,
-        clearance: f32,
         expand_inline: bool,
     ) -> Option<GeometryFrame> {
+        let target_writing_mode = corridor.writing_mode;
+        let container = corridor.container;
         let target_inline_extent = inline_extent(target_frame, target_writing_mode);
         let target_block_extent = block_extent(target_frame, target_writing_mode);
         let (container_minimum, container_maximum) =
@@ -227,30 +238,29 @@ impl FreeTextSpace {
         ) {
             return None;
         }
-        let mut minimum = search_minimum(
-            target_frame,
-            target_writing_mode,
-            container,
-            container_minimum,
-            anchor_inline,
-        );
-        let mut maximum = search_maximum(
-            target_frame,
-            target_writing_mode,
-            container,
-            anchor_inline,
-            container_maximum,
-        );
-
-        let clearance = clearance.max(0.0);
-        minimum += clearance;
-        maximum -= clearance;
-        if anchor_inline < minimum || anchor_inline > maximum {
+        let clearance = corridor.clearance;
+        let mut limits = InlineLimits {
+            minimum: search_minimum(
+                target_frame,
+                target_writing_mode,
+                container,
+                container_minimum,
+                anchor_inline,
+            ) + clearance,
+            maximum: search_maximum(
+                target_frame,
+                target_writing_mode,
+                container,
+                anchor_inline,
+                container_maximum,
+            ) - clearance,
+        };
+        if anchor_inline < limits.minimum || anchor_inline > limits.maximum {
             return None;
         }
 
         for text_site in &self.text_sites {
-            if text_site.entity == source {
+            if text_site.entity == corridor.source {
                 continue;
             }
             let Some(site) = geometry_site(&text_site.geometry) else {
@@ -259,28 +269,20 @@ impl FreeTextSpace {
             if !polygon_contains_point(container, site) {
                 continue;
             }
-            constrain_to_text_site_cell(
-                target_frame,
-                target_writing_mode,
-                source_target_frame,
-                source_site,
-                clearance,
-                text_site,
-                &mut minimum,
-                &mut maximum,
-            )?;
-            if anchor_inline < minimum || anchor_inline > maximum {
+            constrain_to_text_site_cell(target_frame, corridor, text_site, &mut limits)?;
+            if anchor_inline < limits.minimum || anchor_inline > limits.maximum {
                 return None;
             }
         }
 
         for obstacle in self.obstacles.iter().chain(
-            panels_are_obstacles
+            corridor
+                .panels_are_obstacles
                 .then_some(self.panels.iter())
                 .into_iter()
                 .flatten(),
         ) {
-            if obstacle.entity == source {
+            if obstacle.entity == corridor.source {
                 continue;
             }
             let Some(bounds) = projected_bounds(target_frame, &obstacle.geometry) else {
@@ -316,15 +318,15 @@ impl FreeTextSpace {
                 continue;
             }
             if obstacle_maximum <= anchor_inline {
-                minimum = minimum.max(obstacle_maximum + clearance);
+                limits.minimum = limits.minimum.max(obstacle_maximum + clearance);
             } else if obstacle_minimum >= anchor_inline {
-                maximum = maximum.min(obstacle_minimum - clearance);
+                limits.maximum = limits.maximum.min(obstacle_minimum - clearance);
             } else {
                 return None;
             }
         }
 
-        let available_inline_extent = maximum - minimum;
+        let available_inline_extent = limits.maximum - limits.minimum;
         if available_inline_extent < MINIMUM_USEFUL_INLINE_EXTENT {
             return None;
         }
@@ -335,8 +337,8 @@ impl FreeTextSpace {
         };
         let local_inline_start = clamp_interval_start(
             anchor_inline - inline_extent * 0.5,
-            minimum,
-            maximum - inline_extent,
+            limits.minimum,
+            limits.maximum - inline_extent,
         );
         let (local_left, local_top, width, height) = if target_writing_mode.is_vertical() {
             (0.0, local_inline_start, target_block_extent, inline_extent)
@@ -505,14 +507,12 @@ fn geometry_site(geometry: &Geometry) -> Option<(f32, f32)> {
 
 fn constrain_to_text_site_cell(
     candidate: GeometryFrame,
-    writing_mode: WritingMode,
-    source_target_frame: GeometryFrame,
-    source_site: (f32, f32),
-    clearance: f32,
+    corridor: &InlineCorridor<'_>,
     other: &FreeTextSite,
-    minimum: &mut f32,
-    maximum: &mut f32,
+    limits: &mut InlineLimits,
 ) -> Option<()> {
+    let writing_mode = corridor.writing_mode;
+    let clearance = corridor.clearance;
     let other_source_frame = geometry_frame(&other.geometry)?;
     let other_world_site = geometry_site(&other.geometry)?;
     let other_target_frame = logical_frame(
@@ -531,15 +531,14 @@ fn constrain_to_text_site_cell(
         return constrain_to_site_cell(
             candidate,
             writing_mode,
-            source_site,
+            corridor.source_site,
             other_world_site,
             clearance,
-            minimum,
-            maximum,
+            limits,
         );
     }
 
-    let source_bounds = projected_frame_bounds(candidate, source_target_frame)?;
+    let source_bounds = projected_frame_bounds(candidate, corridor.source_target_frame)?;
     let other_bounds = projected_frame_bounds(candidate, other_target_frame)?;
     let (_, _, source_block_minimum, source_block_maximum) =
         logical_bounds(source_bounds, writing_mode);
@@ -569,7 +568,8 @@ fn constrain_to_text_site_cell(
         return (divider + clearance <= tolerance).then_some(());
     }
 
-    let source_local_site = point_in_frame(candidate, source_site.0, source_site.1);
+    let source_local_site =
+        point_in_frame(candidate, corridor.source_site.0, corridor.source_site.1);
     let other_local_site = point_in_frame(candidate, other_world_site.0, other_world_site.1);
     let (source_inline, other_inline) = if writing_mode.is_vertical() {
         (source_local_site.1, other_local_site.1)
@@ -581,20 +581,19 @@ fn constrain_to_text_site_cell(
         return constrain_to_site_cell(
             candidate,
             writing_mode,
-            source_site,
+            corridor.source_site,
             other_world_site,
             clearance,
-            minimum,
-            maximum,
+            limits,
         );
     }
     let divider = (source_inline + other_inline) * 0.5;
     if inline_delta > 0.0 {
-        *maximum = (*maximum).min(divider - clearance);
+        limits.maximum = limits.maximum.min(divider - clearance);
     } else {
-        *minimum = (*minimum).max(divider + clearance);
+        limits.minimum = limits.minimum.max(divider + clearance);
     }
-    (*maximum - *minimum >= MINIMUM_USEFUL_INLINE_EXTENT).then_some(())
+    (limits.maximum - limits.minimum >= MINIMUM_USEFUL_INLINE_EXTENT).then_some(())
 }
 
 fn projected_frame_bounds(reference: GeometryFrame, frame: GeometryFrame) -> Option<LayoutBox> {
@@ -659,8 +658,7 @@ fn constrain_to_site_cell(
     source: (f32, f32),
     other: (f32, f32),
     clearance: f32,
-    minimum: &mut f32,
-    maximum: &mut f32,
+    limits: &mut InlineLimits,
 ) -> Option<()> {
     let delta = (other.0 - source.0, other.1 - source.1);
     let distance = delta.0.hypot(delta.1);
@@ -687,13 +685,13 @@ fn constrain_to_site_cell(
     let tolerance = distance.max(block_extent).max(1.0) * f32::EPSILON * 32.0;
 
     if inline_coefficient > tolerance {
-        *maximum = (*maximum).min(inline_boundary / inline_coefficient);
+        limits.maximum = limits.maximum.min(inline_boundary / inline_coefficient);
     } else if inline_coefficient < -tolerance {
-        *minimum = (*minimum).max(inline_boundary / inline_coefficient);
+        limits.minimum = limits.minimum.max(inline_boundary / inline_coefficient);
     } else if inline_boundary < -tolerance {
         return None;
     }
-    (*maximum - *minimum >= MINIMUM_USEFUL_INLINE_EXTENT).then_some(())
+    (limits.maximum - limits.minimum >= MINIMUM_USEFUL_INLINE_EXTENT).then_some(())
 }
 
 fn projected_bounds(frame: GeometryFrame, geometry: &Geometry) -> Option<LayoutBox> {
