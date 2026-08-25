@@ -33,8 +33,8 @@ use crate::{
     RasterImage, RenderBounds, RenderDependency, RenderDiagnostic, Result, RetentionStats,
     TextAlign, TextMetadata, TypesettingConfig, WritingMode,
     bubble::{
-        GeometryFrame, LayoutBox, contour, flow_cells, geometry_bounds, geometry_frame,
-        point_in_frame,
+        GeometryFrame, LayoutBox, clip_half_plane, contour, flow_cells, geometry_bounds,
+        geometry_frame, point_in_frame, polygon_centroid, polygons_overlap,
     },
     fonts::{FontPreview, FontRequest, Fonts},
     frame::{
@@ -514,7 +514,7 @@ impl Renderer {
         let page_value = snapshot.page(page)?.page()?;
         let (width, height) = surface_size(&page_value)?;
         let source_role = AssetRole::new("source")?;
-        let flow_plan = resolve_balloon_flows(snapshot, page)?;
+        let flow_plan = resolve_balloon_flows(snapshot, page, width, height)?;
         let free_text_plan = resolve_free_text_space(snapshot, page, width, height)?;
         let mut traversal = Traversal {
             snapshot,
@@ -830,12 +830,13 @@ impl Traversal<'_> {
         } else {
             Vec::new()
         };
-        let flow_contour = if authored.is_none() {
+        let flow_contours = if authored.is_none() {
             placement
                 .as_ref()
-                .and_then(|placement| placement.flow_contour.clone())
+                .map(|placement| placement.flow_contours.clone())
+                .unwrap_or_default()
         } else {
-            None
+            Vec::new()
         };
         let preferred_center = if authored.is_none() {
             placement
@@ -896,7 +897,7 @@ impl Traversal<'_> {
             width: frame.bounds.width,
             height: frame.bounds.height,
             balloon_contour,
-            flow_contour,
+            flow_contours,
             preferred_block_center,
             free_text_candidates,
             automatic_free_text,
@@ -963,7 +964,7 @@ impl Traversal<'_> {
             geometry,
             frame,
             balloon_contour: None,
-            flow_contour: None,
+            flow_contours: Vec::new(),
             preferred_center: None,
             dependencies: Arc::from([]),
         }))
@@ -990,16 +991,16 @@ impl Traversal<'_> {
             return Ok(None);
         };
         let preferred_center = anchor_content
-            .map(|content| flow_anchor(self.snapshot, content, dependencies))
+            .map(|content| flow_source(self.snapshot, content, dependencies))
             .transpose()?
             .flatten()
-            .map(|anchor| local_flow_anchor(frame, anchor));
+            .map(|source| local_flow_anchor(frame, source.anchor));
         Ok(Some(ResolvedPlacement {
             target,
             balloon_contour: Some(contour(&geometry, frame)),
             geometry,
             frame,
-            flow_contour: None,
+            flow_contours: Vec::new(),
             preferred_center,
             dependencies: Arc::from([]),
         }))
@@ -1012,7 +1013,7 @@ struct ResolvedPlacement {
     geometry: Geometry,
     frame: GeometryFrame,
     balloon_contour: Option<Vec<(f32, f32)>>,
-    flow_contour: Option<Vec<(f32, f32)>>,
+    flow_contours: Vec<Vec<(f32, f32)>>,
     preferred_center: Option<(f32, f32)>,
     dependencies: Arc<[RenderDependency]>,
 }
@@ -1029,8 +1030,118 @@ struct FreeTextPlan {
 
 struct FlowSeed {
     layer: EntityId,
-    anchor: Option<(f32, f32)>,
+    source: Option<FlowSource>,
     dependencies: BTreeSet<RenderDependency>,
+}
+
+struct FlowSource {
+    anchor: (f32, f32),
+    footprint: Vec<(f32, f32)>,
+}
+
+struct BalloonFlowGroup {
+    balloon: EntityId,
+    geometry: Geometry,
+    frame: GeometryFrame,
+    contour: Vec<(f32, f32)>,
+    world_contour: Vec<(f32, f32)>,
+    ownership_anchor: (f32, f32),
+    seeds: Vec<FlowSeed>,
+    dependencies: BTreeSet<RenderDependency>,
+}
+
+#[derive(Clone, Copy)]
+struct OwnershipSeparator {
+    normal: (f32, f32),
+    offset: f32,
+}
+
+fn source_aware_separator(
+    first_sources: &[&FlowSource],
+    first_fallback: (f32, f32),
+    second_sources: &[&FlowSource],
+    second_fallback: (f32, f32),
+) -> Option<OwnershipSeparator> {
+    let mut nearest = None;
+    for &first in first_sources {
+        for &second in second_sources {
+            let dx = second.anchor.0 - first.anchor.0;
+            let dy = second.anchor.1 - first.anchor.1;
+            let distance_squared = dx * dx + dy * dy;
+            if !distance_squared.is_finite() {
+                continue;
+            }
+            let replaces_nearest = match nearest {
+                Some((_, _, nearest_distance)) => distance_squared < nearest_distance,
+                None => true,
+            };
+            if replaces_nearest {
+                nearest = Some((first, second, distance_squared));
+            }
+        }
+    }
+
+    let (mut first_anchor, mut second_anchor, mut first_footprint, mut second_footprint) =
+        if let Some((first, second, _)) = nearest {
+            (
+                first.anchor,
+                second.anchor,
+                first.footprint.as_slice(),
+                second.footprint.as_slice(),
+            )
+        } else {
+            (first_fallback, second_fallback, &[][..], &[][..])
+        };
+    let mut delta = (
+        second_anchor.0 - first_anchor.0,
+        second_anchor.1 - first_anchor.1,
+    );
+    let mut distance_squared = delta.0 * delta.0 + delta.1 * delta.1;
+    if !distance_squared.is_finite() || distance_squared <= f32::EPSILON {
+        first_anchor = first_fallback;
+        second_anchor = second_fallback;
+        first_footprint = &[];
+        second_footprint = &[];
+        delta = (
+            second_anchor.0 - first_anchor.0,
+            second_anchor.1 - first_anchor.1,
+        );
+        distance_squared = delta.0 * delta.0 + delta.1 * delta.1;
+    }
+    if !distance_squared.is_finite() || distance_squared <= f32::EPSILON {
+        return None;
+    }
+
+    let inverse_distance = distance_squared.sqrt().recip();
+    let normal = (delta.0 * inverse_distance, delta.1 * inverse_distance);
+    let projection = |point: (f32, f32)| point.0 * normal.0 + point.1 * normal.1;
+    let first_center = projection(first_anchor);
+    let second_center = projection(second_anchor);
+    let first_face = first_footprint
+        .iter()
+        .copied()
+        .map(|point| projection(point))
+        .filter(|value| value.is_finite())
+        .max_by(f32::total_cmp)
+        .unwrap_or(first_center);
+    let second_face = second_footprint
+        .iter()
+        .copied()
+        .map(|point| projection(point))
+        .filter(|value| value.is_finite())
+        .min_by(f32::total_cmp)
+        .unwrap_or(second_center);
+    let center_midpoint = (first_center + second_center) * 0.5;
+    let offset = if first_face <= second_face {
+        (first_face + second_face) * 0.5
+    } else {
+        center_midpoint
+    }
+    .clamp(
+        first_center.min(second_center),
+        first_center.max(second_center),
+    );
+    Some(OwnershipSeparator { normal, offset })
 }
 
 fn resolve_free_text_space(
@@ -1218,8 +1329,13 @@ fn resolve_free_text_sites(
     Ok(sites)
 }
 
-fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonFlowPlan> {
-    let mut groups = BTreeMap::<EntityId, Vec<FlowSeed>>::new();
+fn resolve_balloon_flows(
+    snapshot: &Snapshot,
+    page: EntityId,
+    width: u32,
+    height: u32,
+) -> Result<BalloonFlowPlan> {
+    let mut seeds_by_balloon = BTreeMap::<EntityId, Vec<FlowSeed>>::new();
     if let Some(group) = snapshot.page(page)?.text_group()? {
         for layer in group.text_layers()? {
             let entity = layer.id();
@@ -1258,18 +1374,18 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
             if translation.text.value.trim().is_empty() {
                 continue;
             }
-            let anchor = flow_anchor(snapshot, content, &mut dependencies)?;
-            groups.entry(balloon).or_default().push(FlowSeed {
+            let source = flow_source(snapshot, content, &mut dependencies)?;
+            seeds_by_balloon.entry(balloon).or_default().push(FlowSeed {
                 layer: entity,
-                anchor,
+                source,
                 dependencies,
             });
         }
     }
 
-    let mut placements = HashMap::new();
+    let mut groups = Vec::with_capacity(seeds_by_balloon.len());
     let mut all_dependencies = BTreeSet::new();
-    for (balloon, seeds) in groups {
+    for (balloon, seeds) in seeds_by_balloon {
         let region = snapshot.analysis_region(balloon)?;
         let geometry = region.geometry()?;
         let Some(frame) = geometry_frame(&geometry) else {
@@ -1292,27 +1408,203 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
             frame.bounds.x + frame.bounds.width * 0.5,
             frame.bounds.y + frame.bounds.height * 0.5,
         );
-        let anchors = seeds
+        let world_contour = geometry
+            .points
             .iter()
-            .map(|seed| seed.anchor.unwrap_or(center))
+            .map(|point| (point.x as f32, point.y as f32))
             .collect::<Vec<_>>();
-        let cells = (seeds.len() > 1).then(|| flow_cells(frame, &balloon_contour, &anchors));
-        let dependencies: Arc<[RenderDependency]> = dependencies.iter().cloned().collect();
-        for (index, seed) in seeds.into_iter().enumerate() {
+        let ownership_anchor = polygon_centroid(&world_contour).unwrap_or(center);
+        all_dependencies.extend(dependencies.iter().cloned());
+        groups.push(BalloonFlowGroup {
+            balloon,
+            geometry,
+            frame,
+            contour: balloon_contour,
+            world_contour,
+            ownership_anchor,
+            seeds,
+            dependencies,
+        });
+    }
+
+    // Detector polygons for adjacent speech balloons can overlap even though the
+    // source text belongs to separate semantic regions. Build one page-space
+    // ownership cell per balloon, clipping only pairs whose physical polygons
+    // overlap. The separator follows the empty interval between the nearest OCR
+    // source footprints rather than the centroid of a detector mask that may have
+    // merged several lobes. Joined flows retain their more precise contour-neck
+    // partition as an additional constraint below.
+    let mut overlap_graph = vec![Vec::new(); groups.len()];
+    for first in 0..groups.len() {
+        for second in (first + 1)..groups.len() {
+            if polygons_overlap(&groups[first].world_contour, &groups[second].world_contour) {
+                overlap_graph[first].push(second);
+                overlap_graph[second].push(first);
+            }
+        }
+    }
+    let page_frame = GeometryFrame {
+        bounds: LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+        },
+        angle_degrees: 0.0,
+    };
+    let page_contour = vec![
+        (0.0, 0.0),
+        (width as f32, 0.0),
+        (width as f32, height as f32),
+        (0.0, height as f32),
+    ];
+    let mut ownership_cells = vec![None; groups.len()];
+    let mut ownership_dependencies = vec![BTreeSet::new(); groups.len()];
+    let mut visited = vec![false; groups.len()];
+    for start in 0..groups.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut pending = vec![start];
+        visited[start] = true;
+        while let Some(current) = pending.pop() {
+            component.push(current);
+            for &neighbor in &overlap_graph[current] {
+                if !visited[neighbor] {
+                    visited[neighbor] = true;
+                    pending.push(neighbor);
+                }
+            }
+        }
+        if component.len() < 2 {
+            continue;
+        }
+        let mut cells = vec![page_contour.clone(); component.len()];
+        let mut source_partition_is_valid = true;
+        for first in 0..component.len() {
+            for second in (first + 1)..component.len() {
+                let first_group = component[first];
+                let second_group = component[second];
+                if !overlap_graph[first_group].contains(&second_group) {
+                    continue;
+                }
+                let first_sources = groups[first_group]
+                    .seeds
+                    .iter()
+                    .filter_map(|seed| seed.source.as_ref())
+                    .collect::<Vec<_>>();
+                let second_sources = groups[second_group]
+                    .seeds
+                    .iter()
+                    .filter_map(|seed| seed.source.as_ref())
+                    .collect::<Vec<_>>();
+                let Some(separator) = source_aware_separator(
+                    &first_sources,
+                    groups[first_group].ownership_anchor,
+                    &second_sources,
+                    groups[second_group].ownership_anchor,
+                ) else {
+                    source_partition_is_valid = false;
+                    break;
+                };
+                cells[first] = clip_half_plane(&cells[first], separator.normal, separator.offset);
+                cells[second] = clip_half_plane(
+                    &cells[second],
+                    (-separator.normal.0, -separator.normal.1),
+                    -separator.offset,
+                );
+                if cells[first].len() < 3 || cells[second].len() < 3 {
+                    source_partition_is_valid = false;
+                    break;
+                }
+            }
+            if !source_partition_is_valid {
+                break;
+            }
+        }
+        if !source_partition_is_valid {
+            let anchors = component
+                .iter()
+                .map(|&index| groups[index].ownership_anchor)
+                .collect::<Vec<_>>();
+            cells = flow_cells(page_frame, &page_contour, &anchors);
+        }
+        let component_dependencies = component
+            .iter()
+            .flat_map(|&index| groups[index].dependencies.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for (&group, cell) in component.iter().zip(cells) {
+            if cell.len() >= 3 {
+                ownership_cells[group] = Some(cell);
+                ownership_dependencies[group] = component_dependencies.clone();
+            }
+        }
+    }
+
+    let mut placements = HashMap::new();
+    for (group_index, group) in groups.into_iter().enumerate() {
+        let center = (
+            group.frame.bounds.x + group.frame.bounds.width * 0.5,
+            group.frame.bounds.y + group.frame.bounds.height * 0.5,
+        );
+        let anchors = group
+            .seeds
+            .iter()
+            .map(|seed| seed.source.as_ref().map_or(center, |source| source.anchor))
+            .collect::<Vec<_>>();
+        let joined_cells =
+            (group.seeds.len() > 1).then(|| flow_cells(group.frame, &group.contour, &anchors));
+        let ownership_cell = ownership_cells[group_index].as_ref().map(|cell| {
+            cell.iter()
+                .map(|&(x, y)| point_in_frame(group.frame, x, y))
+                .collect::<Vec<_>>()
+        });
+        let mut dependencies = group.dependencies.clone();
+        dependencies.extend(ownership_dependencies[group_index].iter().cloned());
+        let dependencies: Arc<[RenderDependency]> = dependencies.into_iter().collect();
+        for (index, seed) in group.seeds.into_iter().enumerate() {
+            let mut flow_contours = Vec::with_capacity(2);
+            if let Some(cell) = joined_cells.as_ref().and_then(|cells| cells.get(index)) {
+                flow_contours.push(cell.clone());
+            }
+            if let Some(cell) = &ownership_cell {
+                flow_contours.push(cell.clone());
+            }
+            let preferred_center = seed
+                .source
+                .as_ref()
+                .map(|source| local_flow_anchor(group.frame, source.anchor))
+                .or_else(|| {
+                    ownership_cell.as_ref()?;
+                    // Without an OCR anchor, preserve the center that the physical
+                    // balloon or its joined-flow cell supplied before the page-space
+                    // ownership contour was appended as the final constraint.
+                    Some(
+                        joined_cells
+                            .as_ref()
+                            .and_then(|cells| cells.get(index))
+                            .and_then(|cell| polygon_centroid(cell))
+                            .or_else(|| polygon_centroid(&group.contour))
+                            .unwrap_or((
+                                group.frame.bounds.width * 0.5,
+                                group.frame.bounds.height * 0.5,
+                            )),
+                    )
+                });
             placements.insert(
                 seed.layer,
                 ResolvedPlacement {
-                    target: balloon,
-                    geometry: geometry.clone(),
-                    frame,
-                    balloon_contour: Some(balloon_contour.clone()),
-                    flow_contour: cells.as_ref().and_then(|cells| cells.get(index).cloned()),
-                    preferred_center: seed.anchor.map(|anchor| local_flow_anchor(frame, anchor)),
+                    target: group.balloon,
+                    geometry: group.geometry.clone(),
+                    frame: group.frame,
+                    balloon_contour: Some(group.contour.clone()),
+                    flow_contours,
+                    preferred_center,
                     dependencies: dependencies.clone(),
                 },
             );
         }
-        all_dependencies.extend(dependencies.iter().cloned());
     }
     Ok(BalloonFlowPlan {
         placements,
@@ -1328,11 +1620,11 @@ fn local_flow_anchor(frame: GeometryFrame, anchor: (f32, f32)) -> (f32, f32) {
     )
 }
 
-fn flow_anchor(
+fn flow_source(
     snapshot: &Snapshot,
     content: EntityId,
     dependencies: &mut BTreeSet<RenderDependency>,
-) -> Result<Option<(f32, f32)>> {
+) -> Result<Option<FlowSource>> {
     let Some(recognized) = snapshot.relation_from::<RecognizedFrom>(content)? else {
         return Ok(None);
     };
@@ -1343,11 +1635,16 @@ fn flow_anchor(
     let Some(geometry) = snapshot.component::<Geometry>(region)? else {
         return Ok(None);
     };
-    Ok(geometry_bounds(&geometry).map(|bounds| {
-        (
+    Ok(geometry_bounds(&geometry).map(|bounds| FlowSource {
+        anchor: (
             bounds.x + bounds.width * 0.5,
             bounds.y + bounds.height * 0.5,
-        )
+        ),
+        footprint: geometry
+            .points
+            .iter()
+            .map(|point| (point.x as f32, point.y as f32))
+            .collect(),
     }))
 }
 
@@ -2152,6 +2449,28 @@ mod tests {
     }
 
     #[test]
+    fn overlap_separator_uses_the_nearest_source_footprint_gap() {
+        let source = |left: f32, right: f32| FlowSource {
+            anchor: ((left + right) * 0.5, 700.0),
+            footprint: vec![(left, 600.0), (right, 600.0), (right, 800.0), (left, 800.0)],
+        };
+        let near_large_source = source(760.0, 840.0);
+        let far_large_source = source(900.0, 980.0);
+        let small_source = source(650.0, 690.0);
+        let separator = source_aware_separator(
+            &[&near_large_source, &far_large_source],
+            (830.0, 720.0),
+            &[&small_source],
+            (670.0, 720.0),
+        )
+        .unwrap();
+
+        assert!((separator.normal.0 + 1.0).abs() < 1e-6);
+        assert!(separator.normal.1.abs() < 1e-6);
+        assert!((separator.offset + 725.0).abs() < 1e-4);
+    }
+
+    #[test]
     fn only_generated_auto_fit_strokes_follow_the_fitted_font_size() {
         let typography = |origin, auto_fit| Typography {
             origin,
@@ -2582,7 +2901,7 @@ mod tests {
         let NodeDescriptor::Text(descriptor) = &first.descriptor else {
             panic!("expected a text descriptor");
         };
-        assert!(descriptor.flow_contour.is_none());
+        assert!(descriptor.flow_contours.is_empty());
         assert_eq!(descriptor.preferred_block_center, Some(20.0));
 
         let add_sibling = base
@@ -2605,7 +2924,8 @@ mod tests {
                     panic!("expected a text descriptor");
                 };
                 assert_eq!(descriptor.preferred_block_center, Some(20.0));
-                descriptor.flow_contour.clone().unwrap()
+                assert_eq!(descriptor.flow_contours.len(), 1);
+                descriptor.flow_contours[0].clone()
             })
             .collect::<Vec<_>>();
         let first_right = contours[0]
@@ -2618,6 +2938,119 @@ mod tests {
             .fold(f32::INFINITY, f32::min);
         assert!((first_right - second_left).abs() < 1e-4);
         assert!(first_right > 25.0 && first_right < 85.0);
+    }
+
+    #[tokio::test]
+    async fn overlapping_balloon_flows_receive_source_aware_ownership_cells() {
+        let mut session = Session::memory().await.unwrap();
+        let mut ids = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 600.0, 400.0), At::End)?;
+                let mut layers = Vec::new();
+                for (bubble_geometry, source_geometry, source, translation) in [
+                    (
+                        Geometry::rectangle(250.0, 50.0, 300.0, 300.0),
+                        Geometry::rectangle(390.0, 150.0, 20.0, 40.0),
+                        "large source",
+                        "The translated text in the large detected balloon",
+                    ),
+                    (
+                        Geometry::rectangle(180.0, 80.0, 150.0, 240.0),
+                        Geometry::rectangle(240.0, 150.0, 20.0, 40.0),
+                        "small source",
+                        "The translated text in the small detected balloon",
+                    ),
+                    (
+                        Geometry::rectangle(20.0, 40.0, 100.0, 120.0),
+                        Geometry::rectangle(55.0, 80.0, 20.0, 40.0),
+                        "separate source",
+                        "An unrelated translated balloon",
+                    ),
+                ] {
+                    let bubble = edit.add_analysis_region::<BubbleRegion>(
+                        page,
+                        At::End,
+                        &bubble_geometry,
+                        None,
+                    )?;
+                    let region = edit.add_analysis_region::<koharu_scene::TextRegion>(
+                        page,
+                        At::End,
+                        &source_geometry,
+                        None,
+                    )?;
+                    let content = edit.add_text_content(page, At::End)?;
+                    edit.set(
+                        content,
+                        &SourceText {
+                            text: Authored::user(source.to_owned()),
+                            language: None,
+                        },
+                    )?;
+                    edit.set(
+                        content,
+                        &Translation {
+                            text: Authored::user(translation.to_owned()),
+                            language: None,
+                        },
+                    )?;
+                    let layer = edit.add_text_layer(
+                        page,
+                        At::End,
+                        content,
+                        &SceneTextLayout {
+                            origin: Origin::User,
+                            kind: TextLayoutKind::Paragraph,
+                        },
+                    )?;
+                    edit.relate::<RecognizedFrom>(content, region)?;
+                    edit.relate::<FlowsIn>(layer, bubble)?;
+                    layers.push(layer);
+                }
+                ids = Some((page, layers));
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let (page, layers) = ids.unwrap();
+        let compiled = Renderer::default().compile(&snapshot, page).unwrap();
+        let drafts = layers
+            .iter()
+            .map(|entity| {
+                compiled
+                    .layers
+                    .iter()
+                    .find(|layer| layer.entity == *entity)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let descriptors = drafts
+            .iter()
+            .map(|draft| {
+                let NodeDescriptor::Text(descriptor) = &draft.descriptor else {
+                    panic!("expected a text descriptor");
+                };
+                descriptor
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(descriptors[0].flow_contours.len(), 1);
+        assert_eq!(descriptors[1].flow_contours.len(), 1);
+        assert!(descriptors[2].flow_contours.is_empty());
+        let large_left = descriptors[0].flow_contours[0]
+            .iter()
+            .map(|(x, _)| *x + drafts[0].frame.bounds.x)
+            .fold(f32::INFINITY, f32::min);
+        let small_right = descriptors[1].flow_contours[0]
+            .iter()
+            .map(|(x, _)| *x + drafts[1].frame.bounds.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!((large_left - small_right).abs() < 1e-4);
+        assert!((large_left - 325.0).abs() < 1e-4);
+        assert!(large_left > drafts[0].frame.bounds.x);
+        assert!(small_right < drafts[1].frame.bounds.x + drafts[1].frame.bounds.width);
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use icu_properties::{
 use skrifa::{MetadataProvider, instance::Size};
 
 use crate::{
+    bubble::polygon_centroid,
     fonts::{Font, font_key},
     script::shaping_direction_for_text,
     segment::{HyphenationOptions, LineBreakSuffix, LineBreaker, hyphenation_lang_from_tag},
@@ -2866,31 +2867,7 @@ impl ComicBalloon {
 }
 
 fn polygon_block_centroid(contour: &[(f32, f32)], writing_mode: WritingMode) -> Option<f32> {
-    if contour.len() < 3 {
-        return None;
-    }
-    let mut twice_area = 0.0;
-    let mut block_moment = 0.0;
-    for index in 0..contour.len() {
-        let first = contour[index];
-        let second = contour[(index + 1) % contour.len()];
-        let cross = first.0 * second.1 - second.0 * first.1;
-        let first_block = if writing_mode.is_vertical() {
-            first.0
-        } else {
-            first.1
-        };
-        let second_block = if writing_mode.is_vertical() {
-            second.0
-        } else {
-            second.1
-        };
-        twice_area += cross;
-        block_moment += (first_block + second_block) * cross;
-    }
-    (twice_area.abs() > f32::EPSILON)
-        .then(|| block_moment / (3.0 * twice_area))
-        .filter(|center| center.is_finite())
+    polygon_centroid(contour).map(|(x, y)| if writing_mode.is_vertical() { x } else { y })
 }
 
 fn polygon_inline_spans(

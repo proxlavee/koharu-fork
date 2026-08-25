@@ -454,6 +454,86 @@ fn polygon_bounds(polygon: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
     ))
 }
 
+pub(crate) fn polygon_centroid(polygon: &[(f32, f32)]) -> Option<(f32, f32)> {
+    if polygon.len() < 3 {
+        return None;
+    }
+    let mut twice_area = 0.0;
+    let mut x_moment = 0.0;
+    let mut y_moment = 0.0;
+    for index in 0..polygon.len() {
+        let first = polygon[index];
+        let second = polygon[(index + 1) % polygon.len()];
+        let cross = first.0 * second.1 - second.0 * first.1;
+        twice_area += cross;
+        x_moment += (first.0 + second.0) * cross;
+        y_moment += (first.1 + second.1) * cross;
+    }
+    if twice_area.abs() <= f32::EPSILON {
+        return None;
+    }
+    let center = (x_moment / (3.0 * twice_area), y_moment / (3.0 * twice_area));
+    (center.0.is_finite() && center.1.is_finite()).then_some(center)
+}
+
+/// Reports whether two detected polygon interiors can claim the same page area.
+///
+/// Layout deliberately falls back to an axis-aligned frame when a detector emits
+/// more contour points than retained rendering accepts. Mirror that ownership
+/// boundary here: after a positive bounds overlap, an oversized polygon is
+/// treated as its rectangular fallback instead of performing a quadratic edge
+/// walk that cannot affect the contour-aware layout path.
+pub(crate) fn polygons_overlap(first: &[(f32, f32)], second: &[(f32, f32)]) -> bool {
+    if first.len() < 3
+        || second.len() < 3
+        || first
+            .iter()
+            .chain(second)
+            .any(|(x, y)| !x.is_finite() || !y.is_finite())
+    {
+        return false;
+    }
+    let Some((first_min_x, first_max_x, first_min_y, first_max_y)) = polygon_bounds(first) else {
+        return false;
+    };
+    let Some((second_min_x, second_max_x, second_min_y, second_max_y)) = polygon_bounds(second)
+    else {
+        return false;
+    };
+    let scale = (first_max_x - first_min_x)
+        .max(first_max_y - first_min_y)
+        .max(second_max_x - second_min_x)
+        .max(second_max_y - second_min_y)
+        .max(1.0);
+    let epsilon = scale * f32::EPSILON * 16.0;
+    if first_max_x <= second_min_x + epsilon
+        || second_max_x <= first_min_x + epsilon
+        || first_max_y <= second_min_y + epsilon
+        || second_max_y <= first_min_y + epsilon
+    {
+        return false;
+    }
+    if first.len() > MAX_CONTOUR_POINTS || second.len() > MAX_CONTOUR_POINTS {
+        return true;
+    }
+    for first_index in 0..first.len() {
+        let first_start = first[first_index];
+        let first_end = first[(first_index + 1) % first.len()];
+        for second_index in 0..second.len() {
+            if segments_intersect(
+                first_start,
+                first_end,
+                second[second_index],
+                second[(second_index + 1) % second.len()],
+                epsilon,
+            ) {
+                return true;
+            }
+        }
+    }
+    point_in_polygon(first, second[0], epsilon) || point_in_polygon(second, first[0], epsilon)
+}
+
 fn polygon_area(polygon: &[(f32, f32)]) -> f32 {
     if polygon.len() < 3 {
         return 0.0;
@@ -560,7 +640,11 @@ fn distance_squared(first: (f32, f32), second: (f32, f32)) -> f32 {
     (first.0 - second.0).powi(2) + (first.1 - second.1).powi(2)
 }
 
-fn clip_half_plane(polygon: &[(f32, f32)], normal: (f32, f32), offset: f32) -> Vec<(f32, f32)> {
+pub(crate) fn clip_half_plane(
+    polygon: &[(f32, f32)],
+    normal: (f32, f32),
+    offset: f32,
+) -> Vec<(f32, f32)> {
     let Some(&last) = polygon.last() else {
         return Vec::new();
     };
@@ -706,6 +790,34 @@ mod tests {
                 height: 60.0,
             })
         );
+    }
+
+    #[test]
+    fn polygon_overlap_requires_shared_interior_bounds() {
+        let outer = vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
+        let nested = vec![(10.0, 20.0), (40.0, 20.0), (40.0, 80.0), (10.0, 80.0)];
+        let crossing = vec![(80.0, 40.0), (120.0, 40.0), (120.0, 70.0), (80.0, 70.0)];
+        let touching = vec![(100.0, 20.0), (140.0, 20.0), (140.0, 80.0), (100.0, 80.0)];
+        let separated = vec![
+            (120.0, 120.0),
+            (150.0, 120.0),
+            (150.0, 150.0),
+            (120.0, 150.0),
+        ];
+
+        assert!(polygons_overlap(&outer, &nested));
+        assert!(polygons_overlap(&outer, &crossing));
+        assert!(!polygons_overlap(&outer, &touching));
+        assert!(!polygons_overlap(&outer, &separated));
+    }
+
+    #[test]
+    fn polygon_centroid_is_independent_of_winding() {
+        let clockwise = vec![(10.0, 20.0), (10.0, 80.0), (70.0, 80.0), (70.0, 20.0)];
+        let counterclockwise = clockwise.iter().rev().copied().collect::<Vec<_>>();
+
+        assert_eq!(polygon_centroid(&clockwise), Some((40.0, 50.0)));
+        assert_eq!(polygon_centroid(&counterclockwise), Some((40.0, 50.0)));
     }
 
     #[test]

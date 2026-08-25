@@ -89,7 +89,7 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) width: f32,
     pub(crate) height: f32,
     pub(crate) balloon_contour: Option<Vec<(f32, f32)>>,
-    pub(crate) flow_contour: Option<Vec<(f32, f32)>>,
+    pub(crate) flow_contours: Vec<Vec<(f32, f32)>>,
     pub(crate) preferred_block_center: Option<f32>,
     pub(crate) free_text_candidates: Vec<FreeTextCandidate>,
     pub(crate) automatic_free_text: bool,
@@ -320,24 +320,26 @@ impl TextRenderer {
         if let Some(contour) = &descriptor.balloon_contour {
             let [top, _, _, left] = descriptor.text_inset;
             let contour = contour.iter().map(|&(x, y)| (x - left, y - top)).collect();
-            if let Some(flow_contour) = &descriptor.flow_contour {
-                template = template.with_comic_balloon_constraints(
-                    ordinary_bounds.width,
-                    ordinary_bounds.height,
-                    vec![
-                        contour,
-                        flow_contour
-                            .iter()
-                            .map(|&(x, y)| (x - left, y - top))
-                            .collect(),
-                    ],
-                    descriptor.text_inset.into_iter().fold(0.0, f32::max),
-                );
-            } else {
+            if descriptor.flow_contours.is_empty() {
                 template = template.with_comic_balloon(
                     ordinary_bounds.width,
                     ordinary_bounds.height,
                     contour,
+                    descriptor.text_inset.into_iter().fold(0.0, f32::max),
+                );
+            } else {
+                let mut contours = Vec::with_capacity(descriptor.flow_contours.len() + 1);
+                contours.push(contour);
+                contours.extend(descriptor.flow_contours.iter().map(|flow_contour| {
+                    flow_contour
+                        .iter()
+                        .map(|&(x, y)| (x - left, y - top))
+                        .collect()
+                }));
+                template = template.with_comic_balloon_constraints(
+                    ordinary_bounds.width,
+                    ordinary_bounds.height,
+                    contours,
                     descriptor.text_inset.into_iter().fold(0.0, f32::max),
                 );
             }
@@ -1058,7 +1060,7 @@ mod tests {
             width: 240.0,
             height: 120.0,
             balloon_contour: Some(vec![(0.0, 0.0), (240.0, 0.0), (240.0, 120.0), (0.0, 120.0)]),
-            flow_contour: None,
+            flow_contours: Vec::new(),
             preferred_block_center: None,
             free_text_candidates: Vec::new(),
             automatic_free_text: false,
