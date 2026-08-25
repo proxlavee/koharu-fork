@@ -17,6 +17,7 @@ use crate::{
     free_text::FreeTextCandidate,
     layout::{
         fragmentation_quality_font_reduction, has_internal_natural_pause, quality_font_reduction,
+        whole_word_quality_font_reduction,
     },
     script::is_chinese_or_japanese_text,
 };
@@ -27,6 +28,7 @@ use crate::{
 const MAX_GENERATED_STROKE_FONT_RATIO: f32 = 0.12;
 const FREE_TEXT_PAUSE_FONT_REDUCTION_RATIO: f32 = 0.25;
 const FREE_TEXT_PAUSE_FONT_REDUCTION_MAX: f32 = 6.0;
+const FREE_TEXT_LOCALITY_FONT_REDUCTION_MAX: f32 = 1.0;
 
 fn free_text_semantic_font_reduction(text: &str, font_size: f32) -> f32 {
     let ordinary = quality_font_reduction(font_size);
@@ -49,6 +51,34 @@ fn free_text_quality_font_reduction(
         font_size,
         discretionary_hyphens,
     ))
+}
+
+fn free_text_layout_quality_font_reduction(
+    text: &str,
+    largest_font_size: f32,
+    layout: &LayoutRun<'_>,
+) -> f32 {
+    free_text_semantic_font_reduction(text, largest_font_size).max(
+        whole_word_quality_font_reduction(text, largest_font_size, layout),
+    )
+}
+
+fn fragmentation_trade_is_readable(
+    initial_font_size: f32,
+    minimum_font_size: f32,
+    initial_hyphens: usize,
+    candidate_font_size: f32,
+    candidate_hyphens: usize,
+) -> bool {
+    // The configured minimum is an emergency fit boundary, not an aesthetic
+    // budget for removing fragmentation. Mirror the comic-layout invariant so
+    // generated free text cannot buy a cleaner word by becoming unreadably small.
+    let first_visible_size_above_minimum = minimum_font_size.floor() + 1.0;
+    candidate_hyphens >= initial_hyphens
+        || candidate_font_size + f32::EPSILON >= first_visible_size_above_minimum
+        || candidate_font_size + f32::EPSILON
+            >= (initial_font_size - quality_font_reduction(initial_font_size))
+                .max(minimum_font_size)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -501,8 +531,21 @@ impl TextRenderer {
                     })?
                 }
             };
-            let layout =
-                self.prefer_free_text_quality(descriptor, candidate, &builder, layout, minimum)?;
+            let quality_floor = (layout.font_size
+                - free_text_layout_quality_font_reduction(
+                    &descriptor.text,
+                    layout.font_size,
+                    &layout,
+                ))
+            .max(minimum);
+            let layout = self.prefer_free_text_quality(
+                descriptor,
+                candidate,
+                &builder,
+                layout,
+                minimum,
+                quality_floor,
+            )?;
             let fits = free_text_layout_fits(descriptor, candidate, &layout);
             let hyphens = layout.discretionary_hyphen_count(&descriptor.text);
             let natural_pauses = layout.natural_pause_break_count(&descriptor.text);
@@ -516,6 +559,7 @@ impl TextRenderer {
                 hyphens,
                 natural_pauses,
                 weak_breaks,
+                quality_floor,
             });
             if candidate.source_distance <= f32::EPSILON
                 && fits
@@ -542,12 +586,13 @@ impl TextRenderer {
             let largest = largest_candidate.layout.font_size;
             let ordinary_quality_floor =
                 largest - free_text_semantic_font_reduction(&descriptor.text, largest);
-            let extended_quality_floor = largest
-                - free_text_quality_font_reduction(
+            let extended_quality_floor = (largest
+                - free_text_layout_quality_font_reduction(
                     &descriptor.text,
                     largest,
-                    largest_candidate.hyphens,
-                );
+                    &largest_candidate.layout,
+                ))
+            .max(largest_candidate.quality_floor);
             let ordinary_minimum_hyphens = measured
                 .iter()
                 .filter(|candidate| {
@@ -603,6 +648,15 @@ impl TextRenderer {
                     .expect("a punctuation-aware free-text candidate exists");
                 eligible.retain(|(_, candidate)| candidate.weak_breaks == minimum_weak_breaks);
             }
+            let largest_eligible_font_size = eligible
+                .iter()
+                .map(|(_, candidate)| candidate.layout.font_size)
+                .max_by(f32::total_cmp)
+                .expect("a fitted semantic-quality candidate exists");
+            let locality_floor = largest_eligible_font_size - FREE_TEXT_LOCALITY_FONT_REDUCTION_MAX;
+            eligible.retain(|(_, candidate)| {
+                candidate.layout.font_size + f32::EPSILON >= locality_floor
+            });
             eligible
                 .into_iter()
                 .min_by(|(_, left), (_, right)| {
@@ -626,9 +680,11 @@ impl TextRenderer {
         template: &TextLayout<'a>,
         mut selected: LayoutRun<'a>,
         minimum: f32,
+        quality_floor: f32,
     ) -> RenderResult<LayoutRun<'a>> {
         let initial_font_size = selected.font_size;
         let mut selected_hyphens = selected.discretionary_hyphen_count(&descriptor.text);
+        let initial_hyphens = selected_hyphens;
         let mut selected_pauses = selected.natural_pause_break_count(&descriptor.text);
         let mut selected_weak_breaks = selected.weak_line_break_count(&descriptor.text);
         let initial_pauses = selected_pauses;
@@ -639,12 +695,6 @@ impl TextRenderer {
             return Ok(selected);
         }
 
-        let quality_reduction = free_text_quality_font_reduction(
-            &descriptor.text,
-            selected.font_size,
-            selected_hyphens,
-        );
-        let quality_floor = (selected.font_size - quality_reduction).max(minimum);
         let mut next_size = selected.font_size.floor();
         if (next_size - selected.font_size).abs() <= f32::EPSILON {
             next_size -= 1.0;
@@ -664,6 +714,13 @@ impl TextRenderer {
             let semantic_trade_is_bounded =
                 layout.font_size + f32::EPSILON >= initial_font_size - semantic_budget;
             if free_text_layout_fits(descriptor, candidate, &layout)
+                && fragmentation_trade_is_readable(
+                    initial_font_size,
+                    minimum,
+                    initial_hyphens,
+                    layout.font_size,
+                    hyphens,
+                )
                 && (hyphens < selected_hyphens
                     || (hyphens == selected_hyphens
                         && semantic_trade_is_bounded
@@ -694,6 +751,13 @@ impl TextRenderer {
             let semantic_trade_is_bounded =
                 layout.font_size + f32::EPSILON >= initial_font_size - semantic_budget;
             if free_text_layout_fits(descriptor, candidate, &layout)
+                && fragmentation_trade_is_readable(
+                    initial_font_size,
+                    minimum,
+                    initial_hyphens,
+                    layout.font_size,
+                    hyphens,
+                )
                 && (hyphens < selected_hyphens
                     || (hyphens == selected_hyphens
                         && semantic_trade_is_bounded
@@ -743,6 +807,7 @@ struct MeasuredFreeTextLayout<'a> {
     hyphens: usize,
     natural_pauses: usize,
     weak_breaks: usize,
+    quality_floor: f32,
 }
 
 impl<'a> MeasuredFreeTextLayout<'a> {
@@ -815,13 +880,6 @@ fn font_size_limits(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> (f32,
     if descriptor.auto_fit {
         let maximum = descriptor
             .font_size
-            .or_else(|| {
-                if descriptor.balloon_contour.is_none() {
-                    descriptor.source_font_size
-                } else {
-                    None
-                }
-            })
             .unwrap_or_else(|| automatic_maximum(descriptor, bounds));
         // The source size is useful as a diagnostic readability target, but it is
         // not a geometric constraint after translation changes the script or text
@@ -982,6 +1040,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hard_minimum_does_not_buy_a_large_free_text_fragmentation_trade() {
+        assert!(!fragmentation_trade_is_readable(19.0, 12.0, 1, 12.0, 0));
+        assert!(!fragmentation_trade_is_readable(19.0, 12.0, 1, 12.75, 0));
+        assert!(fragmentation_trade_is_readable(15.0, 12.0, 1, 12.0, 0));
+        assert!(fragmentation_trade_is_readable(19.0, 12.0, 1, 13.0, 0));
+        assert!(fragmentation_trade_is_readable(19.0, 12.0, 1, 12.0, 1));
+    }
+
     #[tokio::test]
     async fn automatic_paragraphs_use_frame_capacity_and_fixed_sizes_stay_exact() {
         let descriptor = TextNodeDescriptor {
@@ -1033,7 +1100,10 @@ mod tests {
 
         let mut generated_free_text = large_source.clone();
         generated_free_text.balloon_contour = None;
-        assert_eq!(font_size_limits(&generated_free_text, bounds), (12.0, 30.0));
+        assert_eq!(
+            font_size_limits(&generated_free_text, bounds),
+            (12.0, 240.0)
+        );
 
         let mut authored_maximum = descriptor.clone();
         authored_maximum.font_size = Some(30.0);

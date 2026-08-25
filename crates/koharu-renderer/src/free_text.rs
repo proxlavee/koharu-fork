@@ -4,12 +4,13 @@ use koharu_scene::{EntityId, Geometry};
 
 use crate::{
     WritingMode,
-    bubble::{GeometryFrame, LayoutBox, point_in_frame},
+    bubble::{GeometryFrame, LayoutBox, geometry_frame, point_in_frame},
 };
 
 const BOUNDARY_SEARCH_ITERATIONS: usize = 24;
 const MINIMUM_USEFUL_INLINE_EXTENT: f32 = 0.5;
-// Source, balanced, and logically transposed footprints cover the meaningful
+const PARALLEL_AXIS_COSINE: f32 = 0.999_390_84;
+// Source, balanced, and logically transposed footprints cover the principal
 // composition choices without multiplying font shaping work during page open.
 const ORTHOGONAL_ASPECT_INTERVALS: usize = 2;
 
@@ -19,9 +20,19 @@ pub(crate) struct SpatialRegion {
     pub(crate) geometry: Geometry,
 }
 
+#[derive(Clone)]
+pub(crate) struct FreeTextSite {
+    pub(crate) entity: EntityId,
+    pub(crate) geometry: Geometry,
+    pub(crate) source_writing_mode: WritingMode,
+    pub(crate) target_writing_mode: WritingMode,
+    pub(crate) clearance: f32,
+}
+
 pub(crate) struct FreeTextSpace {
     page: LayoutBox,
     panels: Vec<SpatialRegion>,
+    text_sites: Vec<FreeTextSite>,
     obstacles: Vec<SpatialRegion>,
 }
 
@@ -41,11 +52,13 @@ impl FreeTextSpace {
     pub(crate) fn new(
         page: LayoutBox,
         panels: Vec<SpatialRegion>,
+        text_sites: Vec<FreeTextSite>,
         obstacles: Vec<SpatialRegion>,
     ) -> Self {
         Self {
             page,
             panels,
+            text_sites,
             obstacles,
         }
     }
@@ -56,8 +69,10 @@ impl FreeTextSpace {
     /// in outline-aware fitting and layout-quality selection. For an orthogonal
     /// translation, geometry cannot know which aspect ratio best fits shaped text,
     /// so the source footprint is followed by samples on the continuous
-    /// area-preserving path to the logical-axis transpose. The text renderer ranks
-    /// every candidate after resolving the actual fonts, line breaks, and outline.
+    /// area-preserving path to the logical-axis transpose. Both paths also expose
+    /// unused inline corridor space while retaining the source visual-area budget
+    /// and anchor. The text renderer ranks every candidate after resolving the
+    /// actual fonts, line breaks, and outline.
     pub(crate) fn candidates(
         &self,
         source: EntityId,
@@ -81,30 +96,16 @@ impl FreeTextSpace {
             return Vec::new();
         }
         let preferred_center = (source_width * 0.5, source_height * 0.5);
-        if source_writing_mode == target_writing_mode {
-            return vec![FreeTextCandidate {
-                bounds: LayoutBox {
-                    x: 0.0,
-                    y: 0.0,
-                    width: source_width,
-                    height: source_height,
-                },
-                preferred_center,
-                maximum_visual_area,
-                source_distance: 0.0,
-            }];
-        }
+        let same_direction = source_writing_mode == target_writing_mode;
+        let mut candidates = Vec::with_capacity(if same_direction {
+            2
+        } else {
+            ORTHOGONAL_ASPECT_INTERVALS + 2
+        });
 
         let source_center = (
             source_frame.bounds.x + source_frame.bounds.width * 0.5,
             source_frame.bounds.y + source_frame.bounds.height * 0.5,
-        );
-        let logical_transpose = logical_frame(
-            source_center,
-            source_frame.angle_degrees,
-            target_writing_mode,
-            inline_extent(source_frame, source_writing_mode),
-            block_extent(source_frame, source_writing_mode),
         );
         let source_corners = frame_corners(source_frame);
         let panel = self
@@ -121,31 +122,26 @@ impl FreeTextSpace {
         let container =
             panel.map_or_else(|| page_polygon(self.page), |panel| points(&panel.geometry));
         let source_aspect = source_width / source_height;
-        let mut candidates = Vec::with_capacity(ORTHOGONAL_ASPECT_INTERVALS + 1);
-        for index in 0..=ORTHOGONAL_ASPECT_INTERVALS {
-            let progress = index as f32 / ORTHOGONAL_ASPECT_INTERVALS as f32;
-            let width =
-                logarithmic_interpolation(source_width, logical_transpose.bounds.width, progress);
-            let height =
-                logarithmic_interpolation(source_height, logical_transpose.bounds.height, progress);
-            let target_frame = GeometryFrame {
-                bounds: LayoutBox {
-                    x: source_center.0 - width * 0.5,
-                    y: source_center.1 - height * 0.5,
-                    width,
-                    height,
-                },
-                angle_degrees: source_frame.angle_degrees,
-            };
+        let source_target_frame = logical_frame(
+            source_center,
+            source_frame.angle_degrees,
+            target_writing_mode,
+            inline_extent(source_frame, source_writing_mode),
+            block_extent(source_frame, source_writing_mode),
+        );
+        let mut push_candidate = |target_frame: GeometryFrame, expand_inline: bool| {
             let Some(frame) = self.fit_inline_corridor(
                 source,
+                source_center,
+                source_target_frame,
                 target_frame,
                 target_writing_mode,
                 &container,
                 panel.is_none(),
                 clearance,
+                expand_inline,
             ) else {
-                continue;
+                return;
             };
             let center = (
                 frame.bounds.x + frame.bounds.width * 0.5,
@@ -164,7 +160,7 @@ impl FreeTextSpace {
                     && approximately_equal(candidate.bounds.width, bounds.width)
                     && approximately_equal(candidate.bounds.height, bounds.height)
             }) {
-                continue;
+                return;
             }
             let aspect = bounds.width / bounds.height;
             let shift_x = (local_center.0 - preferred_center.0) / source_width;
@@ -175,18 +171,47 @@ impl FreeTextSpace {
                 maximum_visual_area,
                 source_distance: (aspect / source_aspect).ln().abs() + shift_x.hypot(shift_y),
             });
+        };
+
+        if same_direction {
+            push_candidate(source_frame, false);
+            push_candidate(source_frame, true);
+            return candidates;
         }
+
+        let logical_transpose = source_target_frame;
+        for index in 0..=ORTHOGONAL_ASPECT_INTERVALS {
+            let progress = index as f32 / ORTHOGONAL_ASPECT_INTERVALS as f32;
+            let width =
+                logarithmic_interpolation(source_width, logical_transpose.bounds.width, progress);
+            let height =
+                logarithmic_interpolation(source_height, logical_transpose.bounds.height, progress);
+            let target_frame = GeometryFrame {
+                bounds: LayoutBox {
+                    x: source_center.0 - width * 0.5,
+                    y: source_center.1 - height * 0.5,
+                    width,
+                    height,
+                },
+                angle_degrees: source_frame.angle_degrees,
+            };
+            push_candidate(target_frame, false);
+        }
+        push_candidate(logical_transpose, true);
         candidates
     }
 
     fn fit_inline_corridor(
         &self,
         source: EntityId,
+        source_site: (f32, f32),
+        source_target_frame: GeometryFrame,
         target_frame: GeometryFrame,
         target_writing_mode: WritingMode,
         container: &[(f32, f32)],
         panels_are_obstacles: bool,
         clearance: f32,
+        expand_inline: bool,
     ) -> Option<GeometryFrame> {
         let target_inline_extent = inline_extent(target_frame, target_writing_mode);
         let target_block_extent = block_extent(target_frame, target_writing_mode);
@@ -222,6 +247,31 @@ impl FreeTextSpace {
         maximum -= clearance;
         if anchor_inline < minimum || anchor_inline > maximum {
             return None;
+        }
+
+        for text_site in &self.text_sites {
+            if text_site.entity == source {
+                continue;
+            }
+            let Some(site) = geometry_site(&text_site.geometry) else {
+                continue;
+            };
+            if !polygon_contains_point(container, site) {
+                continue;
+            }
+            constrain_to_text_site_cell(
+                target_frame,
+                target_writing_mode,
+                source_target_frame,
+                source_site,
+                clearance,
+                text_site,
+                &mut minimum,
+                &mut maximum,
+            )?;
+            if anchor_inline < minimum || anchor_inline > maximum {
+                return None;
+            }
         }
 
         for obstacle in self.obstacles.iter().chain(
@@ -278,7 +328,11 @@ impl FreeTextSpace {
         if available_inline_extent < MINIMUM_USEFUL_INLINE_EXTENT {
             return None;
         }
-        let inline_extent = target_inline_extent.min(available_inline_extent);
+        let inline_extent = if expand_inline {
+            available_inline_extent
+        } else {
+            target_inline_extent.min(available_inline_extent)
+        };
         let local_inline_start = clamp_interval_start(
             anchor_inline - inline_extent * 0.5,
             minimum,
@@ -441,6 +495,207 @@ fn local_to_world(frame: GeometryFrame, x: f32, y: f32) -> (f32, f32) {
     (x * cos - y * sin + center_x, x * sin + y * cos + center_y)
 }
 
+fn geometry_site(geometry: &Geometry) -> Option<(f32, f32)> {
+    let frame = geometry_frame(geometry)?;
+    Some((
+        frame.bounds.x + frame.bounds.width * 0.5,
+        frame.bounds.y + frame.bounds.height * 0.5,
+    ))
+}
+
+fn constrain_to_text_site_cell(
+    candidate: GeometryFrame,
+    writing_mode: WritingMode,
+    source_target_frame: GeometryFrame,
+    source_site: (f32, f32),
+    clearance: f32,
+    other: &FreeTextSite,
+    minimum: &mut f32,
+    maximum: &mut f32,
+) -> Option<()> {
+    let other_source_frame = geometry_frame(&other.geometry)?;
+    let other_world_site = geometry_site(&other.geometry)?;
+    let other_target_frame = logical_frame(
+        other_world_site,
+        other_source_frame.angle_degrees,
+        other.target_writing_mode,
+        inline_extent(other_source_frame, other.source_writing_mode),
+        block_extent(other_source_frame, other.source_writing_mode),
+    );
+    let (inline_axis, block_axis) = writing_axes(candidate, writing_mode);
+    let (other_inline_axis, other_block_axis) =
+        writing_axes(other_target_frame, other.target_writing_mode);
+    if dot(inline_axis, other_inline_axis).abs() < PARALLEL_AXIS_COSINE
+        || dot(block_axis, other_block_axis).abs() < PARALLEL_AXIS_COSINE
+    {
+        return constrain_to_site_cell(
+            candidate,
+            writing_mode,
+            source_site,
+            other_world_site,
+            clearance,
+            minimum,
+            maximum,
+        );
+    }
+
+    let source_bounds = projected_frame_bounds(candidate, source_target_frame)?;
+    let other_bounds = projected_frame_bounds(candidate, other_target_frame)?;
+    let (_, _, source_block_minimum, source_block_maximum) =
+        logical_bounds(source_bounds, writing_mode);
+    let (_, _, other_block_minimum, other_block_maximum) =
+        logical_bounds(other_bounds, writing_mode);
+    let clearance = clearance.max(0.0);
+    let other_clearance = other.clearance.max(0.0);
+    let candidate_block_extent = block_extent(candidate, writing_mode);
+    let tolerance = candidate_block_extent
+        .max(source_block_maximum - source_block_minimum)
+        .max(other_block_maximum - other_block_minimum)
+        .max(1.0)
+        * f32::EPSILON
+        * 64.0;
+
+    let divider_minimum = source_block_maximum + clearance;
+    let divider_maximum = other_block_minimum - other_clearance;
+    if divider_minimum <= divider_maximum + tolerance {
+        let divider = (divider_minimum + divider_maximum) * 0.5;
+        return (candidate_block_extent <= divider - clearance + tolerance).then_some(());
+    }
+
+    let divider_minimum = other_block_maximum + other_clearance;
+    let divider_maximum = source_block_minimum - clearance;
+    if divider_minimum <= divider_maximum + tolerance {
+        let divider = (divider_minimum + divider_maximum) * 0.5;
+        return (divider + clearance <= tolerance).then_some(());
+    }
+
+    let source_local_site = point_in_frame(candidate, source_site.0, source_site.1);
+    let other_local_site = point_in_frame(candidate, other_world_site.0, other_world_site.1);
+    let (source_inline, other_inline) = if writing_mode.is_vertical() {
+        (source_local_site.1, other_local_site.1)
+    } else {
+        (source_local_site.0, other_local_site.0)
+    };
+    let inline_delta = other_inline - source_inline;
+    if inline_delta.abs() <= tolerance {
+        return constrain_to_site_cell(
+            candidate,
+            writing_mode,
+            source_site,
+            other_world_site,
+            clearance,
+            minimum,
+            maximum,
+        );
+    }
+    let divider = (source_inline + other_inline) * 0.5;
+    if inline_delta > 0.0 {
+        *maximum = (*maximum).min(divider - clearance);
+    } else {
+        *minimum = (*minimum).max(divider + clearance);
+    }
+    (*maximum - *minimum >= MINIMUM_USEFUL_INLINE_EXTENT).then_some(())
+}
+
+fn projected_frame_bounds(reference: GeometryFrame, frame: GeometryFrame) -> Option<LayoutBox> {
+    let mut projected = frame_corners(frame)
+        .into_iter()
+        .map(|(x, y)| point_in_frame(reference, x, y));
+    let first = projected.next()?;
+    let (mut left, mut top, mut right, mut bottom) = (first.0, first.1, first.0, first.1);
+    for (x, y) in projected {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    (right > left && bottom > top).then_some(LayoutBox {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn logical_bounds(bounds: LayoutBox, writing_mode: WritingMode) -> (f32, f32, f32, f32) {
+    if writing_mode.is_vertical() {
+        (
+            bounds.y,
+            bounds.y + bounds.height,
+            bounds.x,
+            bounds.x + bounds.width,
+        )
+    } else {
+        (
+            bounds.x,
+            bounds.x + bounds.width,
+            bounds.y,
+            bounds.y + bounds.height,
+        )
+    }
+}
+
+fn writing_axes(frame: GeometryFrame, writing_mode: WritingMode) -> ((f32, f32), (f32, f32)) {
+    let (sin, cos) = frame.angle_degrees.to_radians().sin_cos();
+    let x_axis = (cos, sin);
+    let y_axis = (-sin, cos);
+    if writing_mode.is_vertical() {
+        (y_axis, x_axis)
+    } else {
+        (x_axis, y_axis)
+    }
+}
+
+fn dot(left: (f32, f32), right: (f32, f32)) -> f32 {
+    left.0 * right.0 + left.1 * right.1
+}
+
+fn constrain_to_site_cell(
+    frame: GeometryFrame,
+    writing_mode: WritingMode,
+    source: (f32, f32),
+    other: (f32, f32),
+    clearance: f32,
+    minimum: &mut f32,
+    maximum: &mut f32,
+) -> Option<()> {
+    let delta = (other.0 - source.0, other.1 - source.1);
+    let distance = delta.0.hypot(delta.1);
+    if !distance.is_finite() || distance <= f32::EPSILON {
+        return None;
+    }
+
+    let origin = local_to_world(frame, 0.0, 0.0);
+    let midpoint = ((source.0 + other.0) * 0.5, (source.1 + other.1) * 0.5);
+    let (sin, cos) = frame.angle_degrees.to_radians().sin_cos();
+    let local_x_axis = (cos, sin);
+    let local_y_axis = (-sin, cos);
+    let (inline_axis, block_axis, block_extent) = if writing_mode.is_vertical() {
+        (local_y_axis, local_x_axis, frame.bounds.width)
+    } else {
+        (local_x_axis, local_y_axis, frame.bounds.height)
+    };
+    let inline_coefficient = dot(inline_axis, delta);
+    let block_coefficient = dot(block_axis, delta);
+    let relative_midpoint = (midpoint.0 - origin.0, midpoint.1 - origin.1);
+    let boundary = dot(relative_midpoint, delta) - clearance.max(0.0) * distance;
+    let worst_block = (block_coefficient * block_extent).max(0.0);
+    let inline_boundary = boundary - worst_block;
+    let tolerance = distance.max(block_extent).max(1.0) * f32::EPSILON * 32.0;
+
+    if inline_coefficient > tolerance {
+        *maximum = (*maximum).min(inline_boundary / inline_coefficient);
+    } else if inline_coefficient < -tolerance {
+        *minimum = (*minimum).max(inline_boundary / inline_coefficient);
+    } else if inline_boundary < -tolerance {
+        return None;
+    }
+    (*maximum - *minimum >= MINIMUM_USEFUL_INLINE_EXTENT).then_some(())
+}
+
 fn projected_bounds(frame: GeometryFrame, geometry: &Geometry) -> Option<LayoutBox> {
     let mut projected = geometry
         .points
@@ -596,12 +851,27 @@ fn clamp_interval_start(preferred: f32, minimum: f32, maximum: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bubble::geometry_frame;
 
     fn region(geometry: Geometry) -> SpatialRegion {
         SpatialRegion {
             entity: EntityId::new(),
             geometry,
+        }
+    }
+
+    fn site(
+        entity: EntityId,
+        geometry: Geometry,
+        source_writing_mode: WritingMode,
+        target_writing_mode: WritingMode,
+        clearance: f32,
+    ) -> FreeTextSite {
+        FreeTextSite {
+            entity,
+            geometry,
+            source_writing_mode,
+            target_writing_mode,
+            clearance,
         }
     }
 
@@ -617,10 +887,14 @@ mod tests {
                 height: 1808.0,
             },
             Vec::new(),
-            vec![SpatialRegion {
-                entity: source_id,
-                geometry: source.clone(),
-            }],
+            vec![site(
+                source_id,
+                source.clone(),
+                WritingMode::Horizontal,
+                WritingMode::Horizontal,
+                8.0,
+            )],
+            Vec::new(),
         );
 
         let candidates = space.candidates(
@@ -632,7 +906,7 @@ mod tests {
             8.0,
         );
 
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
         let candidate = candidates[0];
         assert_eq!(candidate.bounds.x, 0.0);
         assert_eq!(candidate.bounds.y, 0.0);
@@ -641,6 +915,10 @@ mod tests {
         assert_eq!(candidate.preferred_center, (70.0, 97.109375));
         assert_eq!(candidate.maximum_visual_area, 140.0 * 194.21875);
         assert_eq!(candidate.source_distance, 0.0);
+        let corridor = candidates[1];
+        assert!(corridor.bounds.width > candidate.bounds.width);
+        assert_eq!(corridor.bounds.height, candidate.bounds.height);
+        assert_eq!(corridor.maximum_visual_area, candidate.maximum_visual_area);
     }
 
     #[test]
@@ -655,10 +933,14 @@ mod tests {
                 height: 1808.0,
             },
             vec![region(Geometry::rectangle(0.0, 850.0, 500.0, 500.0))],
-            vec![SpatialRegion {
-                entity: source_id,
-                geometry: source.clone(),
-            }],
+            vec![site(
+                source_id,
+                source.clone(),
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                0.0,
+            )],
+            Vec::new(),
         );
 
         let candidates = space.candidates(
@@ -670,7 +952,7 @@ mod tests {
             0.0,
         );
 
-        assert_eq!(candidates.len(), ORTHOGONAL_ASPECT_INTERVALS + 1);
+        assert_eq!(candidates.len(), ORTHOGONAL_ASPECT_INTERVALS + 2);
         let source_candidate = candidates.first().unwrap();
         assert!((source_candidate.bounds.x - 0.0).abs() < 0.01);
         assert!((source_candidate.bounds.y - 0.0).abs() < 0.01);
@@ -678,7 +960,7 @@ mod tests {
         assert!((source_candidate.bounds.height - 254.25).abs() < 0.01);
         assert!(source_candidate.source_distance.abs() < 0.01);
 
-        let transposed = candidates.last().unwrap();
+        let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
         assert!((transposed.bounds.x + 80.875).abs() < 0.01);
         assert!((transposed.bounds.y - 80.875).abs() < 0.01);
         assert!((transposed.bounds.width - 254.25).abs() < 0.01);
@@ -686,6 +968,10 @@ mod tests {
         assert!((transposed.preferred_center.0 - 46.25).abs() < 0.01);
         assert!((transposed.preferred_center.1 - 127.125).abs() < 0.01);
         assert!((transposed.maximum_visual_area - 92.5 * 254.25).abs() < 0.01);
+        let corridor = candidates.last().unwrap();
+        assert!(corridor.bounds.width > transposed.bounds.width);
+        assert_eq!(corridor.bounds.height, transposed.bounds.height);
+        assert_eq!(corridor.maximum_visual_area, transposed.maximum_visual_area);
     }
 
     #[test]
@@ -700,13 +986,14 @@ mod tests {
                 height: 1808.0,
             },
             vec![region(Geometry::rectangle(1.25, 127.125, 358.75, 826.3125))],
-            vec![
-                SpatialRegion {
-                    entity: source_id,
-                    geometry: source.clone(),
-                },
-                region(Geometry::rectangle(302.0, 33.0, 163.0, 483.0)),
-            ],
+            vec![site(
+                source_id,
+                source.clone(),
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                6.0,
+            )],
+            vec![region(Geometry::rectangle(302.0, 33.0, 163.0, 483.0))],
         );
 
         let candidates = space.candidates(
@@ -717,7 +1004,7 @@ mod tests {
             WritingMode::Horizontal,
             6.0,
         );
-        let transposed = candidates.last().unwrap();
+        let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
 
         assert!((207.5 + transposed.bounds.x + transposed.bounds.width - 296.0).abs() < 0.01);
         assert!((transposed.bounds.height - 55.0).abs() < 0.01);
@@ -739,13 +1026,14 @@ mod tests {
                 height: 1808.0,
             },
             vec![region(Geometry::rectangle(1.25, 127.125, 358.75, 826.3125))],
-            vec![
-                SpatialRegion {
-                    entity: source_id,
-                    geometry: source.clone(),
-                },
-                region(Geometry::rectangle(302.0, 33.0, 163.0, 483.0)),
-            ],
+            vec![site(
+                source_id,
+                source.clone(),
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                4.0,
+            )],
+            vec![region(Geometry::rectangle(302.0, 33.0, 163.0, 483.0))],
         );
 
         let candidates = space.candidates(
@@ -756,13 +1044,186 @@ mod tests {
             WritingMode::Horizontal,
             4.0,
         );
-        let transposed = candidates.last().unwrap();
+        let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
 
         assert!((48.4375 + transposed.bounds.x - 5.25).abs() < 0.01);
         assert!((transposed.bounds.height - 52.8125).abs() < 0.01);
         assert!((transposed.bounds.width - 275.4375).abs() < 0.01);
         assert!((transposed.preferred_center.0 - 26.40625).abs() < 0.01);
         assert!((transposed.maximum_visual_area - 52.8125 * 275.4375).abs() < 0.01);
+    }
+
+    #[test]
+    fn neighboring_text_corridors_own_disjoint_halves_of_the_source_gap() {
+        let panel = Geometry::rectangle(432.4765625, 937.5, 586.1484375, 662.5);
+        let left = Geometry::rectangle(450.0390625, 950.0, 129.5234375, 362.5);
+        let right = Geometry::rectangle(838.609375, 956.25, 166.84375, 387.5);
+        let left_id = EntityId::new();
+        let right_id = EntityId::new();
+        let text_sites = vec![
+            site(
+                left_id,
+                left.clone(),
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                4.0,
+            ),
+            site(
+                right_id,
+                right.clone(),
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                4.0,
+            ),
+        ];
+        let space = FreeTextSpace::new(
+            LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1124.0,
+                height: 1600.0,
+            },
+            vec![region(panel)],
+            text_sites,
+            Vec::new(),
+        );
+        let clearance = 4.0;
+        let left_frame = geometry_frame(&left).unwrap();
+        let right_frame = geometry_frame(&right).unwrap();
+        let left_candidate = space
+            .candidates(
+                left_id,
+                &left,
+                left_frame,
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                clearance,
+            )
+            .into_iter()
+            .max_by(|left, right| left.bounds.width.total_cmp(&right.bounds.width))
+            .unwrap();
+        let right_candidate = space
+            .candidates(
+                right_id,
+                &right,
+                right_frame,
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                clearance,
+            )
+            .into_iter()
+            .max_by(|left, right| left.bounds.width.total_cmp(&right.bounds.width))
+            .unwrap();
+        let left_world_right =
+            left_frame.bounds.x + left_candidate.bounds.x + left_candidate.bounds.width;
+        let right_world_left = right_frame.bounds.x + right_candidate.bounds.x;
+
+        assert!(left_world_right + clearance * 2.0 <= right_world_left + 0.01);
+        assert!(left_candidate.bounds.width > left_frame.bounds.width);
+        assert!(right_candidate.bounds.width > right_frame.bounds.width);
+    }
+
+    #[test]
+    fn vertically_separated_sites_keep_their_unused_horizontal_corridors() {
+        let upper = Geometry::rectangle(140.0, 100.0, 30.0, 100.0);
+        let lower = Geometry::rectangle(140.0, 300.0, 30.0, 100.0);
+        let upper_id = EntityId::new();
+        let lower_id = EntityId::new();
+        let space = FreeTextSpace::new(
+            LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 500.0,
+            },
+            Vec::new(),
+            vec![
+                site(
+                    upper_id,
+                    upper.clone(),
+                    WritingMode::VerticalRl,
+                    WritingMode::Horizontal,
+                    4.0,
+                ),
+                site(
+                    lower_id,
+                    lower,
+                    WritingMode::VerticalRl,
+                    WritingMode::Horizontal,
+                    4.0,
+                ),
+            ],
+            Vec::new(),
+        );
+        let candidates = space.candidates(
+            upper_id,
+            &upper,
+            geometry_frame(&upper).unwrap(),
+            WritingMode::VerticalRl,
+            WritingMode::Horizontal,
+            4.0,
+        );
+        let widest = candidates
+            .iter()
+            .map(|candidate| candidate.bounds.width)
+            .max_by(f32::total_cmp)
+            .unwrap();
+
+        assert!(widest > 300.0);
+    }
+
+    #[test]
+    fn block_separation_rejects_tall_aspects_without_narrowing_the_compact_corridor() {
+        let upper = Geometry::rectangle(140.0, 100.0, 30.0, 100.0);
+        let lower = Geometry::rectangle(140.0, 180.0, 30.0, 100.0);
+        let upper_id = EntityId::new();
+        let lower_id = EntityId::new();
+        let space = FreeTextSpace::new(
+            LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 500.0,
+            },
+            Vec::new(),
+            vec![
+                site(
+                    upper_id,
+                    upper.clone(),
+                    WritingMode::VerticalRl,
+                    WritingMode::Horizontal,
+                    4.0,
+                ),
+                site(
+                    lower_id,
+                    lower,
+                    WritingMode::VerticalRl,
+                    WritingMode::Horizontal,
+                    4.0,
+                ),
+            ],
+            Vec::new(),
+        );
+        let candidates = space.candidates(
+            upper_id,
+            &upper,
+            geometry_frame(&upper).unwrap(),
+            WritingMode::VerticalRl,
+            WritingMode::Horizontal,
+            4.0,
+        );
+
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.bounds.height < 100.0)
+        );
+        let widest = candidates
+            .iter()
+            .map(|candidate| candidate.bounds.width)
+            .max_by(f32::total_cmp)
+            .unwrap();
+        assert!(widest > 300.0);
     }
 
     #[test]

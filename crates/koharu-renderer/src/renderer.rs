@@ -41,7 +41,7 @@ use crate::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
         prepare_frame,
     },
-    free_text::{FreeTextSpace, SpatialRegion},
+    free_text::{FreeTextSite, FreeTextSpace, SpatialRegion},
     images::{DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
     text_renderer::{StrokeOptions, StrokeWidth, TextNodeDescriptor, TextRenderer},
@@ -53,7 +53,8 @@ const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
 const FREE_TEXT_ROLE: &str = "dev.koharu.text.free-text";
-const GENERATED_FREE_TEXT_HALO_EM: f32 = 0.08;
+const DIALOGUE_ROLE: &str = "dev.koharu.text.dialogue";
+const GENERATED_TEXT_HALO_EM: f32 = 0.08;
 const GENERATED_TEXT_LINE_HEIGHT: f32 = 1.2;
 
 #[derive(Clone)]
@@ -1039,6 +1040,7 @@ fn resolve_free_text_space(
     height: u32,
 ) -> Result<FreeTextPlan> {
     let mut panels = Vec::new();
+    let mut text_regions = Vec::new();
     let mut obstacles = Vec::new();
     let mut dependencies = BTreeSet::from([RenderDependency::Hierarchy(page)]);
     for entity in snapshot.descendants(page)? {
@@ -1047,8 +1049,8 @@ fn resolve_free_text_space(
             continue;
         };
         let is_panel = region.kind.as_str() == PanelRegion::KIND;
-        let is_obstacle =
-            region.kind.as_str() == TextRegion::KIND || region.kind.as_str() == BubbleRegion::KIND;
+        let is_text = region.kind.as_str() == TextRegion::KIND;
+        let is_obstacle = is_text || region.kind.as_str() == BubbleRegion::KIND;
         if !is_panel && !is_obstacle {
             continue;
         }
@@ -1064,10 +1066,22 @@ fn resolve_free_text_space(
         };
         if is_panel {
             panels.push(region);
+        } else if is_text {
+            text_regions.push(region);
         } else {
             obstacles.push(region);
         }
     }
+    let text_sites = resolve_free_text_sites(snapshot, page, &mut dependencies)?;
+    let active_targets = text_sites
+        .iter()
+        .map(|site| site.entity)
+        .collect::<HashSet<_>>();
+    obstacles.extend(
+        text_regions
+            .into_iter()
+            .filter(|region| !active_targets.contains(&region.entity)),
+    );
     Ok(FreeTextPlan {
         space: FreeTextSpace::new(
             LayoutBox {
@@ -1077,10 +1091,131 @@ fn resolve_free_text_space(
                 height: height as f32,
             },
             panels,
+            text_sites,
             obstacles,
         ),
         dependencies,
     })
+}
+
+fn resolve_free_text_sites(
+    snapshot: &Snapshot,
+    page: EntityId,
+    dependencies: &mut BTreeSet<RenderDependency>,
+) -> Result<Vec<FreeTextSite>> {
+    let mut sites = Vec::new();
+    let Some(group) = snapshot.page(page)?.text_group()? else {
+        return Ok(sites);
+    };
+    for layer in group.text_layers()? {
+        let entity = layer.id();
+        dependencies.extend([
+            RenderDependency::Entity(entity),
+            component_dependency::<Geometry>(entity),
+            component_dependency::<SceneTextLayout>(entity),
+            component_dependency::<Typography>(entity),
+        ]);
+        for kind in [Presents::KIND, FitsTo::KIND, FlowsIn::KIND] {
+            dependencies.insert(RenderDependency::RelationQuery {
+                source: entity,
+                kind: kind.to_owned(),
+            });
+        }
+        if snapshot.component::<Geometry>(entity)?.is_some() {
+            continue;
+        }
+        let Some(layout) = snapshot.component::<SceneTextLayout>(entity)? else {
+            continue;
+        };
+        if layout.kind != TextLayoutKind::Paragraph {
+            continue;
+        }
+        if let Some(relation) = snapshot.relation_from::<FlowsIn>(entity)? {
+            dependencies.insert(RenderDependency::Relation(relation.id()));
+            continue;
+        }
+        let Some(fits) = snapshot.relation_from::<FitsTo>(entity)? else {
+            continue;
+        };
+        dependencies.insert(RenderDependency::Relation(fits.id()));
+        let target = fits.value().target;
+        if !belongs_to_page(snapshot, target, page)? {
+            continue;
+        }
+        dependencies.extend([
+            RenderDependency::Entity(target),
+            component_dependency::<Region>(target),
+            component_dependency::<Geometry>(target),
+        ]);
+        let Some(region) = snapshot.component::<Region>(target)? else {
+            continue;
+        };
+        if region.kind.as_str() != TextRegion::KIND {
+            continue;
+        }
+        let geometry = snapshot.analysis_region(target)?.geometry()?;
+        let Some(frame) = geometry_frame(&geometry) else {
+            continue;
+        };
+
+        let Some(presents) = snapshot.relation_from::<Presents>(entity)? else {
+            continue;
+        };
+        dependencies.insert(RenderDependency::Relation(presents.id()));
+        let content = presents.value().target;
+        dependencies.extend([
+            RenderDependency::Entity(content),
+            component_dependency::<Translation>(content),
+            component_dependency::<TextRole>(content),
+            RenderDependency::RelationQuery {
+                source: content,
+                kind: RecognizedFrom::KIND.to_owned(),
+            },
+        ]);
+        let Some(translation) = snapshot.component::<Translation>(content)? else {
+            continue;
+        };
+        if translation.text.value.trim().is_empty() {
+            continue;
+        }
+        let role = snapshot.component::<TextRole>(content)?;
+        if !is_generated_free_text(role.as_ref()) {
+            continue;
+        }
+        let typography = snapshot.component::<Typography>(entity)?;
+        let analysis =
+            if let Some(recognized) = snapshot.relation_from::<RecognizedFrom>(content)? {
+                dependencies.insert(RenderDependency::Relation(recognized.id()));
+                let source = recognized.value().target;
+                dependencies.extend([
+                    RenderDependency::Entity(source),
+                    component_dependency::<OcrAnalysis>(source),
+                ]);
+                snapshot.component::<OcrAnalysis>(source)?
+            } else {
+                None
+            };
+        let source_writing_mode =
+            resolve_detected_writing_mode(frame.bounds, typography.as_ref(), analysis.as_ref());
+        let target_writing_mode = resolve_writing_mode(
+            &translation.text.value,
+            frame.bounds,
+            typography.as_ref(),
+            analysis.as_ref(),
+        );
+        let foreground = typography
+            .as_ref()
+            .and_then(|value| value.color)
+            .unwrap_or([0, 0, 0, 255]);
+        sites.push(FreeTextSite {
+            entity: target,
+            geometry,
+            source_writing_mode,
+            target_writing_mode,
+            clearance: free_text_clearance(typography.as_ref(), role.as_ref(), foreground),
+        });
+    }
+    Ok(sites)
 }
 
 fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonFlowPlan> {
@@ -1604,6 +1739,13 @@ fn is_generated_free_text(role: Option<&TextRole>) -> bool {
     })
 }
 
+fn is_generated_automatic_text_role(role: Option<&TextRole>) -> bool {
+    role.is_some_and(|role| {
+        matches!(&role.origin, Origin::Generated(_))
+            && (role.role == FREE_TEXT_ROLE || role.role == DIALOGUE_ROLE)
+    })
+}
+
 fn free_text_clearance(
     typography: Option<&Typography>,
     role: Option<&TextRole>,
@@ -1622,7 +1764,7 @@ fn free_text_clearance(
         typography
             .and_then(|value| value.size)
             .unwrap_or(crate::MINIMUM_READABLE_FONT_SIZE)
-            * GENERATED_FREE_TEXT_HALO_EM
+            * GENERATED_TEXT_HALO_EM
     })
 }
 
@@ -1674,13 +1816,13 @@ fn resolve_stroke(
     let generated_auto_fit = typography.is_some_and(|typography| {
         typography.auto_fit && matches!(&typography.origin, Origin::Generated(_))
     });
-    let generated_free_text = is_generated_free_text(role);
-    (generated_auto_fit && generated_free_text)
+    let generated_automatic_text_role = is_generated_automatic_text_role(role);
+    (generated_auto_fit && generated_automatic_text_role)
         .then(|| opposing_halo_color(foreground))
         .flatten()
         .map(|color| StrokeOptions {
             color,
-            width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+            width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
         })
 }
 
@@ -2061,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_free_text_without_a_stroke_gets_an_opposing_halo() {
+    fn generated_automatic_text_without_a_stroke_gets_an_opposing_halo() {
         let generated = koharu_scene::Origin::Generated(Generation::new(
             ProducerId::new("dev.koharu.test").unwrap(),
         ));
@@ -2088,14 +2230,14 @@ mod tests {
             resolve_stroke(Some(&typography), Some(&role), [0, 0, 0, 255]),
             Some(StrokeOptions {
                 color: [255; 4],
-                width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+                width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
             })
         );
         assert_eq!(
             resolve_stroke(Some(&typography), Some(&role), [255; 4]),
             Some(StrokeOptions {
                 color: [0, 0, 0, 255],
-                width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+                width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
             })
         );
         assert_eq!(
@@ -2111,7 +2253,19 @@ mod tests {
             resolve_stroke(Some(&zero_width_typography), Some(&role), [255; 4]),
             Some(StrokeOptions {
                 color: [0, 0, 0, 255],
-                width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+                width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
+            })
+        );
+
+        let dialogue_role = TextRole {
+            origin: role.origin.clone(),
+            role: DIALOGUE_ROLE.to_owned(),
+        };
+        assert_eq!(
+            resolve_stroke(Some(&typography), Some(&dialogue_role), [255; 4]),
+            Some(StrokeOptions {
+                color: [0, 0, 0, 255],
+                width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
             })
         );
         assert_eq!(

@@ -22,7 +22,7 @@ use crate::{
 };
 
 const HYPHENATION_MIN_WORD_LEN: usize = 5;
-const COMPACT_HYPHENATION_FRAGMENT_LEN: usize = 2;
+const COMPACT_HYPHENATION_FRAGMENT_LEN: usize = 3;
 const LINE_BREAK_HYPHEN_PENALTY: f32 = 2_000.0;
 const LINE_BREAK_OVERFLOW_MULTIPLIER: f32 = 10_000.0;
 const COMIC_LINE_OVERFLOW_PENALTY: f32 = 1_000_000.0;
@@ -643,13 +643,18 @@ impl<'a> TextLayout<'a> {
             .collect::<Vec<_>>();
         let ordinary_choice = self.preferred_comic_quality(text, &ordinary_candidates);
         let extended_choice = self.preferred_comic_quality(text, &quality_candidates);
-        let quality_choice = if discretionary_hyphen_count(text, &extended_choice.lines)
+        let mut quality_choice = if discretionary_hyphen_count(text, &extended_choice.lines)
             < discretionary_hyphen_count(text, &ordinary_choice.lines)
         {
             extended_choice
         } else {
             ordinary_choice
         };
+        if let Some(clean) =
+            self.preferred_clean_comic_layout(text, minimum, &largest, &quality_choice, &fits)?
+        {
+            quality_choice = clean;
+        }
 
         if !self.comic_layout_is_source_local(&quality_choice)
             && self
@@ -682,6 +687,75 @@ impl<'a> TextLayout<'a> {
         }
 
         Ok(Some(quality_choice))
+    }
+
+    fn preferred_clean_comic_layout(
+        &self,
+        text: &str,
+        minimum: f32,
+        largest: &LayoutRun<'a>,
+        hyphenated: &LayoutRun<'a>,
+        fits: &impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<Option<LayoutRun<'a>>> {
+        let discretionary_hyphens = discretionary_hyphen_count(text, &hyphenated.lines);
+        if discretionary_hyphens == 0 {
+            return Ok(None);
+        }
+
+        // A fixed-size LastResort layout already exhausts every legal whole-word
+        // line count before it introduces a discretionary split. The missing
+        // frontier is therefore cross-size: search the complete visually acceptable
+        // range with hyphenation disabled, rather than assuming the first large fit
+        // is the only candidate worth composing.
+        // Measure the clean-word trade against the composition that would
+        // actually be painted. The largest geometric fit can already have been
+        // rejected for centering, locality, or fragmentation; using it as the
+        // quality reference double-counts that rejection and can exclude a clean
+        // candidate that is only modestly smaller than the selected layout.
+        // Candidate search advances in visible whole-pixel steps, so round the
+        // proportional boundary down rather than rejecting the next pixel by a
+        // fractional remainder.
+        let quality_reference = hyphenated.font_size;
+        let quality_floor = (quality_reference
+            - whole_word_quality_font_reduction(text, quality_reference, hyphenated))
+        .max(minimum)
+        .floor()
+        .max(minimum);
+        if quality_floor + f32::EPSILON >= largest.font_size {
+            return Ok(None);
+        }
+
+        let mut clean_layout = self.clone();
+        clean_layout.hyphenation_policy = HyphenationPolicy::Disabled;
+        let accepted_center_error = self
+            .comic_center_error_em(hyphenated)
+            .max(COMIC_CENTER_ERROR_TOLERANCE_EM);
+        let preserve_source_locality = self
+            .comic_balloon
+            .as_ref()
+            .is_some_and(|balloon| balloon.preferred_block_center.is_some())
+            && self.comic_layout_is_source_local(hyphenated);
+        let ordinary_quality_floor =
+            (hyphenated.font_size - quality_font_reduction(hyphenated.font_size)).max(minimum);
+
+        largest_fitting_font_size(
+            quality_floor,
+            largest.font_size,
+            |size| clean_layout.run_with_size(text, size),
+            |candidate| {
+                fits(candidate)
+                    && discretionary_hyphen_count(text, &candidate.lines) == 0
+                    // The hard minimum is a last-resort fit boundary, not an
+                    // aesthetic budget for eliminating a discretionary split.
+                    // At that boundary, prefer the larger readable composition
+                    // unless the clean layout remains within the ordinary quality
+                    // window as well.
+                    && (candidate.font_size > minimum + f32::EPSILON
+                        || candidate.font_size + f32::EPSILON >= ordinary_quality_floor)
+                    && self.comic_center_error_em(candidate) <= accepted_center_error + f32::EPSILON
+                    && (!preserve_source_locality || self.comic_layout_is_source_local(candidate))
+            },
+        )
     }
 
     fn preferred_comic_quality(&self, text: &str, candidates: &[LayoutRun<'a>]) -> LayoutRun<'a> {
@@ -1789,23 +1863,65 @@ pub(crate) fn fragmentation_quality_font_reduction(
     }
 }
 
+pub(crate) fn whole_word_quality_font_reduction(
+    text: &str,
+    reference_font_size: f32,
+    layout: &LayoutRun<'_>,
+) -> f32 {
+    let discretionary_hyphens = discretionary_hyphen_count(text, &layout.lines);
+    if discretionary_hyphens == 0 {
+        return quality_font_reduction(reference_font_size);
+    }
+    let word_count = text
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count();
+    let high_fragmentation = word_count > 0
+        && word_count
+            <= discretionary_hyphens.saturating_mul(COMIC_HIGH_FRAGMENTATION_WORDS_PER_HYPHEN);
+    let compact_fragment = layout.lines.windows(2).any(|pair| {
+        let boundary = pair[0].range.end;
+        is_discretionary_hyphen_boundary(text, pair)
+            && discretionary_fragment_lengths(text, boundary).is_some_and(|(before, after)| {
+                before.min(after) <= COMPACT_HYPHENATION_FRAGMENT_LEN
+            })
+    });
+    let ratio = if high_fragmentation || compact_fragment {
+        COMIC_HIGH_FRAGMENTATION_FONT_REDUCTION_RATIO
+    } else {
+        COMIC_FRAGMENTATION_FONT_REDUCTION_RATIO
+    };
+    quality_font_reduction(reference_font_size).max(reference_font_size * ratio)
+}
+
+fn discretionary_fragment_lengths(text: &str, boundary: usize) -> Option<(usize, usize)> {
+    if boundary == 0 || boundary >= text.len() || !text.is_char_boundary(boundary) {
+        return None;
+    }
+    let before = text[..boundary]
+        .chars()
+        .rev()
+        .take_while(|character| character.is_alphabetic())
+        .count();
+    let after = text[boundary..]
+        .chars()
+        .take_while(|character| character.is_alphabetic())
+        .count();
+    (before > 0 && after > 0).then_some((before, after))
+}
+
+fn is_discretionary_hyphen_boundary(text: &str, pair: &[LayoutLine<'_>]) -> bool {
+    let [before, after] = pair else {
+        return false;
+    };
+    let boundary = before.range.end;
+    boundary == after.range.start && discretionary_fragment_lengths(text, boundary).is_some()
+}
+
 fn discretionary_hyphen_count(text: &str, lines: &[LayoutLine<'_>]) -> usize {
     lines
         .windows(2)
-        .filter(|pair| {
-            let boundary = pair[0].range.end;
-            boundary == pair[1].range.start
-                && boundary > 0
-                && boundary < text.len()
-                && text[..boundary]
-                    .chars()
-                    .next_back()
-                    .is_some_and(char::is_alphabetic)
-                && text[boundary..]
-                    .chars()
-                    .next()
-                    .is_some_and(char::is_alphabetic)
-        })
+        .filter(|pair| is_discretionary_hyphen_boundary(text, pair))
         .count()
 }
 
@@ -4123,6 +4239,36 @@ mod tests {
         assert_approx_eq(
             fragmentation_quality_font_reduction("several fragmented words", 40.0, 3),
             40.0 / 3.0,
+        );
+
+        let ordinary_text = "A longer caption contains prosperity inside";
+        let ordinary_boundary = ordinary_text.find("prosperity").unwrap() + 5;
+        let ordinary_split = candidate(
+            44.0,
+            &[0..ordinary_boundary, ordinary_boundary..ordinary_text.len()],
+        );
+        assert_eq!(
+            discretionary_hyphen_count(ordinary_text, &ordinary_split.lines),
+            1
+        );
+        assert_approx_eq(
+            whole_word_quality_font_reduction(ordinary_text, 48.0, &ordinary_split),
+            12.0,
+        );
+
+        let compact_text = "A longer caption keeps stimulating words intact";
+        let compact_boundary = compact_text.find("stimulating").unwrap() + 8;
+        let compact_split = candidate(
+            44.0,
+            &[0..compact_boundary, compact_boundary..compact_text.len()],
+        );
+        assert_eq!(
+            discretionary_hyphen_count(compact_text, &compact_split.lines),
+            1
+        );
+        assert_approx_eq(
+            whole_word_quality_font_reduction(compact_text, 48.0, &compact_split),
+            16.0,
         );
     }
 
