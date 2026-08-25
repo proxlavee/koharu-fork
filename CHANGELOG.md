@@ -1,3 +1,18 @@
+## [0.80.4](https://github.com/proxlavee/koharu-fork/compare/0.80.3..0.80.4) - 2026-08-25
+
+### 🐛 Bug Fixes
+
+- *(typesetting)* Preserve readable generated text composition - ([6476c8e](https://github.com/proxlavee/koharu-fork/commit/6476c8efd5d916fbee925e50d126f68fc7e69136))
+
+### 🚜 Refactor
+
+- *(renderer)* Group free-text corridor constraints - ([3691ad9](https://github.com/proxlavee/koharu-fork/commit/3691ad975d076930803d2f6ad2514396665fc237))
+
+### 🧪 Testing
+
+- *(renderer)* Compare projected heights geometrically - ([ef7c90c](https://github.com/proxlavee/koharu-fork/commit/ef7c90c66e73db271220eba720816898e3aaddf7))
+
+
 ## [0.80.3](https://github.com/proxlavee/koharu-fork/compare/0.80.2..0.80.3) - 2026-08-25
 
 ### 🐛 Bug Fixes
