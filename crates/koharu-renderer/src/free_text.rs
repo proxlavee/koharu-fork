@@ -968,7 +968,10 @@ mod tests {
         assert!((transposed.maximum_visual_area - 92.5 * 254.25).abs() < 0.01);
         let corridor = candidates.last().unwrap();
         assert!(corridor.bounds.width > transposed.bounds.width);
-        assert_eq!(corridor.bounds.height, transposed.bounds.height);
+        assert!(approximately_equal(
+            corridor.bounds.height,
+            transposed.bounds.height
+        ));
         assert_eq!(corridor.maximum_visual_area, transposed.maximum_visual_area);
     }
 
