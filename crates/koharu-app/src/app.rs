@@ -13,6 +13,13 @@ use crate::commands::{
     project::{CurrentProject, ProjectLibrary},
 };
 
+#[cfg(debug_assertions)]
+fn has_same_origin(current: &tauri::Url, expected: &tauri::Url) -> bool {
+    current.scheme() == expected.scheme()
+        && current.host_str() == expected.host_str()
+        && current.port_or_known_default() == expected.port_or_known_default()
+}
+
 #[tracing::instrument(
     target = "koharu_metrics",
     name = "app_started",
@@ -110,13 +117,14 @@ pub fn run(context: tauri::Context<Cef>) -> Result<()> {
         .invoke_handler(crate::commands::bindings().invoke_handler())
         .setup(move |application| {
             #[cfg(target_os = "windows")]
-            koharu_runtime::Store::configure(
-                application
-                    .path()
-                    .resource_dir()
-                    .context("failed to locate Koharu's installation directory")?
-                    .join("store"),
-            )?;
+            {
+                let executable = std::env::current_exe()
+                    .context("failed to locate the running Koharu executable")?;
+                let directory = executable
+                    .parent()
+                    .context("the running Koharu executable has no parent directory")?;
+                koharu_runtime::Store::configure(directory.join("store"))?;
+            }
 
             application.manage(CurrentProject {
                 project: Mutex::new(None),
@@ -141,13 +149,120 @@ pub fn run(context: tauri::Context<Cef>) -> Result<()> {
                 .iter()
                 .find(|window| window.label == "main")
                 .context("the main Tauri window configuration is unavailable")?;
-            let window = tauri::WebviewWindowBuilder::from_config(application, window_config)?
+            #[cfg(debug_assertions)]
+            let development_url = application.config().build.dev_url.clone();
+            let window_builder =
+                tauri::WebviewWindowBuilder::from_config(application, window_config)?;
+            #[cfg(debug_assertions)]
+            let initial_page_loaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            #[cfg(debug_assertions)]
+            let window_builder = {
+                let development_url = development_url.clone();
+                let initial_page_loaded = initial_page_loaded.clone();
+                window_builder.on_page_load(move |_, payload| {
+                    if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                        && development_url
+                            .as_ref()
+                            .is_some_and(|expected| has_same_origin(payload.url(), expected))
+                    {
+                        initial_page_loaded.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                })
+            };
+            let window = window_builder
                 .build()
                 .context("failed to create the main window")?;
             window.show().context("failed to show the main window")?;
             window
                 .set_focus()
                 .context("failed to focus the main window")?;
+
+            #[cfg(debug_assertions)]
+            if let Some(development_url) = development_url {
+                let recovery_window = window.clone();
+                drop(tauri::async_runtime::spawn(async move {
+                    use std::sync::atomic::Ordering;
+                    use std::time::Duration;
+
+                    // The CEF runtime initially loads about:blank while it installs Tauri's
+                    // initialization scripts. A network-service restart can strand that deferred
+                    // navigation, so keep the configured development origin as the startup invariant.
+                    let started_at = tokio::time::Instant::now();
+                    let deadline = started_at + Duration::from_secs(120);
+                    let mut next_navigation_at = started_at + Duration::from_secs(1);
+                    let mut recovery_started = false;
+                    let mut recovery_attempts = 0_u32;
+
+                    loop {
+                        if initial_page_loaded.load(Ordering::Acquire) {
+                            if recovery_started {
+                                tracing::info!(
+                                    url = development_url.as_str(),
+                                    "recovered the initial development page navigation"
+                                );
+                            }
+                            break;
+                        }
+
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
+                            let current_url = recovery_window
+                                .url()
+                                .map_or_else(|error| format!("unavailable: {error}"), |url| url.to_string());
+                            tracing::error!(
+                                expected_url = development_url.as_str(),
+                                current_url,
+                                "the initial development page did not finish loading before the recovery deadline"
+                            );
+                            break;
+                        }
+
+                        if now >= next_navigation_at {
+                            let current_url = recovery_window.url();
+                            let at_development_origin = current_url
+                                .as_ref()
+                                .is_ok_and(|current| has_same_origin(current, &development_url));
+                            let load_is_stalled = now.duration_since(started_at) >= Duration::from_secs(5);
+
+                            if !at_development_origin || load_is_stalled {
+                                if !recovery_started {
+                                    tracing::warn!(
+                                        expected_url = development_url.as_str(),
+                                        current_url = current_url
+                                            .as_ref()
+                                            .map_or("unavailable", tauri::Url::as_str),
+                                        "the development page is not loaded; starting navigation recovery"
+                                    );
+                                    recovery_started = true;
+                                }
+                                // frame.load_url is the runtime's normal navigation path, but CEF can
+                                // keep dropping it after its network service restarts. Page.navigate
+                                // reaches the same browser through CDP and remains usable in that state.
+                                let navigation = serde_json::json!({
+                                    "id": 2_000_000_000_u32 + recovery_attempts,
+                                    "method": "Page.navigate",
+                                    "params": { "url": development_url.as_str() },
+                                })
+                                .to_string();
+                                recovery_attempts += 1;
+                                if let Err(error) =
+                                    recovery_window.send_dev_tools_message(navigation.as_bytes())
+                                {
+                                    tracing::warn!(
+                                        %error,
+                                        "failed to submit a development page CDP recovery navigation"
+                                    );
+                                }
+                            }
+
+                            next_navigation_at = now + Duration::from_secs(5);
+                        }
+
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }));
+            }
+
             let initialization_handle = handle.clone();
             drop(tauri::async_runtime::spawn(async move {
                 initialize(initialization_handle.clone())

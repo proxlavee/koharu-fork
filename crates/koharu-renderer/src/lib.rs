@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod fonts;
 mod frame;
+mod free_text;
 mod images;
 mod layout;
 mod renderer;
@@ -27,7 +28,7 @@ pub use types::{FontFace, FontFamily, FontMetadata, FontRange, FontSource, FontS
 /// Smallest automatically fitted size retained instead of silently producing unreadable text.
 pub const MINIMUM_READABLE_FONT_SIZE: f32 = 12.0;
 
-/// Smallest fraction of an available source-size hint retained during automatic fitting.
+/// Source-size fraction used to diagnose generated text that required substantial shrinkage.
 pub const MINIMUM_SOURCE_FONT_RATIO: f32 = 0.5;
 
 pub(crate) use layout::{HyphenationPolicy, LayoutRun, TextLayout};

@@ -9,11 +9,11 @@ use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_scene::{
-    Asset, AssetRole, BlobId, Change, Component, ComponentOwner, EntityChange, EntityId, FitsTo,
-    FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, Presents, RasterLayer, RasterLayerKind,
-    RecognizedFrom, Region, RelationChange, RelationId, RelationSpec, Revision, Snapshot,
-    TextAlignment, TextDirection, TextLayout as SceneTextLayout, TextLayoutKind, Translation,
-    Typography, Visibility,
+    Asset, AssetRole, BlobId, BubbleRegion, Change, Component, ComponentOwner, EntityChange,
+    EntityId, FitsTo, FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, PanelRegion, Presents,
+    RasterLayer, RasterLayerKind, RecognizedFrom, Region, RegionSpec, RelationChange, RelationId,
+    RelationSpec, Revision, Snapshot, TextAlignment, TextDirection, TextLayout as SceneTextLayout,
+    TextLayoutKind, TextRegion, TextRole, Translation, Typography, Visibility,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -32,15 +32,19 @@ use crate::{
     Error, FontFamily, FontStyle, Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation,
     RasterImage, RenderBounds, RenderDependency, RenderDiagnostic, Result, RetentionStats,
     TextAlign, TextMetadata, TypesettingConfig, WritingMode,
-    bubble::{GeometryFrame, LayoutBox, contour, flow_cells, geometry_bounds, geometry_frame},
+    bubble::{
+        GeometryFrame, LayoutBox, contour, flow_cells, geometry_bounds, geometry_frame,
+        point_in_frame,
+    },
     fonts::{FontPreview, FontRequest, Fonts},
     frame::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
         prepare_frame,
     },
+    free_text::{FreeTextSpace, SpatialRegion},
     images::{DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
-    text_renderer::{StrokeOptions, StrokeSizing, TextNodeDescriptor, TextRenderer},
+    text_renderer::{StrokeOptions, StrokeWidth, TextNodeDescriptor, TextRenderer},
 };
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
@@ -48,6 +52,9 @@ const MAX_SURFACE_PIXELS: u64 = 268_435_456;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
+const FREE_TEXT_ROLE: &str = "dev.koharu.text.free-text";
+const GENERATED_FREE_TEXT_HALO_EM: f32 = 0.08;
+const GENERATED_TEXT_LINE_HEIGHT: f32 = 1.2;
 
 #[derive(Clone)]
 pub struct Renderer {
@@ -507,6 +514,7 @@ impl Renderer {
         let (width, height) = surface_size(&page_value)?;
         let source_role = AssetRole::new("source")?;
         let flow_plan = resolve_balloon_flows(snapshot, page)?;
+        let free_text_plan = resolve_free_text_space(snapshot, page, width, height)?;
         let mut traversal = Traversal {
             snapshot,
             page,
@@ -515,6 +523,7 @@ impl Renderer {
             source_role: &source_role,
             font_families: &typesetting.font_families,
             balloon_flows: flow_plan.placements,
+            free_text_space: free_text_plan.space,
             layers: Vec::new(),
             dependencies: BTreeSet::from([
                 RenderDependency::Entity(page),
@@ -528,6 +537,7 @@ impl Renderer {
             diagnostics: Vec::new(),
         };
         traversal.dependencies.extend(flow_plan.dependencies);
+        traversal.dependencies.extend(free_text_plan.dependencies);
         if let Some(asset) = snapshot.asset(page, &source_role)? {
             let geometry = Geometry::rectangle(0.0, 0.0, f64::from(width), f64::from(height));
             let mut dependencies = BTreeSet::from([
@@ -589,6 +599,7 @@ struct Traversal<'a> {
     source_role: &'a AssetRole,
     font_families: &'a [String],
     balloon_flows: HashMap<EntityId, ResolvedPlacement>,
+    free_text_space: FreeTextSpace,
     layers: Vec<LayerDraft>,
     dependencies: BTreeSet<RenderDependency>,
     diagnostics: Vec<RenderDiagnostic>,
@@ -740,6 +751,7 @@ impl Traversal<'_> {
         let content = presents.value().target;
         dependencies.insert(RenderDependency::Entity(content));
         dependencies.insert(component_dependency::<Translation>(content));
+        dependencies.insert(component_dependency::<TextRole>(content));
         dependencies.insert(RenderDependency::RelationQuery {
             source: content,
             kind: RecognizedFrom::KIND.to_owned(),
@@ -747,6 +759,7 @@ impl Traversal<'_> {
         let Some(translation) = self.snapshot.component::<Translation>(content)? else {
             return Ok(None);
         };
+        let text_role = self.snapshot.component::<TextRole>(content)?;
         let text = translation.text.value;
         if text.trim().is_empty() {
             return Ok(None);
@@ -755,15 +768,78 @@ impl Traversal<'_> {
         let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
             Some(placement.clone())
-        } else if let Some(placement) = self.balloon_flow(entity, dependencies)? {
+        } else if let Some(placement) =
+            self.balloon_flow(entity, authored.is_none().then_some(content), dependencies)?
+        {
             Some(placement)
         } else {
             self.fit(entity, dependencies)?
+        };
+        let typography = self.snapshot.component::<Typography>(entity)?;
+        let analysis =
+            if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
+                dependencies.insert(RenderDependency::Relation(recognized.id()));
+                dependencies.insert(RenderDependency::Entity(recognized.value().target));
+                dependencies.insert(component_dependency::<OcrAnalysis>(
+                    recognized.value().target,
+                ));
+                self.snapshot
+                    .component::<OcrAnalysis>(recognized.value().target)?
+            } else {
+                None
+            };
+        let initial_frame = if let Some(geometry) = authored.as_ref() {
+            geometry_frame(geometry)
+        } else {
+            placement.as_ref().map(|placement| placement.frame)
+        };
+        let Some(initial_frame) = initial_frame else {
+            return Ok(None);
+        };
+        let source_writing_mode = resolve_detected_writing_mode(
+            initial_frame.bounds,
+            typography.as_ref(),
+            analysis.as_ref(),
+        );
+        let writing_mode = resolve_writing_mode(
+            &text,
+            initial_frame.bounds,
+            typography.as_ref(),
+            analysis.as_ref(),
+        );
+        let foreground_color = typography
+            .as_ref()
+            .and_then(|value| value.color)
+            .unwrap_or([0, 0, 0, 255]);
+        let automatic_free_text = authored.is_none()
+            && layout.kind == TextLayoutKind::Paragraph
+            && is_generated_free_text(text_role.as_ref());
+        let free_text_candidates = if automatic_free_text
+            && let Some(placement) = placement.as_ref()
+            && placement.balloon_contour.is_none()
+        {
+            self.free_text_space.candidates(
+                placement.target,
+                &placement.geometry,
+                placement.frame,
+                source_writing_mode,
+                writing_mode,
+                free_text_clearance(typography.as_ref(), text_role.as_ref(), foreground_color),
+            )
+        } else {
+            Vec::new()
         };
         let flow_contour = if authored.is_none() {
             placement
                 .as_ref()
                 .and_then(|placement| placement.flow_contour.clone())
+        } else {
+            None
+        };
+        let preferred_center = if authored.is_none() {
+            placement
+                .as_ref()
+                .and_then(|placement| placement.preferred_center)
         } else {
             None
         };
@@ -786,21 +862,9 @@ impl Traversal<'_> {
                 placement.balloon_contour,
             )
         };
-        let typography = self.snapshot.component::<Typography>(entity)?;
-        let analysis =
-            if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
-                dependencies.insert(RenderDependency::Relation(recognized.id()));
-                dependencies.insert(RenderDependency::Entity(recognized.value().target));
-                dependencies.insert(component_dependency::<OcrAnalysis>(
-                    recognized.value().target,
-                ));
-                self.snapshot
-                    .component::<OcrAnalysis>(recognized.value().target)?
-            } else {
-                None
-            };
-        let writing_mode =
-            resolve_writing_mode(&text, frame.bounds, typography.as_ref(), analysis.as_ref());
+        let preferred_block_center = balloon_contour.as_ref().and_then(|_| {
+            preferred_center.map(|(x, y)| if writing_mode.is_vertical() { x } else { y })
+        });
         let (direction, _) = shaping_direction_for_text(&text, writing_mode);
         let alignment = resolve_alignment(
             typography.as_ref().and_then(|value| value.alignment),
@@ -832,6 +896,9 @@ impl Traversal<'_> {
             height: frame.bounds.height,
             balloon_contour,
             flow_contour,
+            preferred_block_center,
+            free_text_candidates,
+            automatic_free_text,
             preferred_font,
             font_families,
             font_weight: typography.as_ref().and_then(|value| value.font_weight),
@@ -845,12 +912,9 @@ impl Traversal<'_> {
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
-            foreground_color: typography
-                .as_ref()
-                .and_then(|value| value.color)
-                .unwrap_or([0, 0, 0, 255]),
-            stroke: resolve_stroke(typography.as_ref()),
-            line_height: 1.2,
+            foreground_color,
+            stroke: resolve_stroke(typography.as_ref(), text_role.as_ref(), foreground_color),
+            line_height: GENERATED_TEXT_LINE_HEIGHT,
             letter_spacing: 0.0,
             word_spacing: 0.0,
             text_inset: [4.0; 4],
@@ -894,10 +958,12 @@ impl Traversal<'_> {
             return Ok(None);
         };
         Ok(Some(ResolvedPlacement {
+            target,
             geometry,
             frame,
             balloon_contour: None,
             flow_contour: None,
+            preferred_center: None,
             dependencies: Arc::from([]),
         }))
     }
@@ -905,6 +971,7 @@ impl Traversal<'_> {
     fn balloon_flow(
         &self,
         entity: EntityId,
+        anchor_content: Option<EntityId>,
         dependencies: &mut BTreeSet<RenderDependency>,
     ) -> Result<Option<ResolvedPlacement>> {
         let Some(relation) = self.snapshot.relation_from::<FlowsIn>(entity)? else {
@@ -921,11 +988,18 @@ impl Traversal<'_> {
         let Some(frame) = geometry_frame(&geometry) else {
             return Ok(None);
         };
+        let preferred_center = anchor_content
+            .map(|content| flow_anchor(self.snapshot, content, dependencies))
+            .transpose()?
+            .flatten()
+            .map(|anchor| local_flow_anchor(frame, anchor));
         Ok(Some(ResolvedPlacement {
+            target,
             balloon_contour: Some(contour(&geometry, frame)),
             geometry,
             frame,
             flow_contour: None,
+            preferred_center,
             dependencies: Arc::from([]),
         }))
     }
@@ -933,10 +1007,12 @@ impl Traversal<'_> {
 
 #[derive(Clone)]
 struct ResolvedPlacement {
+    target: EntityId,
     geometry: Geometry,
     frame: GeometryFrame,
     balloon_contour: Option<Vec<(f32, f32)>>,
     flow_contour: Option<Vec<(f32, f32)>>,
+    preferred_center: Option<(f32, f32)>,
     dependencies: Arc<[RenderDependency]>,
 }
 
@@ -945,10 +1021,66 @@ struct BalloonFlowPlan {
     dependencies: BTreeSet<RenderDependency>,
 }
 
+struct FreeTextPlan {
+    space: FreeTextSpace,
+    dependencies: BTreeSet<RenderDependency>,
+}
+
 struct FlowSeed {
     layer: EntityId,
     anchor: Option<(f32, f32)>,
     dependencies: BTreeSet<RenderDependency>,
+}
+
+fn resolve_free_text_space(
+    snapshot: &Snapshot,
+    page: EntityId,
+    width: u32,
+    height: u32,
+) -> Result<FreeTextPlan> {
+    let mut panels = Vec::new();
+    let mut obstacles = Vec::new();
+    let mut dependencies = BTreeSet::from([RenderDependency::Hierarchy(page)]);
+    for entity in snapshot.descendants(page)? {
+        let id = entity.id();
+        let Some(region) = snapshot.component::<Region>(id)? else {
+            continue;
+        };
+        let is_panel = region.kind.as_str() == PanelRegion::KIND;
+        let is_obstacle =
+            region.kind.as_str() == TextRegion::KIND || region.kind.as_str() == BubbleRegion::KIND;
+        if !is_panel && !is_obstacle {
+            continue;
+        }
+        dependencies.extend([
+            RenderDependency::Entity(id),
+            component_dependency::<Region>(id),
+            component_dependency::<Geometry>(id),
+        ]);
+        let geometry = snapshot.analysis_region(id)?.geometry()?;
+        let region = SpatialRegion {
+            entity: id,
+            geometry,
+        };
+        if is_panel {
+            panels.push(region);
+        } else {
+            obstacles.push(region);
+        }
+    }
+    Ok(FreeTextPlan {
+        space: FreeTextSpace::new(
+            LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+            },
+            panels,
+            obstacles,
+        ),
+        dependencies,
+    })
 }
 
 fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonFlowPlan> {
@@ -1035,10 +1167,12 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
             placements.insert(
                 seed.layer,
                 ResolvedPlacement {
+                    target: balloon,
                     geometry: geometry.clone(),
                     frame,
                     balloon_contour: Some(balloon_contour.clone()),
                     flow_contour: cells.as_ref().and_then(|cells| cells.get(index).cloned()),
+                    preferred_center: seed.anchor.map(|anchor| local_flow_anchor(frame, anchor)),
                     dependencies: dependencies.clone(),
                 },
             );
@@ -1049,6 +1183,14 @@ fn resolve_balloon_flows(snapshot: &Snapshot, page: EntityId) -> Result<BalloonF
         placements,
         dependencies: all_dependencies,
     })
+}
+
+fn local_flow_anchor(frame: GeometryFrame, anchor: (f32, f32)) -> (f32, f32) {
+    let (x, y) = point_in_frame(frame, anchor.0, anchor.1);
+    (
+        x.clamp(0.0, frame.bounds.width),
+        y.clamp(0.0, frame.bounds.height),
+    )
 }
 
 fn flow_anchor(
@@ -1431,6 +1573,20 @@ fn resolve_writing_mode(
     if !is_chinese_or_japanese_text(text) {
         return WritingMode::Horizontal;
     }
+    resolve_detected_writing_mode(bounds, typography, analysis)
+}
+
+fn resolve_detected_writing_mode(
+    bounds: LayoutBox,
+    typography: Option<&Typography>,
+    analysis: Option<&OcrAnalysis>,
+) -> WritingMode {
+    let typography_mode = typography
+        .and_then(|value| value.writing_mode)
+        .map(|mode| match mode {
+            koharu_scene::WritingMode::Horizontal => WritingMode::Horizontal,
+            koharu_scene::WritingMode::Vertical => WritingMode::VerticalRl,
+        });
     if let Some(mode) = typography_mode {
         return mode;
     }
@@ -1440,6 +1596,34 @@ fn resolve_writing_mode(
         Some(TextDirection::Auto) | None if bounds.height > bounds.width => WritingMode::VerticalRl,
         Some(TextDirection::Auto) | None => WritingMode::Horizontal,
     }
+}
+
+fn is_generated_free_text(role: Option<&TextRole>) -> bool {
+    role.is_some_and(|role| {
+        role.role == FREE_TEXT_ROLE && matches!(&role.origin, Origin::Generated(_))
+    })
+}
+
+fn free_text_clearance(
+    typography: Option<&Typography>,
+    role: Option<&TextRole>,
+    foreground: [u8; 4],
+) -> f32 {
+    if !is_generated_free_text(role) {
+        return 0.0;
+    }
+    if let Some(width) = typography
+        .and_then(|value| value.stroke_width)
+        .filter(|width| *width > 0.0)
+    {
+        return width;
+    }
+    opposing_halo_color(foreground).map_or(0.0, |_| {
+        typography
+            .and_then(|value| value.size)
+            .unwrap_or(crate::MINIMUM_READABLE_FONT_SIZE)
+            * GENERATED_FREE_TEXT_HALO_EM
+    })
 }
 
 fn resolve_alignment(
@@ -1464,21 +1648,51 @@ fn resolve_alignment(
     }
 }
 
-fn resolve_stroke(typography: Option<&Typography>) -> Option<StrokeOptions> {
-    let typography = typography?;
-    let width_px = typography.stroke_width.filter(|width| *width > 0.0)?;
-    let generated_auto_fit =
-        typography.auto_fit && matches!(&typography.origin, Origin::Generated(_));
-    Some(StrokeOptions {
-        color: typography.stroke_color.unwrap_or([u8::MAX; 4]),
-        width_px,
-        sizing: if generated_auto_fit {
-            StrokeSizing::Generated {
-                reference_font_size: typography.size,
-            }
-        } else {
-            StrokeSizing::Absolute
-        },
+fn resolve_stroke(
+    typography: Option<&Typography>,
+    role: Option<&TextRole>,
+    foreground: [u8; 4],
+) -> Option<StrokeOptions> {
+    if let Some(typography) = typography
+        && let Some(width_px) = typography.stroke_width.filter(|width| *width > 0.0)
+    {
+        let generated_auto_fit =
+            typography.auto_fit && matches!(&typography.origin, Origin::Generated(_));
+        return Some(StrokeOptions {
+            color: typography.stroke_color.unwrap_or([u8::MAX; 4]),
+            width: if generated_auto_fit {
+                StrokeWidth::Generated {
+                    width_px,
+                    reference_font_size: typography.size,
+                }
+            } else {
+                StrokeWidth::Absolute(width_px)
+            },
+        });
+    }
+
+    let generated_auto_fit = typography.is_some_and(|typography| {
+        typography.auto_fit && matches!(&typography.origin, Origin::Generated(_))
+    });
+    let generated_free_text = is_generated_free_text(role);
+    (generated_auto_fit && generated_free_text)
+        .then(|| opposing_halo_color(foreground))
+        .flatten()
+        .map(|color| StrokeOptions {
+            color,
+            width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+        })
+}
+
+fn opposing_halo_color([red, green, blue, alpha]: [u8; 4]) -> Option<[u8; 4]> {
+    if alpha == 0 {
+        return None;
+    }
+    let luma = u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114;
+    Some(if luma <= 128_000 {
+        [u8::MAX; 4]
+    } else {
+        [0, 0, 0, u8::MAX]
     })
 }
 
@@ -1785,7 +1999,6 @@ mod tests {
             width: 100.0,
             height: 200.0,
         };
-
         assert_eq!(
             resolve_writing_mode("rokuna", bounds, Some(&typography), None),
             WritingMode::Horizontal
@@ -1817,24 +2030,102 @@ mod tests {
         ));
 
         assert_eq!(
-            resolve_stroke(Some(&typography(generated.clone(), true)))
-                .unwrap()
-                .sizing,
-            StrokeSizing::Generated {
+            resolve_stroke(
+                Some(&typography(generated.clone(), true)),
+                None,
+                [0, 0, 0, 255],
+            )
+            .unwrap()
+            .width,
+            StrokeWidth::Generated {
+                width_px: 3.0,
                 reference_font_size: Some(24.0)
             }
         );
         assert_eq!(
-            resolve_stroke(Some(&typography(generated, false)))
+            resolve_stroke(Some(&typography(generated, false)), None, [0, 0, 0, 255],)
                 .unwrap()
-                .sizing,
-            StrokeSizing::Absolute
+                .width,
+            StrokeWidth::Absolute(3.0)
         );
         assert_eq!(
-            resolve_stroke(Some(&typography(koharu_scene::Origin::User, true)))
-                .unwrap()
-                .sizing,
-            StrokeSizing::Absolute
+            resolve_stroke(
+                Some(&typography(koharu_scene::Origin::User, true)),
+                None,
+                [0, 0, 0, 255],
+            )
+            .unwrap()
+            .width,
+            StrokeWidth::Absolute(3.0)
+        );
+    }
+
+    #[test]
+    fn generated_free_text_without_a_stroke_gets_an_opposing_halo() {
+        let generated = koharu_scene::Origin::Generated(Generation::new(
+            ProducerId::new("dev.koharu.test").unwrap(),
+        ));
+        let typography = Typography {
+            origin: generated.clone(),
+            preferred_font: None,
+            font_weight: None,
+            font_style: None,
+            size: Some(24.0),
+            auto_fit: true,
+            color: None,
+            stroke_color: None,
+            stroke_width: None,
+            alignment: None,
+            writing_mode: None,
+            extensions: BTreeMap::new(),
+        };
+        let role = TextRole {
+            origin: generated,
+            role: FREE_TEXT_ROLE.to_owned(),
+        };
+
+        assert_eq!(
+            resolve_stroke(Some(&typography), Some(&role), [0, 0, 0, 255]),
+            Some(StrokeOptions {
+                color: [255; 4],
+                width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+            })
+        );
+        assert_eq!(
+            resolve_stroke(Some(&typography), Some(&role), [255; 4]),
+            Some(StrokeOptions {
+                color: [0, 0, 0, 255],
+                width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+            })
+        );
+        assert_eq!(
+            free_text_clearance(Some(&typography), Some(&role), [255; 4]),
+            1.92
+        );
+
+        let zero_width_typography = Typography {
+            stroke_width: Some(0.0),
+            ..typography.clone()
+        };
+        assert_eq!(
+            resolve_stroke(Some(&zero_width_typography), Some(&role), [255; 4]),
+            Some(StrokeOptions {
+                color: [0, 0, 0, 255],
+                width: StrokeWidth::FontRelative(GENERATED_FREE_TEXT_HALO_EM),
+            })
+        );
+        assert_eq!(
+            free_text_clearance(Some(&zero_width_typography), Some(&role), [255; 4]),
+            1.92
+        );
+
+        let user_typography = Typography {
+            origin: koharu_scene::Origin::User,
+            ..typography
+        };
+        assert_eq!(
+            resolve_stroke(Some(&user_typography), Some(&role), [0, 0, 0, 255]),
+            None
         );
     }
 
@@ -2088,7 +2379,7 @@ mod tests {
                     let region = edit.add_analysis_region::<koharu_scene::TextRegion>(
                         page,
                         At::End,
-                        &Geometry::rectangle(x, 35.0, 20.0, 30.0),
+                        &Geometry::rectangle(x, 25.0, 20.0, 30.0),
                         None,
                     )?;
                     let content = edit.add_text_content(page, At::End)?;
@@ -2138,6 +2429,7 @@ mod tests {
             panic!("expected a text descriptor");
         };
         assert!(descriptor.flow_contour.is_none());
+        assert_eq!(descriptor.preferred_block_center, Some(20.0));
 
         let add_sibling = base
             .patch(|edit| edit.relate::<FlowsIn>(layers[1], bubble).map(|_| ()))
@@ -2158,6 +2450,7 @@ mod tests {
                 let NodeDescriptor::Text(descriptor) = &layer.descriptor else {
                     panic!("expected a text descriptor");
                 };
+                assert_eq!(descriptor.preferred_block_center, Some(20.0));
                 descriptor.flow_contour.clone().unwrap()
             })
             .collect::<Vec<_>>();
