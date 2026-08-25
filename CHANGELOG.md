@@ -1,3 +1,22 @@
+## [0.80.3](https://github.com/proxlavee/koharu-fork/compare/0.80.2..0.80.3) - 2026-08-25
+
+### 🐛 Bug Fixes
+
+- *(typesetting)* Restore milestone validation - ([e3bd61e](https://github.com/proxlavee/koharu-fork/commit/e3bd61efbcdc28e87c1fb577991c26c65aaff096))
+- *(typesetting)* Improve manga layout and generated text readability - ([bc00d0f](https://github.com/proxlavee/koharu-fork/commit/bc00d0f0ff584f43f9e42ab51523a2de452ef295))
+
+### 🧪 Testing
+
+- *(typesetting)* Make hyphenation contracts portable - ([1d68101](https://github.com/proxlavee/koharu-fork/commit/1d68101711f649a5cc38a0e1cd25758a15cf6941))
+
+### Build
+
+- *(deps)* Bump recharts from 3.8.0 to 3.10.1 - ([2095ce3](https://github.com/proxlavee/koharu-fork/commit/2095ce3704d1f993c909df918751d8a586d618ce))
+- *(deps-dev)* Bump sponsorkit from 17.1.1 to 18.0.0 - ([b18c85b](https://github.com/proxlavee/koharu-fork/commit/b18c85b8fff5f0a8103f01440980ffb0fc774c7a))
+- *(deps-dev)* Bump jsdom from 29.1.1 to 30.0.1 - ([0104278](https://github.com/proxlavee/koharu-fork/commit/0104278e67fa1dfd2a1ebc43b116e2667341fecb))
+- *(deps-dev)* Bump typescript from 6.0.3 to 7.0.2 - ([9e5ced2](https://github.com/proxlavee/koharu-fork/commit/9e5ced2634e7caa6f3aabeb6dfae978a89308248))
+
+
 ## [0.80.2](https://github.com/proxlavee/koharu-fork/compare/0.80.1..0.80.2) - 2026-08-23
 
 ### 🐛 Bug Fixes

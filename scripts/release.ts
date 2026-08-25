@@ -50,18 +50,18 @@ async function main() {
   await exec(`git commit -m "chore(release): ${bumpedVersion}"`, execOpts)
   console.log('Created release commit')
 
-  await exec(`git tag ${bumpedVersion}`, execOpts)
-  console.log('Created git tag')
-
-  await exec(`bun git-cliff --offline -o CHANGELOG.md`, execOpts)
+  await exec(
+    `bun git-cliff --offline --unreleased --tag ${bumpedVersion} --prepend CHANGELOG.md`,
+    execOpts,
+  )
   console.log('Updated CHANGELOG.md')
 
   await exec('git add CHANGELOG.md', execOpts)
   await exec(`git commit --amend --no-edit`, execOpts)
   console.log('Amended release commit with updated CHANGELOG.md')
 
-  await exec(`git tag -f ${bumpedVersion}`, execOpts)
-  console.log('Updated git tag to include CHANGELOG.md')
+  await exec(`git tag ${bumpedVersion}`, execOpts)
+  console.log('Created git tag')
 
   console.log(`Release commit and tag ${bumpedVersion} created.`)
 }
