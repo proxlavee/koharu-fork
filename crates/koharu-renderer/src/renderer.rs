@@ -1120,14 +1120,14 @@ fn source_aware_separator(
     let first_face = first_footprint
         .iter()
         .copied()
-        .map(|point| projection(point))
+        .map(&projection)
         .filter(|value| value.is_finite())
         .max_by(f32::total_cmp)
         .unwrap_or(first_center);
     let second_face = second_footprint
         .iter()
         .copied()
-        .map(|point| projection(point))
+        .map(projection)
         .filter(|value| value.is_finite())
         .min_by(f32::total_cmp)
         .unwrap_or(second_center);
