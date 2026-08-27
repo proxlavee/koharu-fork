@@ -1,0 +1,3 @@
+## 2024-05-17 - [O(N^2) bottlenecks in Canvas Iterations]
+**Learning:** During heavy canvas operations like hitting a layer (`hitTestLayers`) or computing layout map overlaps (`CanvasOverlay.tsx`), sequentially searching the array (`layers.find(...)`) inside a tree-walking loop (like finding parents in `effectiveLayerVisibility`) causes an invisible O(N^2) complexity bottleneck leading to UI choppiness with many layers.
+**Action:** When working with rendering loops and hierarchical structure algorithms that perform property accumulation over parent nodes, explicitly extract state to `Map<string, Layer>` first. Then query parents in O(1) time rather than O(N).

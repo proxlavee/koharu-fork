@@ -31,12 +31,16 @@ export function expandLayerSelection(layers: Layer[], selected: string[]): strin
   return result
 }
 
-export function effectiveLayerVisibility(layers: Layer[], layer: Layer) {
+export function effectiveLayerVisibility(layers: Layer[] | Map<string, Layer>, layer: Layer) {
   let visible = layer.visibility.visible
   let opacity = layer.visibility.opacity
   let parent = layer.parent
+  const isMap = layers instanceof Map
+
   while (parent) {
-    const group = layers.find((candidate) => candidate.id === parent)
+    const group = isMap
+      ? (layers as Map<string, Layer>).get(parent)
+      : (layers as Layer[]).find((candidate) => candidate.id === parent)
     if (!group || !isGroupLayer(group)) break
     visible &&= group.visibility.visible
     opacity *= group.visibility.opacity
