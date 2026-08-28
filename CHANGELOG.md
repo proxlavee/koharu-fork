@@ -1,7 +1,20 @@
-## [0.80.4](https://github.com/proxlavee/koharu-fork/compare/0.80.3..0.80.4) - 2026-08-25
+## [0.80.5](https://github.com/proxlavee/koharu-fork/compare/0.80.3..0.80.5) - 2026-08-28
+
+### ⛰️  Features
+
+- Add the Hayai OCR model - ([156c5fc](https://github.com/proxlavee/koharu-fork/commit/156c5fcf3eb7b12847da5f99f0349081bd0491ac))
 
 ### 🐛 Bug Fixes
 
+- *(canvas)* Prioritize selected page frames - ([e134e23](https://github.com/proxlavee/koharu-fork/commit/e134e23f32f99602d007ee45fee5fd1d121c59c9))
+- *(inpainting)* Preserve preview mask transparency - ([023bf7a](https://github.com/proxlavee/koharu-fork/commit/023bf7a6b9a6a1780336935a7835394ddfa631a9))
+- *(ml)* Align RF-DETR inference with upstream - ([e09feb8](https://github.com/proxlavee/koharu-fork/commit/e09feb87eb801b790f801c9351b25a4469c29a59))
+- *(pipeline)* Make selected reruns authoritative - ([02b4716](https://github.com/proxlavee/koharu-fork/commit/02b47160401940b20d1a7b5749e66bdde33e3a25))
+- *(renderer)* Prevent avoidable balloon shrinkage - ([cb6ab38](https://github.com/proxlavee/koharu-fork/commit/cb6ab38041f15dcc8f86497692678374cf8961dd))
+- *(runtime)* Use dedicated native release repositories - ([86ff7f0](https://github.com/proxlavee/koharu-fork/commit/86ff7f0f9da5988612473a4978e9698d19877176))
+- *(runtime)* Update Torch to v2.13.0.3 - ([fd0ca01](https://github.com/proxlavee/koharu-fork/commit/fd0ca01e0ceba2d198fde4b981da7efa8c0d32ed))
+- *(typesetting)* Preserve readable comic layouts - ([0d0c204](https://github.com/proxlavee/koharu-fork/commit/0d0c2043ca03afd4840a232c04e699cc3b94a331))
+- *(typesetting)* Separate overlapping balloon flows - ([d61dd12](https://github.com/proxlavee/koharu-fork/commit/d61dd129a1605ac4eca4e56a5f8cc29f26fbd50d))
 - *(typesetting)* Preserve readable generated text composition - ([6476c8e](https://github.com/proxlavee/koharu-fork/commit/6476c8efd5d916fbee925e50d126f68fc7e69136))
 
 ### 🚜 Refactor
@@ -10,6 +23,8 @@
 
 ### 🧪 Testing
 
+- *(pipeline)* Seed source text before translation - ([a025b76](https://github.com/proxlavee/koharu-fork/commit/a025b76037867cba015ccd7c6bec098585bae1a6))
+- *(renderer)* Use measured vertical ink clearance - ([6b16a39](https://github.com/proxlavee/koharu-fork/commit/6b16a3984936b6f6a5bdb959a37ea8f5bef71bd8))
 - *(renderer)* Compare projected heights geometrically - ([ef7c90c](https://github.com/proxlavee/koharu-fork/commit/ef7c90c66e73db271220eba720816898e3aaddf7))
 
 
