@@ -1,6 +1,6 @@
 //! Native page preparation shared by browser presentation and export.
 
-use std::{collections::HashSet, future::Future, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
 
 use anyhow::{Context as _, Result, bail};
 use koharu_rasterizer::{Rasterizer, ResourceId};
@@ -54,6 +54,10 @@ struct PresentationState {
 }
 
 const MAX_CACHED_PAGE_FRAMES: usize = 8;
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
 
 #[derive(Default)]
 struct PageFrameCache {
@@ -119,8 +123,13 @@ impl Desktop {
             .map_err(Into::into)
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(page = %page, revision = %snapshot.revision()))]
     pub async fn prepare_page(&self, snapshot: &Snapshot, page: EntityId) -> Result<bool> {
-        let request = self.request_preparation();
+        // Cache warming observes the current presentation epoch instead of
+        // advancing it. A foreground page selection must be able to preempt
+        // background work, while a late prefetch must never cancel the frame
+        // the user explicitly requested.
+        let request = self.current_preparation();
         let _preparation = self.preparation.lock().await;
         if !self.is_current_preparation(request) {
             return Ok(false);
@@ -355,14 +364,31 @@ impl Desktop {
         Ok(true)
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, fields(page = ?page, revision = %snapshot.revision()))]
     pub async fn show_page(&self, snapshot: &Snapshot, page: Option<EntityId>) -> Result<bool> {
+        let started = Instant::now();
         let request = self.request_preparation();
+        let wait_started = Instant::now();
         let _preparation = self.preparation.lock().await;
-        if !self.is_current_preparation(request) {
-            return Ok(false);
-        }
-        self.show_page_locked(snapshot, page, request).await
+        let wait_us = elapsed_micros(wait_started);
+        let work_started = Instant::now();
+        let result = if self.is_current_preparation(request) {
+            self.show_page_locked(snapshot, page, request).await
+        } else {
+            Ok(false)
+        };
+        tracing::info!(
+            target: "koharu_renderer_timing",
+            marker = "show_page",
+            page = ?page,
+            revision = %snapshot.revision(),
+            wait_us,
+            work_us = elapsed_micros(work_started),
+            total_us = elapsed_micros(started),
+            presented = ?result.as_ref().copied().ok(),
+            success = result.is_ok(),
+        );
+        result
     }
 
     pub async fn clear(&self) {
@@ -417,6 +443,10 @@ impl Desktop {
         };
         self.preparation_changed.notify_waiters();
         request
+    }
+
+    fn current_preparation(&self) -> u64 {
+        self.presentation.read().requested_preparation
     }
 
     fn is_current_preparation(&self, request: u64) -> bool {
@@ -588,6 +618,20 @@ mod tests {
         assert!(!desktop.replace_frame_if_current(obsolete, None));
         assert_eq!(desktop.canvas_state().generation, 0);
         assert!(desktop.replace_frame_if_current(latest, None));
+        assert_eq!(desktop.canvas_state().generation, 1);
+    }
+
+    #[test]
+    fn background_preparation_observes_the_foreground_epoch() {
+        let desktop = Desktop::new().unwrap();
+        let earlier_background = desktop.current_preparation();
+        let foreground = desktop.request_preparation();
+        let later_background = desktop.current_preparation();
+
+        assert_ne!(earlier_background, foreground);
+        assert_eq!(later_background, foreground);
+        assert!(!desktop.replace_frame_if_current(earlier_background, None));
+        assert!(desktop.replace_frame_if_current(foreground, None));
         assert_eq!(desktop.canvas_state().generation, 1);
     }
 }

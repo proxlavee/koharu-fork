@@ -5,6 +5,7 @@ import { observeElementRect, useVirtualizer } from '@tanstack/react-virtual'
 import {
   FilePlus2,
   FolderOpen,
+  GripVertical,
   LoaderCircle,
   MoreHorizontal,
   Search,
@@ -470,11 +471,10 @@ function PageItem({
 
   return (
     <article
-      draggable
       data-active={active}
       data-selected={selected}
       className={cn(
-        'group grid cursor-default grid-cols-[48px_minmax(0,1fr)] gap-2.5 rounded-xl p-1.5 transition-colors select-none',
+        'group grid cursor-default grid-cols-[8px_48px_minmax(0,1fr)] gap-1.5 rounded-xl p-1.5 transition-colors select-none',
         active
           ? 'bg-primary/[0.09] hover:bg-primary/[0.09]'
           : selected
@@ -489,14 +489,27 @@ function PageItem({
         onSelect(event.ctrlKey || event.metaKey, event.shiftKey)
       }}
       onDoubleClick={onRename}
-      onDragStart={onDragStart}
-      onDragEnd={onDragEnd}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault()
         onDrop()
       }}
     >
+      <div
+        draggable
+        data-page-drag-handle
+        aria-hidden='true'
+        className='grid h-16 cursor-grab place-items-center text-muted-foreground/50 active:cursor-grabbing'
+        onClick={(event) => event.stopPropagation()}
+        onDragStart={(event) => {
+          event.dataTransfer.effectAllowed = 'move'
+          event.dataTransfer.setData('text/plain', page.id)
+          onDragStart()
+        }}
+        onDragEnd={onDragEnd}
+      >
+        <GripVertical className='size-3' />
+      </div>
       <div className='grid h-16 w-12 place-items-center overflow-hidden rounded-lg bg-[var(--surface-well)]'>
         {page.source_asset ? (
           <PageThumbnail page={page.id} asset={page.source_asset} label={page.label} />

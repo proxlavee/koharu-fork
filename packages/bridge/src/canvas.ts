@@ -86,6 +86,17 @@ interface CanvasModule {
 let modulePromise: Promise<CanvasModule> | null = null
 let activeCanvas: Canvas | null = null
 let prefetchGeneration = 0
+let nativePrefetchTail: Promise<void> = Promise.resolve()
+
+type CanvasStagePriority = 'foreground' | 'background'
+
+interface CanvasStageQueue {
+  running: boolean
+  foreground: Array<() => Promise<void>>
+  background: Array<() => Promise<void>>
+}
+
+const canvasStageQueues = new WeakMap<Canvas, CanvasStageQueue>()
 
 export async function createCanvas(
   element: HTMLCanvasElement,
@@ -206,6 +217,30 @@ export async function fetchCanvasResource(
   return canvasBytesView(await commands.getCanvasResource(generation, resource))
 }
 
+export async function loadCanvasFrame(
+  canvas: Canvas,
+  generation: number,
+  current: () => boolean,
+): Promise<boolean> {
+  const manifest = await fetchCanvasManifest(generation)
+  if (!current()) return false
+  if (canvas.hasActiveManifest(manifest)) return true
+  const activated = await enqueueCanvasStage(canvas, 'foreground', async () => {
+    if (!current()) return false
+    if (canvas.hasActiveManifest(manifest)) return true
+    return installCanvasManifest(
+      canvas,
+      manifest,
+      current,
+      (resource) => fetchCanvasResource(generation, resource),
+      (token) => canvas.activateFrame(token),
+    )
+  })
+  if (!current()) return false
+  if (!activated) throw new Error('The prepared canvas frame could not be activated.')
+  return true
+}
+
 // Specta exposes CanvasBytes as number[], while its IpcResponse sends an ArrayBuffer at runtime.
 function canvasBytesView(bytes: number[] | ArrayBuffer): Uint8Array {
   return new Uint8Array(bytes)
@@ -243,39 +278,110 @@ export function cancelCanvasPrefetch(): void {
   prefetchGeneration++
 }
 
-export async function prefetchCanvasPages(pages: string[]) {
+export function prefetchCanvasPages(pages: string[]): Promise<CanvasPagePreparation[]> {
   const canvas = activeCanvas
-  if (!canvas || pages.length === 0) return []
-  const preparedPages: CanvasPagePreparation[] = []
+  if (!canvas || pages.length === 0) return Promise.resolve([])
   const generation = ++prefetchGeneration
   const current = () => activeCanvas === canvas && prefetchGeneration === generation
-  for (const page of pages) {
-    const prepared = await commands.prepareCanvasPage(page)
-    if (!current() || prepared === null) return preparedPages
-    const revision = prepared.revision
-    const manifest = canvasBytesView(await commands.getCanvasPageManifest(page, revision))
+  return enqueueNativePrefetch(async () => {
+    const preparedPages: CanvasPagePreparation[] = []
     if (!current()) return preparedPages
-    const staged = canvas.stageManifest(manifest)
-    for (let offset = 0; offset < staged.missing.length; offset += 4) {
-      const resources = staged.missing.slice(offset, offset + 4)
-      const packets = await Promise.all(
-        resources.map(
+    for (const page of pages) {
+      const prepared = await commands.prepareCanvasPage(page)
+      if (!current() || prepared === null) return preparedPages
+      const revision = prepared.revision
+      const manifest = canvasBytesView(await commands.getCanvasPageManifest(page, revision))
+      if (!current()) return preparedPages
+      const cached = await enqueueCanvasStage(canvas, 'background', () =>
+        installCanvasManifest(
+          canvas,
+          manifest,
+          current,
           async (resource) =>
-            [
-              resource,
-              canvasBytesView(await commands.getCanvasPageResource(page, revision, resource)),
-            ] as const,
+            canvasBytesView(await commands.getCanvasPageResource(page, revision, resource)),
+          (token) => canvas.cacheFrame(token, page),
         ),
       )
       if (!current()) return preparedPages
-      await Promise.all(
-        packets.map(([resource, packet]) => canvas.installResource(resource, packet)),
-      )
+      if (cached) preparedPages.push(prepared)
     }
-    if (!current()) return preparedPages
-    if (canvas.cacheFrame(staged.token, page)) preparedPages.push(prepared)
+    return preparedPages
+  })
+}
+
+function enqueueNativePrefetch<Result>(operation: () => Promise<Result>): Promise<Result> {
+  // The desktop renderer serializes page preparation internally. Keep speculative
+  // requests serialized here too, so pointer movement can leave at most the
+  // active request plus the newest still-current intent instead of a native queue.
+  const result = nativePrefetchTail.then(operation, operation)
+  nativePrefetchTail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
+}
+
+async function installCanvasManifest(
+  canvas: Canvas,
+  manifest: Uint8Array,
+  current: () => boolean,
+  fetchResource: (resource: string) => Promise<Uint8Array>,
+  commit: (token: number) => boolean,
+): Promise<boolean> {
+  if (!current()) return false
+  const staged = canvas.stageManifest(manifest)
+  for (let offset = 0; offset < staged.missing.length; offset += 4) {
+    const resources = staged.missing.slice(offset, offset + 4)
+    const packets = await Promise.all(
+      resources.map(async (resource) => [resource, await fetchResource(resource)] as const),
+    )
+    if (!current()) return false
+    await Promise.all(packets.map(([resource, packet]) => canvas.installResource(resource, packet)))
   }
-  return preparedPages
+  if (!current()) return false
+  return commit(staged.token)
+}
+
+function enqueueCanvasStage<Result>(
+  canvas: Canvas,
+  priority: CanvasStagePriority,
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  const existing = canvasStageQueues.get(canvas)
+  const queue: CanvasStageQueue = existing ?? { running: false, foreground: [], background: [] }
+  if (!existing) canvasStageQueues.set(canvas, queue)
+  return new Promise<Result>((resolve, reject) => {
+    queue[priority].push(async () => {
+      try {
+        resolve(await operation())
+      } catch (error) {
+        reject(error)
+      }
+    })
+    void drainCanvasStageQueue(canvas, queue)
+  })
+}
+
+async function drainCanvasStageQueue(canvas: Canvas, queue: CanvasStageQueue): Promise<void> {
+  if (queue.running) return
+  queue.running = true
+  try {
+    for (;;) {
+      // WebCanvas owns one staged manifest. An operation already touching that
+      // slot must finish, but a selected page takes the next turn instead of
+      // waiting behind speculative cache warming.
+      const operation = queue.foreground.shift() ?? queue.background.shift()
+      if (!operation) break
+      await operation()
+    }
+  } finally {
+    queue.running = false
+    if (queue.foreground.length > 0 || queue.background.length > 0) {
+      void drainCanvasStageQueue(canvas, queue)
+    } else if (canvasStageQueues.get(canvas) === queue) {
+      canvasStageQueues.delete(canvas)
+    }
+  }
 }
 
 export function workspaceColor(): WorkspaceColor {

@@ -354,6 +354,22 @@ describe('greenfield editor', () => {
     expect(screen.queryByText('01')).not.toBeInTheDocument()
   })
 
+  it('keeps page selection clicks separate from the reorder drag handle', async () => {
+    installProject()
+    const selectPage = vi.spyOn(commands, 'selectPage')
+    const view = render(<PageRail />)
+    const row = screen.getByText('Page 1').closest('article')!
+    const handle = view.container.querySelector('[data-page-drag-handle]')!
+
+    expect(row).not.toHaveAttribute('draggable')
+    expect(handle).toHaveAttribute('draggable', 'true')
+    fireEvent.click(handle)
+    expect(selectPage).not.toHaveBeenCalled()
+
+    fireEvent.click(row)
+    await waitFor(() => expect(selectPage).toHaveBeenCalledWith('page'))
+  })
+
   it('keeps rapid page switches on the latest native selection', async () => {
     installProject()
     const pages = [

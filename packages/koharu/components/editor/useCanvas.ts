@@ -6,8 +6,7 @@ import {
   activateCanvas,
   cancelCanvasPrefetch,
   createCanvas,
-  fetchCanvasManifest,
-  fetchCanvasResource,
+  loadCanvasFrame,
   type Canvas,
 } from '@koharu/bridge/canvas'
 
@@ -136,7 +135,7 @@ export function useCanvas(
       generationRef.current === requested &&
       revisionRef.current !== null
 
-    void prepareFrame(canvas, requested, current)
+    void loadCanvasFrame(canvas, requested, current)
       .then((activated) => {
         if (!current() || !activated) return
         activeFrame.current = { canvas, generation: requested }
@@ -160,32 +159,6 @@ export function useCanvas(
   }, [canvas])
 
   return { canvas, error, generation: activeGeneration, hasFrame, retry, status }
-}
-
-async function prepareFrame(
-  canvas: Canvas,
-  generation: number,
-  current: () => boolean,
-): Promise<boolean> {
-  const manifest = await fetchCanvasManifest(generation)
-  if (!current()) return false
-  if (canvas.hasActiveManifest(manifest)) return true
-  const staged = canvas.stageManifest(manifest)
-  for (let offset = 0; offset < staged.missing.length; offset += 4) {
-    const resources = staged.missing.slice(offset, offset + 4)
-    const packets = await Promise.all(
-      resources.map(
-        async (resource) => [resource, await fetchCanvasResource(generation, resource)] as const,
-      ),
-    )
-    if (!current()) return false
-    await Promise.all(packets.map(([resource, packet]) => canvas.installResource(resource, packet)))
-  }
-  if (!current()) return false
-  const activated = canvas.activateFrame(staged.token)
-  if (!current()) return false
-  if (!activated) throw new Error('The prepared canvas frame was superseded before activation.')
-  return true
 }
 
 function toError(value: unknown): Error {

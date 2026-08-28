@@ -45,6 +45,30 @@ vi.mock('@koharu/bridge/canvas', () => ({
   fetchCanvasManifest: (generation: number) => adapter.fetchManifest(generation),
   fetchCanvasResource: (generation: number, resource: string) =>
     adapter.fetchResource(generation, resource),
+  loadCanvasFrame: async (canvas: typeof renderer, generation: number, current: () => boolean) => {
+    const manifest = await adapter.fetchManifest(generation)
+    if (!current()) return false
+    if (canvas.hasActiveManifest(manifest)) return true
+    const staged = canvas.stageManifest(manifest)
+    for (let offset = 0; offset < staged.missing.length; offset += 4) {
+      const resources = staged.missing.slice(offset, offset + 4)
+      const packets = await Promise.all(
+        resources.map(
+          async (resource) =>
+            [resource, await adapter.fetchResource(generation, resource)] as const,
+        ),
+      )
+      if (!current()) return false
+      await Promise.all(
+        packets.map(([resource, packet]) => canvas.installResource(resource, packet)),
+      )
+    }
+    if (!current()) return false
+    const activated = canvas.activateFrame(staged.token)
+    if (!current()) return false
+    if (!activated) throw new Error('The prepared canvas frame could not be activated.')
+    return true
+  },
   activateCanvas: (canvas: unknown) => adapter.activate(canvas),
   cancelCanvasPrefetch: vi.fn(),
 }))
