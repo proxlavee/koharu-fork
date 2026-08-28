@@ -5820,17 +5820,13 @@ mod tests {
             .inline_ink_bounds(font_size, &vertical_plain.lines[0])
             .expect("test glyph should have vertical ink bounds");
         let vertical_ink_extent = vertical_ink_end - vertical_ink_start;
-        assert!(
-            vertical_advance
-                > horizontal_advance + COMIC_LINE_RASTER_TOLERANCE * 3.0
-        );
+        assert!(vertical_advance > horizontal_advance + COMIC_LINE_RASTER_TOLERANCE * 3.0);
         let vertical_width = font_size * 5.0;
         // Reusing the horizontal advance as total vertical wall air would leave
         // enough room for the painted glyph. Axis-specific vertical air leaves
         // less than the measured ink extent even after raster tolerance.
-        let insufficient_height = horizontal_advance
-            + vertical_ink_extent
-            + COMIC_LINE_RASTER_TOLERANCE;
+        let insufficient_height =
+            horizontal_advance + vertical_ink_extent + COMIC_LINE_RASTER_TOLERANCE;
         let constrained = TextLayout::new(&font)
             .with_font_size(font_size)
             .with_writing_mode(WritingMode::VerticalRl)
