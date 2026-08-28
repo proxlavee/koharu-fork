@@ -330,6 +330,21 @@ fn write_regions<'a>(
     let inferred = detections
         .par_iter()
         .map(|detection| {
+            let span = tracing::trace_span!(
+                target: "koharu_detection_probe",
+                "infer_typography",
+                marker = "typography_detection",
+                %page,
+                label = %detection.label,
+                score = detection.score,
+                bbox = ?detection.bbox,
+                mask_x = detection.mask.x,
+                mask_y = detection.mask.y,
+                mask_width = detection.mask.width,
+                mask_height = detection.mask.height,
+                mask_area = detection.area,
+            );
+            let _entered = span.enter();
             (detection.label == "text")
                 .then(|| infer_typography(image, detection))
                 .flatten()
@@ -919,6 +934,34 @@ fn infer_outline(
         .filter(|(_, cluster)| !cluster.pixels.is_empty())
         .min_by_key(|(_, cluster)| color_distance_squared(cluster.color, background))
         .map(|(index, _)| index)?;
+    if tracing::enabled!(target: "koharu_detection_probe", tracing::Level::TRACE) {
+        let cluster_trace = clusters
+            .iter()
+            .enumerate()
+            .map(|(index, cluster)| {
+                (
+                    index,
+                    cluster.color,
+                    cluster.pixels.len(),
+                    cluster
+                        .pixels
+                        .iter()
+                        .filter(|pixel| pixel.inside_mask)
+                        .count(),
+                    color_distance_squared(cluster.color, background),
+                )
+            })
+            .collect::<Vec<_>>();
+        tracing::trace!(
+            target: "koharu_detection_probe",
+            marker = "outline_clusters",
+            ?background,
+            background_index,
+            width,
+            height,
+            ?cluster_trace,
+        );
+    }
     let mut best = None;
     for (stroke_index, stroke_cluster) in clusters.iter().enumerate() {
         if stroke_cluster.pixels.len() < 8 || stroke_index == background_index {
@@ -953,25 +996,77 @@ fn infer_outline(
             let fill_color = median_pixel_color(&enclosed_fill);
             let stroke_color = median_pixel_color(&stroke_pixels);
             let contrast = color_distance_squared(fill_color, stroke_color);
-            if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
-                || color_distance_squared(fill_color, background)
-                    < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
-                || color_distance_squared(stroke_color, background)
-                    < COLOR_CLUSTER_MIN_DISTANCE_SQUARED
-                || color_lies_between(stroke_color, fill_color, background)
-                || color_lies_between(fill_color, stroke_color, background)
-            {
+            let fill_background_distance = color_distance_squared(fill_color, background);
+            let stroke_background_distance = color_distance_squared(stroke_color, background);
+            let stroke_between = color_lies_between(stroke_color, fill_color, background);
+            let fill_between = color_lies_between(fill_color, stroke_color, background);
+            let rejection = if contrast < COLOR_CLUSTER_MIN_DISTANCE_SQUARED {
+                Some("fill-stroke-contrast")
+            } else if fill_background_distance < COLOR_CLUSTER_MIN_DISTANCE_SQUARED {
+                Some("fill-matches-background")
+            } else if stroke_background_distance < COLOR_CLUSTER_MIN_DISTANCE_SQUARED {
+                Some("stroke-matches-background")
+            } else if stroke_between {
+                Some("stroke-is-intermediate")
+            } else if fill_between {
+                Some("fill-is-intermediate")
+            } else {
+                None
+            };
+            if let Some(rejection) = rejection {
+                tracing::trace!(
+                    target: "koharu_detection_probe",
+                    marker = "outline_candidate",
+                    accepted = false,
+                    rejection,
+                    stroke_index,
+                    fill_index,
+                    ?fill_color,
+                    ?stroke_color,
+                    contrast,
+                    fill_background_distance,
+                    stroke_background_distance,
+                    stroke_between,
+                    fill_between,
+                    enclosed_fill = enclosed_fill.len(),
+                    stroke_pixels = stroke_pixels.len(),
+                );
                 continue;
             }
             let normalized_fill = normalize_text_color(fill_color);
             let normalized_stroke = normalize_text_color(stroke_color);
             if normalized_fill == normalized_stroke {
+                tracing::trace!(
+                    target: "koharu_detection_probe",
+                    marker = "outline_candidate",
+                    accepted = false,
+                    rejection = "normalized-colors-match",
+                    stroke_index,
+                    fill_index,
+                    ?fill_color,
+                    ?stroke_color,
+                    ?normalized_fill,
+                    enclosed_fill = enclosed_fill.len(),
+                    stroke_pixels = stroke_pixels.len(),
+                );
                 continue;
             }
 
             let Some(stroke_width) =
                 measured_stroke_width(&stroke_pixels, &enclosed_fill, &outside, width, height)
             else {
+                tracing::trace!(
+                    target: "koharu_detection_probe",
+                    marker = "outline_candidate",
+                    accepted = false,
+                    rejection = "unmeasured-stroke-width",
+                    stroke_index,
+                    fill_index,
+                    ?fill_color,
+                    ?stroke_color,
+                    enclosed_fill = enclosed_fill.len(),
+                    stroke_pixels = stroke_pixels.len(),
+                );
                 continue;
             };
             let inside_fill = enclosed_fill
@@ -979,6 +1074,8 @@ fn infer_outline(
                 .filter(|pixel| pixel.inside_mask)
                 .count();
             let evidence = enclosed_fill.len() + inside_fill;
+            let enclosed_fill_len = enclosed_fill.len();
+            let stroke_pixels_len = stroke_pixels.len();
             let mut ink_pixels = enclosed_fill;
             ink_pixels.extend(stroke_pixels);
             let candidate = OutlinePaint {
@@ -988,13 +1085,47 @@ fn infer_outline(
                 score: u64::from(contrast) * evidence.min(4096) as u64,
                 ink_pixels,
             };
-            if best
+            let replaces_best = best
                 .as_ref()
-                .is_none_or(|current: &OutlinePaint| candidate.score > current.score)
-            {
+                .is_none_or(|current: &OutlinePaint| candidate.score > current.score);
+            tracing::trace!(
+                target: "koharu_detection_probe",
+                marker = "outline_candidate",
+                accepted = true,
+                replaces_best,
+                stroke_index,
+                fill_index,
+                ?fill_color,
+                ?stroke_color,
+                ?normalized_fill,
+                ?normalized_stroke,
+                stroke_width,
+                evidence,
+                score = candidate.score,
+                enclosed_fill = enclosed_fill_len,
+                stroke_pixels = stroke_pixels_len,
+            );
+            if replaces_best {
                 best = Some(candidate);
             }
         }
+    }
+    if let Some(selected) = &best {
+        tracing::trace!(
+            target: "koharu_detection_probe",
+            marker = "outline_selected",
+            accepted = true,
+            fill_color = ?selected.fill_color,
+            stroke_color = ?selected.stroke_color,
+            stroke_width = selected.stroke_width,
+            score = selected.score,
+        );
+    } else {
+        tracing::trace!(
+            target: "koharu_detection_probe",
+            marker = "outline_selected",
+            accepted = false,
+        );
     }
     best
 }
