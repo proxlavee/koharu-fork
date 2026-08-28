@@ -548,7 +548,7 @@ impl<'a> TextLayout<'a> {
                 && layout.height <= max_height + f32::EPSILON
         };
 
-        if self.comic_balloon.is_some() {
+        if let Some(balloon) = &self.comic_balloon {
             // A balloon's usable width changes when the text reflows to a different
             // number of lines, so a smaller font can fail even though a larger one
             // fits. Search every visible-pixel candidate without assuming that the
@@ -580,10 +580,6 @@ impl<'a> TextLayout<'a> {
                 target: "koharu_typesetting_probe",
                 tracing::Level::TRACE
             ) {
-                let balloon = self
-                    .comic_balloon
-                    .as_ref()
-                    .expect("comic search diagnostics require a balloon");
                 let contour_trace = balloon
                     .contours
                     .iter()

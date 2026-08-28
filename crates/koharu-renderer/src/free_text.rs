@@ -39,6 +39,17 @@ pub(crate) struct FreeTextSpace {
     obstacles: Vec<SpatialRegion>,
 }
 
+pub(crate) struct FreeTextRequest<'a> {
+    pub(crate) source: EntityId,
+    pub(crate) source_geometry: &'a Geometry,
+    pub(crate) source_frame: GeometryFrame,
+    pub(crate) source_writing_mode: WritingMode,
+    pub(crate) target_writing_mode: WritingMode,
+    pub(crate) refine_orthogonal_shape: bool,
+    pub(crate) translation_visual_area_scale: f32,
+    pub(crate) clearance: f32,
+}
+
 struct InlineCorridor<'a> {
     source: EntityId,
     source_site: (f32, f32),
@@ -105,17 +116,17 @@ impl FreeTextSpace {
     /// unused inline corridor space while retaining the source visual-area budget
     /// and anchor. Longer translations add progressive visual-area families; the
     /// text renderer stops at the first tier that leaves the emergency fit band.
-    pub(crate) fn candidates(
-        &self,
-        source: EntityId,
-        source_geometry: &Geometry,
-        source_frame: GeometryFrame,
-        source_writing_mode: WritingMode,
-        target_writing_mode: WritingMode,
-        refine_orthogonal_shape: bool,
-        translation_visual_area_scale: f32,
-        clearance: f32,
-    ) -> Vec<FreeTextCandidate> {
+    pub(crate) fn candidates(&self, request: FreeTextRequest<'_>) -> Vec<FreeTextCandidate> {
+        let FreeTextRequest {
+            source,
+            source_geometry,
+            source_frame,
+            source_writing_mode,
+            target_writing_mode,
+            refine_orthogonal_shape,
+            translation_visual_area_scale,
+            clearance,
+        } = request;
         let maximum_visual_area = geometry_area(source_geometry);
         if !maximum_visual_area.is_finite() || maximum_visual_area <= 0.0 {
             return Vec::new();
@@ -208,122 +219,123 @@ impl FreeTextSpace {
                 .map(|obstacle| obstacle.entity)
                 .collect::<Vec<_>>()
         });
-        let mut push_candidate = |target_frame: GeometryFrame,
-                                  expand_inline: bool,
-                                  maximum_visual_area: f32,
-                                  visual_area_scale: f32| {
-            let frame = match self.fit_inline_corridor(&corridor, target_frame, expand_inline) {
-                Ok(frame) => frame,
-                Err(rejection) => {
-                    #[cfg(debug_assertions)]
-                    if let Some(rejections) = &mut rejections {
-                        rejections.push((
-                            target_frame.bounds,
-                            expand_inline,
-                            visual_area_scale,
-                            rejection,
-                        ));
+        {
+            let mut push_candidate = |target_frame: GeometryFrame,
+                                      expand_inline: bool,
+                                      maximum_visual_area: f32,
+                                      visual_area_scale: f32| {
+                let frame = match self.fit_inline_corridor(&corridor, target_frame, expand_inline) {
+                    Ok(frame) => frame,
+                    Err(rejection) => {
+                        #[cfg(debug_assertions)]
+                        if let Some(rejections) = &mut rejections {
+                            rejections.push((
+                                target_frame.bounds,
+                                expand_inline,
+                                visual_area_scale,
+                                rejection,
+                            ));
+                        }
+                        return;
                     }
+                };
+                let center = (
+                    frame.bounds.x + frame.bounds.width * 0.5,
+                    frame.bounds.y + frame.bounds.height * 0.5,
+                );
+                let local_center = point_in_frame(source_frame, center.0, center.1);
+                let bounds = LayoutBox {
+                    x: local_center.0 - frame.bounds.width * 0.5,
+                    y: local_center.1 - frame.bounds.height * 0.5,
+                    width: frame.bounds.width,
+                    height: frame.bounds.height,
+                };
+                if candidates.iter().any(|candidate: &FreeTextCandidate| {
+                    approximately_equal(candidate.bounds.x, bounds.x)
+                        && approximately_equal(candidate.bounds.y, bounds.y)
+                        && approximately_equal(candidate.bounds.width, bounds.width)
+                        && approximately_equal(candidate.bounds.height, bounds.height)
+                        && approximately_equal(candidate.maximum_visual_area, maximum_visual_area)
+                }) {
                     return;
                 }
+                let aspect = bounds.width / bounds.height;
+                let shift_x = (local_center.0 - preferred_center.0) / source_width;
+                let shift_y = (local_center.1 - preferred_center.1) / source_height;
+                candidates.push(FreeTextCandidate {
+                    bounds,
+                    preferred_center,
+                    maximum_visual_area,
+                    translation_visual_area_scale: visual_area_scale,
+                    source_distance: (aspect / source_aspect).ln().abs()
+                        + visual_area_scale.ln().abs() * 0.5
+                        + shift_x.hypot(shift_y),
+                });
             };
-            let center = (
-                frame.bounds.x + frame.bounds.width * 0.5,
-                frame.bounds.y + frame.bounds.height * 0.5,
-            );
-            let local_center = point_in_frame(source_frame, center.0, center.1);
-            let bounds = LayoutBox {
-                x: local_center.0 - frame.bounds.width * 0.5,
-                y: local_center.1 - frame.bounds.height * 0.5,
-                width: frame.bounds.width,
-                height: frame.bounds.height,
-            };
-            if candidates.iter().any(|candidate: &FreeTextCandidate| {
-                approximately_equal(candidate.bounds.x, bounds.x)
-                    && approximately_equal(candidate.bounds.y, bounds.y)
-                    && approximately_equal(candidate.bounds.width, bounds.width)
-                    && approximately_equal(candidate.bounds.height, bounds.height)
-                    && approximately_equal(candidate.maximum_visual_area, maximum_visual_area)
-            }) {
-                return;
-            }
-            let aspect = bounds.width / bounds.height;
-            let shift_x = (local_center.0 - preferred_center.0) / source_width;
-            let shift_y = (local_center.1 - preferred_center.1) / source_height;
-            candidates.push(FreeTextCandidate {
-                bounds,
-                preferred_center,
-                maximum_visual_area,
-                translation_visual_area_scale: visual_area_scale,
-                source_distance: (aspect / source_aspect).ln().abs()
-                    + visual_area_scale.ln().abs() * 0.5
-                    + shift_x.hypot(shift_y),
-            });
-        };
 
-        let mut push_family = |visual_area_scale: f32| {
-            let linear_scale = visual_area_scale.sqrt();
-            let family_area = maximum_visual_area * linear_scale * linear_scale;
-            let family_source = GeometryFrame {
-                bounds: LayoutBox {
-                    x: source_center.0 - source_width * linear_scale * 0.5,
-                    y: source_center.1 - source_height * linear_scale * 0.5,
-                    width: source_width * linear_scale,
-                    height: source_height * linear_scale,
-                },
-                angle_degrees: source_frame.angle_degrees,
-            };
-            if same_direction {
-                push_candidate(family_source, false, family_area, visual_area_scale);
-                push_candidate(family_source, true, family_area, visual_area_scale);
-                return;
-            }
-
-            let logical_transpose = logical_frame(
-                source_center,
-                source_frame.angle_degrees,
-                target_writing_mode,
-                inline_extent(source_frame, source_writing_mode) * linear_scale,
-                block_extent(source_frame, source_writing_mode) * linear_scale,
-            );
-            for index in 0..=aspect_intervals {
-                let progress = index as f32 / aspect_intervals as f32;
-                let width = logarithmic_interpolation(
-                    family_source.bounds.width,
-                    logical_transpose.bounds.width,
-                    progress,
-                );
-                let height = logarithmic_interpolation(
-                    family_source.bounds.height,
-                    logical_transpose.bounds.height,
-                    progress,
-                );
-                let target_frame = GeometryFrame {
+            let mut push_family = |visual_area_scale: f32| {
+                let linear_scale = visual_area_scale.sqrt();
+                let family_area = maximum_visual_area * linear_scale * linear_scale;
+                let family_source = GeometryFrame {
                     bounds: LayoutBox {
-                        x: source_center.0 - width * 0.5,
-                        y: source_center.1 - height * 0.5,
-                        width,
-                        height,
+                        x: source_center.0 - source_width * linear_scale * 0.5,
+                        y: source_center.1 - source_height * linear_scale * 0.5,
+                        width: source_width * linear_scale,
+                        height: source_height * linear_scale,
                     },
                     angle_degrees: source_frame.angle_degrees,
                 };
-                push_candidate(target_frame, false, family_area, visual_area_scale);
-            }
-            push_candidate(logical_transpose, true, family_area, visual_area_scale);
-        };
+                if same_direction {
+                    push_candidate(family_source, false, family_area, visual_area_scale);
+                    push_candidate(family_source, true, family_area, visual_area_scale);
+                    return;
+                }
 
-        push_family(1.0);
-        if translation_visual_area_scale > 1.0 + f32::EPSILON {
-            for index in 1..=TRANSLATION_VISUAL_AREA_INTERVALS {
-                let progress = index as f32 / TRANSLATION_VISUAL_AREA_INTERVALS as f32;
-                push_family(logarithmic_interpolation(
-                    1.0,
-                    translation_visual_area_scale,
-                    progress,
-                ));
+                let logical_transpose = logical_frame(
+                    source_center,
+                    source_frame.angle_degrees,
+                    target_writing_mode,
+                    inline_extent(source_frame, source_writing_mode) * linear_scale,
+                    block_extent(source_frame, source_writing_mode) * linear_scale,
+                );
+                for index in 0..=aspect_intervals {
+                    let progress = index as f32 / aspect_intervals as f32;
+                    let width = logarithmic_interpolation(
+                        family_source.bounds.width,
+                        logical_transpose.bounds.width,
+                        progress,
+                    );
+                    let height = logarithmic_interpolation(
+                        family_source.bounds.height,
+                        logical_transpose.bounds.height,
+                        progress,
+                    );
+                    let target_frame = GeometryFrame {
+                        bounds: LayoutBox {
+                            x: source_center.0 - width * 0.5,
+                            y: source_center.1 - height * 0.5,
+                            width,
+                            height,
+                        },
+                        angle_degrees: source_frame.angle_degrees,
+                    };
+                    push_candidate(target_frame, false, family_area, visual_area_scale);
+                }
+                push_candidate(logical_transpose, true, family_area, visual_area_scale);
+            };
+
+            push_family(1.0);
+            if translation_visual_area_scale > 1.0 + f32::EPSILON {
+                for index in 1..=TRANSLATION_VISUAL_AREA_INTERVALS {
+                    let progress = index as f32 / TRANSLATION_VISUAL_AREA_INTERVALS as f32;
+                    push_family(logarithmic_interpolation(
+                        1.0,
+                        translation_visual_area_scale,
+                        progress,
+                    ));
+                }
             }
         }
-        drop(push_family);
         #[cfg(debug_assertions)]
         if source_containing_obstacles
             .as_ref()
@@ -1055,16 +1067,16 @@ mod tests {
             Vec::new(),
         );
 
-        let candidates = space.candidates(
-            source_id,
-            &source,
-            geometry_frame(&source).unwrap(),
-            WritingMode::Horizontal,
-            WritingMode::Horizontal,
-            false,
-            1.0,
-            8.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: source_id,
+            source_geometry: &source,
+            source_frame: geometry_frame(&source).unwrap(),
+            source_writing_mode: WritingMode::Horizontal,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 1.0,
+            clearance: 8.0,
+        });
 
         assert_eq!(candidates.len(), 2);
         let candidate = candidates[0];
@@ -1103,16 +1115,16 @@ mod tests {
             Vec::new(),
         );
 
-        let candidates = space.candidates(
-            source_id,
-            &source,
-            geometry_frame(&source).unwrap(),
-            WritingMode::Horizontal,
-            WritingMode::Horizontal,
-            false,
-            4.0,
-            0.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: source_id,
+            source_geometry: &source,
+            source_frame: geometry_frame(&source).unwrap(),
+            source_writing_mode: WritingMode::Horizontal,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 4.0,
+            clearance: 0.0,
+        });
 
         assert_eq!(candidates.len(), 8);
         let expected_scales = [1.0, 4.0_f32.powf(1.0 / 3.0), 4.0_f32.powf(2.0 / 3.0), 4.0];
@@ -1151,16 +1163,16 @@ mod tests {
             Vec::new(),
         );
 
-        let candidates = space.candidates(
-            source_id,
-            &source,
-            geometry_frame(&source).unwrap(),
-            WritingMode::VerticalRl,
-            WritingMode::Horizontal,
-            false,
-            1.0,
-            0.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: source_id,
+            source_geometry: &source,
+            source_frame: geometry_frame(&source).unwrap(),
+            source_writing_mode: WritingMode::VerticalRl,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 1.0,
+            clearance: 0.0,
+        });
 
         assert_eq!(candidates.len(), ORTHOGONAL_ASPECT_INTERVALS + 2);
         let source_candidate = candidates.first().unwrap();
@@ -1209,16 +1221,16 @@ mod tests {
             vec![region(Geometry::rectangle(302.0, 33.0, 163.0, 483.0))],
         );
 
-        let candidates = space.candidates(
-            source_id,
-            &source,
-            geometry_frame(&source).unwrap(),
-            WritingMode::VerticalRl,
-            WritingMode::Horizontal,
-            false,
-            1.0,
-            6.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: source_id,
+            source_geometry: &source,
+            source_frame: geometry_frame(&source).unwrap(),
+            source_writing_mode: WritingMode::VerticalRl,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 1.0,
+            clearance: 6.0,
+        });
         let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
 
         assert!((207.5 + transposed.bounds.x + transposed.bounds.width - 296.0).abs() < 0.01);
@@ -1251,16 +1263,16 @@ mod tests {
             vec![region(Geometry::rectangle(302.0, 33.0, 163.0, 483.0))],
         );
 
-        let candidates = space.candidates(
-            source_id,
-            &source,
-            geometry_frame(&source).unwrap(),
-            WritingMode::VerticalRl,
-            WritingMode::Horizontal,
-            false,
-            1.0,
-            4.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: source_id,
+            source_geometry: &source,
+            source_frame: geometry_frame(&source).unwrap(),
+            source_writing_mode: WritingMode::VerticalRl,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 1.0,
+            clearance: 4.0,
+        });
         let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
 
         assert!((48.4375 + transposed.bounds.x - 5.25).abs() < 0.01);
@@ -1294,16 +1306,16 @@ mod tests {
         );
 
         let source_frame = geometry_frame(&source).unwrap();
-        let candidates = space.candidates(
-            source_id,
-            &source,
+        let candidates = space.candidates(FreeTextRequest {
+            source: source_id,
+            source_geometry: &source,
             source_frame,
-            WritingMode::VerticalRl,
-            WritingMode::Horizontal,
-            true,
-            4.0,
-            2.0,
-        );
+            source_writing_mode: WritingMode::VerticalRl,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: true,
+            translation_visual_area_scale: 4.0,
+            clearance: 2.0,
+        });
 
         assert!(!candidates.is_empty());
         assert!(
@@ -1351,30 +1363,30 @@ mod tests {
         let left_frame = geometry_frame(&left).unwrap();
         let right_frame = geometry_frame(&right).unwrap();
         let left_candidate = space
-            .candidates(
-                left_id,
-                &left,
-                left_frame,
-                WritingMode::VerticalRl,
-                WritingMode::Horizontal,
-                false,
-                1.0,
+            .candidates(FreeTextRequest {
+                source: left_id,
+                source_geometry: &left,
+                source_frame: left_frame,
+                source_writing_mode: WritingMode::VerticalRl,
+                target_writing_mode: WritingMode::Horizontal,
+                refine_orthogonal_shape: false,
+                translation_visual_area_scale: 1.0,
                 clearance,
-            )
+            })
             .into_iter()
             .max_by(|left, right| left.bounds.width.total_cmp(&right.bounds.width))
             .unwrap();
         let right_candidate = space
-            .candidates(
-                right_id,
-                &right,
-                right_frame,
-                WritingMode::VerticalRl,
-                WritingMode::Horizontal,
-                false,
-                1.0,
+            .candidates(FreeTextRequest {
+                source: right_id,
+                source_geometry: &right,
+                source_frame: right_frame,
+                source_writing_mode: WritingMode::VerticalRl,
+                target_writing_mode: WritingMode::Horizontal,
+                refine_orthogonal_shape: false,
+                translation_visual_area_scale: 1.0,
                 clearance,
-            )
+            })
             .into_iter()
             .max_by(|left, right| left.bounds.width.total_cmp(&right.bounds.width))
             .unwrap();
@@ -1419,16 +1431,16 @@ mod tests {
             ],
             Vec::new(),
         );
-        let candidates = space.candidates(
-            upper_id,
-            &upper,
-            geometry_frame(&upper).unwrap(),
-            WritingMode::VerticalRl,
-            WritingMode::Horizontal,
-            false,
-            1.0,
-            4.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: upper_id,
+            source_geometry: &upper,
+            source_frame: geometry_frame(&upper).unwrap(),
+            source_writing_mode: WritingMode::VerticalRl,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 1.0,
+            clearance: 4.0,
+        });
         let widest = candidates
             .iter()
             .map(|candidate| candidate.bounds.width)
@@ -1470,16 +1482,16 @@ mod tests {
             ],
             Vec::new(),
         );
-        let candidates = space.candidates(
-            upper_id,
-            &upper,
-            geometry_frame(&upper).unwrap(),
-            WritingMode::VerticalRl,
-            WritingMode::Horizontal,
-            false,
-            1.0,
-            4.0,
-        );
+        let candidates = space.candidates(FreeTextRequest {
+            source: upper_id,
+            source_geometry: &upper,
+            source_frame: geometry_frame(&upper).unwrap(),
+            source_writing_mode: WritingMode::VerticalRl,
+            target_writing_mode: WritingMode::Horizontal,
+            refine_orthogonal_shape: false,
+            translation_visual_area_scale: 1.0,
+            clearance: 4.0,
+        });
 
         assert!(
             candidates

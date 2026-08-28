@@ -43,7 +43,7 @@ use crate::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
         prepare_frame,
     },
-    free_text::{FreeTextSite, FreeTextSpace, SpatialRegion},
+    free_text::{FreeTextRequest, FreeTextSite, FreeTextSpace, SpatialRegion},
     images::{DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
     text_renderer::{StrokeOptions, StrokeWidth, TextNodeDescriptor, TextRenderer},
@@ -919,16 +919,23 @@ impl Traversal<'_> {
             && let Some(placement) = placement.as_ref()
             && placement.balloon_contour.is_none()
         {
-            self.free_text_space.candidates(
-                placement.target,
-                &placement.geometry,
-                placement.frame,
+            self.free_text_space.candidates(FreeTextRequest {
+                source: placement.target,
+                source_geometry: &placement.geometry,
+                source_frame: placement.frame,
                 source_writing_mode,
-                writing_mode,
-                preferred_free_text_line_count.is_some(),
-                translation_visual_area_scale(source_text.as_ref(), &text),
-                free_text_clearance(typography.as_ref(), text_role.as_ref(), foreground_color),
-            )
+                target_writing_mode: writing_mode,
+                refine_orthogonal_shape: preferred_free_text_line_count.is_some(),
+                translation_visual_area_scale: translation_visual_area_scale(
+                    source_text.as_ref(),
+                    &text,
+                ),
+                clearance: free_text_clearance(
+                    typography.as_ref(),
+                    text_role.as_ref(),
+                    foreground_color,
+                ),
+            })
         } else {
             Vec::new()
         };
