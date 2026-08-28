@@ -1000,11 +1000,20 @@ impl<'a> TextLayout<'a> {
         minimum: f32,
         candidates: &[LayoutRun<'a>],
     ) -> LayoutRun<'a> {
+        let largest = candidates
+            .iter()
+            .max_by(|left, right| left.font_size.total_cmp(&right.font_size))
+            .expect("comic quality selection requires a fitted candidate");
+        let quality_trade_floor = minimum + COMIC_QUALITY_FONT_REDUCTION_MAX;
+        // Centering can narrow the comfortable-size frontier. When every fit is
+        // already in the emergency band, however, anchor tolerance to the largest
+        // candidate so a soft position hint cannot force another aesthetic shrink.
         let accepted_error = candidates
             .iter()
+            .filter(|candidate| candidate.font_size + f32::EPSILON >= quality_trade_floor)
             .map(|candidate| self.comic_center_error_em(candidate))
             .min_by(f32::total_cmp)
-            .expect("comic quality selection requires a fitted candidate")
+            .unwrap_or_else(|| self.comic_center_error_em(largest))
             .max(COMIC_CENTER_ERROR_TOLERANCE_EM);
         let requires_source_locality = self.comic_balloon.as_ref().is_some_and(|balloon| {
             balloon.preferred_block_center.is_some() && balloon.strict_source_locality
@@ -1020,7 +1029,6 @@ impl<'a> TextLayout<'a> {
                     && self.comic_center_error_em(candidate) <= accepted_error + f32::EPSILON
             })
             .collect::<Vec<_>>();
-        let quality_trade_floor = minimum + COMIC_QUALITY_FONT_REDUCTION_MAX;
         if eligible
             .iter()
             .any(|candidate| candidate.font_size + f32::EPSILON >= quality_trade_floor)
@@ -1307,6 +1315,24 @@ impl<'a> TextLayout<'a> {
     }
 
     fn run_with_size(&self, text: &str, font_size: f32) -> Result<LayoutRun<'a>> {
+        if self.hyphenation_policy == HyphenationPolicy::LastResort {
+            // Hyphenation changes segmentation before shaping. Merely forbidding
+            // discretionary break suffixes afterward can still lose cross-fragment
+            // shaping and make LastResort fit worse than Disabled. Shape the clean
+            // text first, then introduce hyphenation only when that exact layout
+            // overflows.
+            let mut clean = self.clone();
+            clean.hyphenation_policy = HyphenationPolicy::Disabled;
+            let clean = clean.run_with_size(text, font_size)?;
+            if !clean.overflowed() {
+                return Ok(clean);
+            }
+
+            let mut hyphenated = self.clone();
+            hyphenated.hyphenation_policy = HyphenationPolicy::Normal;
+            return hyphenated.run_with_size(text, font_size);
+        }
+
         let ordinary = self.run_with_size_pass(text, font_size, false)?;
         if ordinary.overflowed()
             && self.comic_balloon.is_some()
@@ -5517,13 +5543,14 @@ mod tests {
     }
 
     #[test]
-    fn comic_auto_fit_hyphenates_at_the_readability_floor() -> anyhow::Result<()> {
+    fn comic_auto_fit_hyphenates_near_the_readability_floor() -> anyhow::Result<()> {
         let font = any_system_font();
         let text = "For the villagers, it's a common occurrence.";
+        let minimum = 9.0;
         let layout = |policy| {
             TextLayout::new(&font)
                 .with_max_font_size(80.0)
-                .with_min_font_size(9.0)
+                .with_min_font_size(minimum)
                 .with_line_height(1.2)
                 .with_hyphenation_language_tag("en")
                 .with_hyphenation_policy(policy)
@@ -5541,9 +5568,15 @@ mod tests {
         let clean = layout(HyphenationPolicy::Disabled)?;
         let last_resort = layout(HyphenationPolicy::LastResort)?;
 
-        assert_eq!(clean.font_size.floor(), 9.0);
         assert!(
-            last_resort.font_size.floor() > clean.font_size.floor(),
+            clean.overflowed()
+                || clean.font_size <= minimum + quality_font_reduction(minimum) + f32::EPSILON,
+            "the clean layout no longer exercises the readability boundary: minimum {minimum}, clean size {}",
+            clean.font_size
+        );
+        assert!(!last_resort.overflowed());
+        assert!(
+            clean.overflowed() || last_resort.font_size.floor() > clean.font_size.floor(),
             "clean size {} ({} lines), LastResort size {} ({} lines)",
             clean.font_size,
             clean.lines.len(),
@@ -5755,17 +5788,10 @@ mod tests {
             .find_map(|family| fonts.query_family(family).ok())
             .expect("a proportional Latin test font should be available");
         let font_size = 24.0;
-        let metrics = font
-            .skrifa_ref()?
-            .metrics(Size::new(font_size), font.location());
-        let average_width = metrics
-            .average_width
-            .expect("test font should expose an OpenType average width");
 
         let horizontal_plain = TextLayout::new(&font).with_font_size(font_size).run("H")?;
         let horizontal_advance = horizontal_plain.lines[0].advance;
-        assert!(horizontal_plain.height - 2.0 > average_width + 0.25);
-        let horizontal_width = horizontal_advance + average_width * 2.0 + 0.5;
+        let horizontal_width = horizontal_advance * 2.0 + COMIC_LINE_RASTER_TOLERANCE;
         let horizontal_height = font_size * 5.0;
         let horizontal = TextLayout::new(&font)
             .with_font_size(font_size)
@@ -5790,9 +5816,12 @@ mod tests {
             .with_writing_mode(WritingMode::VerticalRl)
             .run("H")?;
         let vertical_advance = vertical_plain.lines[0].advance;
-        assert!(vertical_advance > average_width + 0.25);
+        assert!(vertical_advance > horizontal_advance + COMIC_LINE_RASTER_TOLERANCE);
         let vertical_width = font_size * 5.0;
-        let insufficient_height = vertical_advance + average_width * 2.0 + 0.5;
+        // Reusing the horizontal advance as vertical wall air would make this fit.
+        // Vertical layout must instead reserve its own full advance across both
+        // margins, leaving only `horizontal_advance` for the glyph here.
+        let insufficient_height = vertical_advance + horizontal_advance;
         let constrained = TextLayout::new(&font)
             .with_font_size(font_size)
             .with_writing_mode(WritingMode::VerticalRl)
@@ -5812,7 +5841,7 @@ mod tests {
             .run("H")?;
         assert!(constrained.overflowed());
 
-        let sufficient_height = vertical_advance * 3.0 + 0.5;
+        let sufficient_height = vertical_advance * 2.0 + COMIC_LINE_RASTER_TOLERANCE;
         let vertical = TextLayout::new(&font)
             .with_font_size(font_size)
             .with_writing_mode(WritingMode::VerticalRl)
