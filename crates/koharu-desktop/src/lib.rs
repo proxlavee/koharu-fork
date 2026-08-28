@@ -621,8 +621,8 @@ mod tests {
         assert_eq!(desktop.canvas_state().generation, 1);
     }
 
-    #[test]
-    fn background_preparation_observes_the_foreground_epoch() {
+    #[tokio::test]
+    async fn background_preparation_observes_the_foreground_epoch() {
         let desktop = Desktop::new().unwrap();
         let earlier_background = desktop.current_preparation();
         let foreground = desktop.request_preparation();
