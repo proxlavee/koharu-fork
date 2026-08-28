@@ -5811,17 +5811,26 @@ mod tests {
             .run("H")?;
         assert!(!horizontal.overflowed());
 
-        let vertical_plain = TextLayout::new(&font)
+        let vertical_layout = TextLayout::new(&font)
             .with_font_size(font_size)
-            .with_writing_mode(WritingMode::VerticalRl)
-            .run("H")?;
+            .with_writing_mode(WritingMode::VerticalRl);
+        let vertical_plain = vertical_layout.clone().run("H")?;
         let vertical_advance = vertical_plain.lines[0].advance;
-        assert!(vertical_advance > horizontal_advance + COMIC_LINE_RASTER_TOLERANCE);
+        let (vertical_ink_start, vertical_ink_end) = vertical_layout
+            .inline_ink_bounds(font_size, &vertical_plain.lines[0])
+            .expect("test glyph should have vertical ink bounds");
+        let vertical_ink_extent = vertical_ink_end - vertical_ink_start;
+        assert!(
+            vertical_advance
+                > horizontal_advance + COMIC_LINE_RASTER_TOLERANCE * 3.0
+        );
         let vertical_width = font_size * 5.0;
-        // Reusing the horizontal advance as vertical wall air would make this fit.
-        // Vertical layout must instead reserve its own full advance across both
-        // margins, leaving only `horizontal_advance` for the glyph here.
-        let insufficient_height = vertical_advance + horizontal_advance;
+        // Reusing the horizontal advance as total vertical wall air would leave
+        // enough room for the painted glyph. Axis-specific vertical air leaves
+        // less than the measured ink extent even after raster tolerance.
+        let insufficient_height = horizontal_advance
+            + vertical_ink_extent
+            + COMIC_LINE_RASTER_TOLERANCE;
         let constrained = TextLayout::new(&font)
             .with_font_size(font_size)
             .with_writing_mode(WritingMode::VerticalRl)
