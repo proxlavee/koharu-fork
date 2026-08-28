@@ -195,6 +195,33 @@ opt-level = 3
 [profile.dev.package.koharu-rasterizer]
 opt-level = 3
 
+[profile.dev.package.koharu-renderer]
+opt-level = 3
+
+[profile.dev.package.harfrust]
+opt-level = 3
+
+[profile.dev.package.hypher]
+opt-level = 3
+
+[profile.dev.package.icu_normalizer]
+opt-level = 3
+
+[profile.dev.package.icu_properties]
+opt-level = 3
+
+[profile.dev.package.icu_segmenter]
+opt-level = 3
+
+[profile.dev.package.read-fonts]
+opt-level = 3
+
+[profile.dev.package.skrifa]
+opt-level = 3
+
+[profile.dev.package.unicode-bidi]
+opt-level = 3
+
 [profile.dev.package.postcard]
 opt-level = 3
 

@@ -90,6 +90,7 @@ pub struct LineBreaker {
     segmenter: LineSegmenterBorrowed<'static>,
     korean_segmenter: LineSegmenterBorrowed<'static>,
     hyphenation: Option<HyphenationOptions>,
+    emergency_terminal_punctuation: bool,
 }
 
 fn trim_mandatory_break_suffix(text: &str, start: usize, end: usize) -> usize {
@@ -116,6 +117,7 @@ impl LineBreaker {
             segmenter: LineSegmenter::new_auto(LineBreakOptions::default()),
             korean_segmenter: LineSegmenter::new_auto(*korean_options),
             hyphenation: None,
+            emergency_terminal_punctuation: false,
         }
     }
 
@@ -123,6 +125,16 @@ impl LineBreaker {
     #[must_use]
     pub fn with_hyphenation(mut self, options: HyphenationOptions) -> Self {
         self.hyphenation = Some(options);
+        self
+    }
+
+    /// Permit a final repeated emphasis-punctuation run to continue on another
+    /// line. This is an emergency comic-layout fallback, not ordinary prose
+    /// segmentation, and callers should enable it only after the normal layout
+    /// has proven infeasible.
+    #[must_use]
+    pub fn with_emergency_terminal_punctuation(mut self) -> Self {
+        self.emergency_terminal_punctuation = true;
         self
     }
 
@@ -178,7 +190,60 @@ impl LineBreaker {
                 };
                 self.hyphenated_segments(text, segment)
             })
+            .flat_map(|segment| self.emergency_terminal_punctuation_segments(text, segment))
             .collect()
+    }
+
+    fn emergency_terminal_punctuation_segments(
+        &self,
+        text: &str,
+        segment: LineSegment,
+    ) -> Vec<LineSegment> {
+        if !self.emergency_terminal_punctuation || segment.break_suffix.is_some() {
+            return vec![segment];
+        }
+
+        let segment_text = &text[segment.range.clone()];
+        let mut suffix_start = segment_text.len();
+        let mut punctuation_count = 0usize;
+        let mut has_pause_mark = false;
+        let mut has_emphasis_mark = false;
+        for (offset, character) in segment_text.char_indices().rev() {
+            if !is_terminal_punctuation(character) {
+                break;
+            }
+            suffix_start = offset;
+            punctuation_count += 1;
+            has_pause_mark |= is_terminal_pause_mark(character);
+            has_emphasis_mark |= is_terminal_emphasis_mark(character);
+        }
+        if punctuation_count < 2
+            || !has_pause_mark
+            || !has_emphasis_mark
+            || suffix_start == 0
+            || !segment_text[..suffix_start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+        {
+            return vec![segment];
+        }
+
+        let punctuation_start = segment.range.start + suffix_start;
+        vec![
+            LineSegment {
+                range: segment.range.start..punctuation_start,
+                next_offset: punctuation_start,
+                is_mandatory: false,
+                break_suffix: None,
+            },
+            LineSegment {
+                range: punctuation_start..segment.range.end,
+                next_offset: segment.next_offset,
+                is_mandatory: segment.is_mandatory,
+                break_suffix: None,
+            },
+        ]
     }
 
     fn hyphenated_segments(&self, text: &str, segment: LineSegment) -> Vec<LineSegment> {
@@ -303,6 +368,21 @@ fn contains_chinese(text: &str) -> bool {
             _ => Some(has_chinese),
         })
         .unwrap_or(false)
+}
+
+fn is_terminal_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | '!' | '?' | '…' | '‼' | '⁇' | '⁈' | '⁉' | '~' | '〜' | '～'
+    )
+}
+
+fn is_terminal_pause_mark(character: char) -> bool {
+    matches!(character, '.' | '…')
+}
+
+fn is_terminal_emphasis_mark(character: char) -> bool {
+    matches!(character, '!' | '?' | '‼' | '⁇' | '⁈' | '⁉')
 }
 
 fn hyphenatable_word_bounds(text: &str) -> Option<(usize, usize)> {
@@ -496,6 +576,45 @@ mod tests {
         assert_eq!(pieces, ["tow", "er ", "with", "in"]);
         assert_eq!(segments[0].break_suffix, Some(LineBreakSuffix::Hyphen));
         assert_eq!(segments[2].break_suffix, Some(LineBreakSuffix::Hyphen));
+    }
+
+    #[test]
+    fn emergency_terminal_punctuation_is_explicit_and_preserves_text() {
+        let text = "Geliyorum...!!";
+        let ordinary = LineBreaker::new().line_segments(text);
+        let emergency = LineBreaker::new()
+            .with_emergency_terminal_punctuation()
+            .line_segments(text);
+
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(
+            emergency
+                .iter()
+                .map(|segment| &text[segment.range.clone()])
+                .collect::<Vec<_>>(),
+            ["Geliyorum", "...!!"]
+        );
+        assert_eq!(
+            emergency
+                .iter()
+                .map(|segment| &text[segment.range.clone()])
+                .collect::<String>(),
+            text
+        );
+        assert!(
+            emergency
+                .iter()
+                .all(|segment| segment.break_suffix.is_none())
+        );
+
+        let plain_ellipsis = "Aynen...";
+        assert_eq!(
+            LineBreaker::new()
+                .with_emergency_terminal_punctuation()
+                .line_segments(plain_ellipsis)
+                .len(),
+            1
+        );
     }
 
     #[test]

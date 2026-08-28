@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, OnceLock, Weak},
+    time::Instant,
 };
 
 use anyhow::{Context, anyhow};
@@ -12,8 +13,9 @@ use koharu_scene::{
     Asset, AssetRole, BlobId, BubbleRegion, Change, Component, ComponentOwner, EntityChange,
     EntityId, FitsTo, FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, PanelRegion, Presents,
     RasterLayer, RasterLayerKind, RecognizedFrom, Region, RegionSpec, RelationChange, RelationId,
-    RelationSpec, Revision, Snapshot, TextAlignment, TextDirection, TextLayout as SceneTextLayout,
-    TextLayoutKind, TextRegion, TextRole, Translation, Typography, Visibility,
+    RelationSpec, Revision, Snapshot, SourceText, TextAlignment, TextDirection,
+    TextLayout as SceneTextLayout, TextLayoutKind, TextRegion, TextRole, Translation, Typography,
+    Visibility,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -56,6 +58,14 @@ const FREE_TEXT_ROLE: &str = "dev.koharu.text.free-text";
 const DIALOGUE_ROLE: &str = "dev.koharu.text.dialogue";
 const GENERATED_TEXT_HALO_EM: f32 = 0.08;
 const GENERATED_TEXT_LINE_HEIGHT: f32 = 1.2;
+const STROKE_LUMA_MIDPOINT: u32 = 128_000;
+const MIN_STROKE_FOREGROUND_LUMA_CONTRAST: u32 = 64_000;
+const DETECTED_WRITING_MODE_ASPECT_RATIO: f32 = 1.15;
+const MAX_TRANSLATION_VISUAL_AREA_SCALE: f32 = 6.0;
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
 
 #[derive(Clone)]
 pub struct Renderer {
@@ -119,8 +129,24 @@ impl Renderer {
     /// Completely renders one page, including resources needed by retained nodes.
     #[tracing::instrument(level = "info", skip_all, fields(page = %page, revision = %snapshot.revision()))]
     pub async fn render(&self, snapshot: &Snapshot, page: EntityId) -> Result<Frame> {
+        let started = Instant::now();
         let compiled = self.compile(snapshot, page)?;
-        self.finish(snapshot, compiled, None, None).await
+        let layers = compiled.layers.len();
+        let compile_us = elapsed_micros(started);
+        let finish_started = Instant::now();
+        let result = self.finish(snapshot, compiled, None, None).await;
+        tracing::info!(
+            target: "koharu_renderer_timing",
+            marker = "render_page",
+            page = %page,
+            revision = %snapshot.revision(),
+            layers,
+            compile_us,
+            finish_us = elapsed_micros(finish_started),
+            total_us = elapsed_micros(started),
+            success = result.is_ok(),
+        );
+        result
     }
 
     /// Renders a contiguous revision while retaining unchanged vector nodes.
@@ -254,6 +280,10 @@ impl Renderer {
         previous: Option<&Frame>,
         affected: Option<&AffectedDependencies>,
     ) -> Result<Frame> {
+        let started = Instant::now();
+        let page = compiled.page;
+        let layers = compiled.layers.len();
+        let cache_started = Instant::now();
         let mut nodes = vec![None; compiled.layers.len()];
         let mut pending = Vec::new();
         let mut reused = 0;
@@ -289,13 +319,17 @@ impl Renderer {
             }
             clock
         };
+        let cache_us = elapsed_micros(cache_started);
+        let pending_layers = pending.len();
 
         let font_requests = font_requests(&pending);
+        let fonts_started = Instant::now();
         self.inner
             .fonts
             .prepare(&font_requests)
             .await
             .map_err(Error::FontResource)?;
+        let fonts_us = elapsed_micros(fonts_started);
         let image_ids = pending
             .iter()
             .filter_map(|(_, descriptor)| match descriptor {
@@ -303,7 +337,11 @@ impl Renderer {
                 NodeDescriptor::Text(_) => None,
             })
             .collect::<BTreeSet<_>>();
+        let image_count = image_ids.len();
+        let images_started = Instant::now();
         let images = Arc::new(self.load_images(snapshot, image_ids).await?);
+        let images_us = elapsed_micros(images_started);
+        let nodes_started = Instant::now();
         if !pending.is_empty() {
             let workers = self.workers()?;
             let fonts = self.inner.fonts.clone();
@@ -312,14 +350,46 @@ impl Renderer {
                     pending
                         .into_par_iter()
                         .map(|(index, descriptor)| {
-                            build_node(descriptor, &fonts, &images).map(|node| (index, node))
+                            let started = Instant::now();
+                            build_node(descriptor, &fonts, &images)
+                                .map(|node| (index, node, elapsed_micros(started)))
                         })
                         .collect::<Result<Vec<_>>>()
                 })
             })
             .await
             .map_err(|source| Error::Backend(anyhow!(source)))??;
-            for (index, node) in built {
+            for (index, node, build_us) in built {
+                let entity = compiled.layers[index].entity;
+                match &node.descriptor {
+                    NodeDescriptor::Image(image) => tracing::trace!(
+                        target: "koharu_renderer_timing",
+                        marker = "build_image_node",
+                        page = %page,
+                        entity = %entity,
+                        blob = %image.blob,
+                        build_us,
+                    ),
+                    NodeDescriptor::Text(text) => tracing::trace!(
+                        target: "koharu_renderer_timing",
+                        marker = "build_text_node",
+                        page = %page,
+                        entity = %entity,
+                        role = ?text.text_role.as_deref(),
+                        text_chars = text.text.chars().count(),
+                        writing_mode = ?text.writing_mode,
+                        target_width = text.width,
+                        target_height = text.height,
+                        source_font_size = ?text.source_font_size,
+                        minimum_font_size = text.minimum_font_size,
+                        automatic_free_text = text.automatic_free_text,
+                        free_text_candidates = text.free_text_candidates.len(),
+                        balloon = text.balloon_contour.is_some(),
+                        flow_contours = text.flow_contours.len(),
+                        auto_fit = text.auto_fit,
+                        build_us,
+                    ),
+                }
                 let node = Arc::new(node);
                 self.inner.nodes.lock().insert(
                     (compiled.page, compiled.layers[index].entity),
@@ -329,6 +399,7 @@ impl Renderer {
                 nodes[index] = Some(node);
             }
         }
+        let nodes_us = elapsed_micros(nodes_started);
 
         let rebuilt = compiled.layers.len().saturating_sub(reused);
         let nodes = nodes
@@ -341,11 +412,28 @@ impl Renderer {
             rebuilt_layers: rebuilt,
         };
         let workers = self.workers()?;
-        tokio::task::spawn_blocking(move || {
+        let assemble_started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
             workers.install(|| assemble_frame(compiled, nodes, stats))
         })
         .await
-        .map_err(|source| Error::Backend(anyhow!(source)))?
+        .map_err(|source| Error::Backend(anyhow!(source)))?;
+        tracing::info!(
+            target: "koharu_renderer_timing",
+            marker = "finish_page",
+            page = %page,
+            layers,
+            pending_layers,
+            image_count,
+            cache_us,
+            fonts_us,
+            images_us,
+            nodes_us,
+            assemble_us = elapsed_micros(assemble_started),
+            total_us = elapsed_micros(started),
+            success = result.is_ok(),
+        );
+        result
     }
 
     fn workers(&self) -> Result<Arc<rayon::ThreadPool>> {
@@ -752,6 +840,7 @@ impl Traversal<'_> {
         let content = presents.value().target;
         dependencies.insert(RenderDependency::Entity(content));
         dependencies.insert(component_dependency::<Translation>(content));
+        dependencies.insert(component_dependency::<SourceText>(content));
         dependencies.insert(component_dependency::<TextRole>(content));
         dependencies.insert(RenderDependency::RelationQuery {
             source: content,
@@ -760,6 +849,7 @@ impl Traversal<'_> {
         let Some(translation) = self.snapshot.component::<Translation>(content)? else {
             return Ok(None);
         };
+        let source_text = self.snapshot.component::<SourceText>(content)?;
         let text_role = self.snapshot.component::<TextRole>(content)?;
         let text = translation.text.value;
         if text.trim().is_empty() {
@@ -815,6 +905,16 @@ impl Traversal<'_> {
         let automatic_free_text = authored.is_none()
             && layout.kind == TextLayoutKind::Paragraph
             && is_generated_free_text(text_role.as_ref());
+        let preferred_free_text_line_count = if automatic_free_text {
+            preferred_transposed_free_text_line_count(
+                &text,
+                initial_frame.bounds,
+                source_writing_mode,
+                writing_mode,
+            )
+        } else {
+            None
+        };
         let free_text_candidates = if automatic_free_text
             && let Some(placement) = placement.as_ref()
             && placement.balloon_contour.is_none()
@@ -825,6 +925,8 @@ impl Traversal<'_> {
                 placement.frame,
                 source_writing_mode,
                 writing_mode,
+                preferred_free_text_line_count.is_some(),
+                translation_visual_area_scale(source_text.as_ref(), &text),
                 free_text_clearance(typography.as_ref(), text_role.as_ref(), foreground_color),
             )
         } else {
@@ -893,6 +995,8 @@ impl Traversal<'_> {
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
+            text_role: text_role.as_ref().map(|role| role.role.clone()),
+            typography_origin: typography.as_ref().map(|value| value.origin.clone()),
             language: translation.language.clone(),
             width: frame.bounds.width,
             height: frame.bounds.height,
@@ -900,6 +1004,7 @@ impl Traversal<'_> {
             flow_contours,
             preferred_block_center,
             free_text_candidates,
+            preferred_free_text_line_count,
             automatic_free_text,
             preferred_font,
             font_families,
@@ -1036,6 +1141,7 @@ struct FlowSeed {
 
 struct FlowSource {
     anchor: (f32, f32),
+    bounds: LayoutBox,
     footprint: Vec<(f32, f32)>,
 }
 
@@ -1592,6 +1698,25 @@ fn resolve_balloon_flows(
                             )),
                     )
                 });
+            #[cfg(debug_assertions)]
+            if tracing::enabled!(
+                target: "koharu_typesetting_probe",
+                tracing::Level::TRACE
+            ) {
+                tracing::trace!(
+                    target: "koharu_typesetting_probe",
+                    marker = "flow_geometry",
+                    entity = %seed.layer,
+                    balloon = %group.balloon,
+                    source_bounds = ?seed.source.as_ref().map(|source| source.bounds),
+                    source_anchor = ?seed.source.as_ref().map(|source| source.anchor),
+                    target_bounds = ?group.frame.bounds,
+                    target_angle = group.frame.angle_degrees,
+                    target_contour_points = group.contour.len(),
+                    flow_contour_count = flow_contours.len(),
+                    preferred_center = ?preferred_center,
+                );
+            }
             placements.insert(
                 seed.layer,
                 ResolvedPlacement {
@@ -1640,6 +1765,7 @@ fn flow_source(
             bounds.x + bounds.width * 0.5,
             bounds.y + bounds.height * 0.5,
         ),
+        bounds,
         footprint: geometry
             .points
             .iter()
@@ -2022,12 +2148,76 @@ fn resolve_detected_writing_mode(
     if let Some(mode) = typography_mode {
         return mode;
     }
+
+    // OCR direction is generated from the detected region's aspect ratio. The
+    // live geometry is therefore the stronger signal when an older persisted
+    // analysis contradicts a clearly oriented box; near-square regions still
+    // retain the analysis decision.
+    if bounds.height >= bounds.width * DETECTED_WRITING_MODE_ASPECT_RATIO {
+        return WritingMode::VerticalRl;
+    }
+    if bounds.width >= bounds.height * DETECTED_WRITING_MODE_ASPECT_RATIO {
+        return WritingMode::Horizontal;
+    }
     match analysis.map(|value| value.direction) {
         Some(TextDirection::Vertical) => WritingMode::VerticalRl,
         Some(TextDirection::Horizontal) => WritingMode::Horizontal,
         Some(TextDirection::Auto) | None if bounds.height > bounds.width => WritingMode::VerticalRl,
         Some(TextDirection::Auto) | None => WritingMode::Horizontal,
     }
+}
+
+fn preferred_transposed_free_text_line_count(
+    text: &str,
+    source_bounds: LayoutBox,
+    source_writing_mode: WritingMode,
+    target_writing_mode: WritingMode,
+) -> Option<usize> {
+    // A vertical source footprint becomes a horizontal target block. Preserve
+    // that transposed shape rather than blindly treating the narrow OCR bounds
+    // as the final line width: for N roughly square glyph cells split across L
+    // lines, the block aspect is proportional to N / L^2. Solving against the
+    // transposed source aspect gives L ~= sqrt(N * source_width/source_height).
+    if !source_writing_mode.is_vertical()
+        || target_writing_mode.is_vertical()
+        || !source_bounds.width.is_finite()
+        || !source_bounds.height.is_finite()
+        || source_bounds.width <= 0.0
+        || source_bounds.height <= 0.0
+    {
+        return None;
+    }
+    let character_count = text
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .count();
+    if character_count == 0 {
+        return None;
+    }
+    let estimated = ((character_count as f32 * source_bounds.width / source_bounds.height)
+        .sqrt()
+        .round() as usize)
+        .clamp(1, character_count);
+    (estimated > 1).then_some(estimated)
+}
+
+fn translation_visual_area_scale(source: Option<&SourceText>, target: &str) -> f32 {
+    let Some(source) = source else {
+        return 1.0;
+    };
+    let source_units = layout_character_count(&source.text.value);
+    let target_units = layout_character_count(target);
+    if source_units == 0 || target_units <= source_units {
+        return 1.0;
+    }
+    (target_units as f32 / source_units as f32).min(MAX_TRANSLATION_VISUAL_AREA_SCALE)
+}
+
+fn layout_character_count(text: &str) -> usize {
+    text.trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .count()
 }
 
 fn is_generated_free_text(role: Option<&TextRole>) -> bool {
@@ -2051,10 +2241,7 @@ fn free_text_clearance(
     if !is_generated_free_text(role) {
         return 0.0;
     }
-    if let Some(width) = typography
-        .and_then(|value| value.stroke_width)
-        .filter(|width| *width > 0.0)
-    {
+    if let Some(width) = accepted_explicit_stroke_width(typography, role, foreground) {
         return width;
     }
     opposing_halo_color(foreground).map_or(0.0, |_| {
@@ -2093,7 +2280,7 @@ fn resolve_stroke(
     foreground: [u8; 4],
 ) -> Option<StrokeOptions> {
     if let Some(typography) = typography
-        && let Some(width_px) = typography.stroke_width.filter(|width| *width > 0.0)
+        && let Some(width_px) = accepted_explicit_stroke_width(Some(typography), role, foreground)
     {
         let generated_auto_fit =
             typography.auto_fit && matches!(&typography.origin, Origin::Generated(_));
@@ -2123,12 +2310,42 @@ fn resolve_stroke(
         })
 }
 
-fn opposing_halo_color([red, green, blue, alpha]: [u8; 4]) -> Option<[u8; 4]> {
-    if alpha == 0 {
-        return None;
+fn accepted_explicit_stroke_width(
+    typography: Option<&Typography>,
+    role: Option<&TextRole>,
+    foreground: [u8; 4],
+) -> Option<f32> {
+    let typography = typography?;
+    let width = typography.stroke_width.filter(|width| *width > 0.0)?;
+    let generated_automatic = typography.auto_fit
+        && matches!(&typography.origin, Origin::Generated(_))
+        && is_generated_automatic_text_role(role);
+    if !generated_automatic {
+        return Some(width);
     }
-    let luma = u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114;
-    Some(if luma <= 128_000 {
+    let stroke = typography.stroke_color.unwrap_or([u8::MAX; 4]);
+    stroke_opposes_foreground(foreground, stroke).then_some(width)
+}
+
+fn perceived_luma([red, green, blue, alpha]: [u8; 4]) -> Option<u32> {
+    (alpha > 0).then(|| u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114)
+}
+
+fn stroke_opposes_foreground(foreground: [u8; 4], stroke: [u8; 4]) -> bool {
+    let Some(foreground_luma) = perceived_luma(foreground) else {
+        return false;
+    };
+    let Some(stroke_luma) = perceived_luma(stroke) else {
+        return false;
+    };
+    let is_dark = |luma: u32| luma <= STROKE_LUMA_MIDPOINT;
+    is_dark(foreground_luma) != is_dark(stroke_luma)
+        && foreground_luma.abs_diff(stroke_luma) >= MIN_STROKE_FOREGROUND_LUMA_CONTRAST
+}
+
+fn opposing_halo_color(color: [u8; 4]) -> Option<[u8; 4]> {
+    let luma = perceived_luma(color)?;
+    Some(if luma <= STROKE_LUMA_MIDPOINT {
         [u8::MAX; 4]
     } else {
         [0, 0, 0, u8::MAX]
@@ -2449,9 +2666,153 @@ mod tests {
     }
 
     #[test]
+    fn strong_source_geometry_overrides_stale_ocr_direction() {
+        let generation = Generation::new(
+            ProducerId::new("dev.koharu.pipeline.ocr").expect("the producer ID is valid"),
+        );
+        let analysis = |direction| OcrAnalysis {
+            origin: Origin::Generated(generation.clone()),
+            direction,
+            confidence: None,
+            line_boundaries: Vec::new(),
+        };
+        let vertical = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 275.0,
+        };
+        let horizontal = LayoutBox {
+            width: 275.0,
+            height: 40.0,
+            ..vertical
+        };
+        let ambiguous = LayoutBox {
+            width: 100.0,
+            height: 105.0,
+            ..vertical
+        };
+
+        assert_eq!(
+            resolve_detected_writing_mode(
+                vertical,
+                None,
+                Some(&analysis(TextDirection::Horizontal)),
+            ),
+            WritingMode::VerticalRl
+        );
+        assert_eq!(
+            resolve_detected_writing_mode(
+                horizontal,
+                None,
+                Some(&analysis(TextDirection::Vertical)),
+            ),
+            WritingMode::Horizontal
+        );
+        assert_eq!(
+            resolve_detected_writing_mode(
+                ambiguous,
+                None,
+                Some(&analysis(TextDirection::Horizontal)),
+            ),
+            WritingMode::Horizontal
+        );
+    }
+
+    #[test]
+    fn direction_changed_free_text_uses_the_transposed_source_shape() {
+        let narrow_vertical_source = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 280.0,
+        };
+        assert_eq!(
+            preferred_transposed_free_text_line_count(
+                "abcdefghijklmnop",
+                narrow_vertical_source,
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+            ),
+            Some(2)
+        );
+
+        let broader_vertical_source = LayoutBox {
+            width: 60.0,
+            height: 100.0,
+            ..narrow_vertical_source
+        };
+        assert_eq!(
+            preferred_transposed_free_text_line_count(
+                "abcdefghijklmnopqrstuvwxyzabcdefghijklmn",
+                broader_vertical_source,
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+            ),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn unchanged_or_empty_free_text_has_no_transposed_shape_target() {
+        let bounds = LayoutBox {
+            x: 0.0,
+            y: 0.0,
+            width: 60.0,
+            height: 100.0,
+        };
+        assert_eq!(
+            preferred_transposed_free_text_line_count(
+                "ordinary caption",
+                bounds,
+                WritingMode::Horizontal,
+                WritingMode::Horizontal,
+            ),
+            None
+        );
+        assert_eq!(
+            preferred_transposed_free_text_line_count(
+                "...!!",
+                bounds,
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn translation_demand_scales_visual_area_only_when_the_target_is_longer() {
+        let source = |text: &str| SourceText {
+            text: Authored::user(text.to_owned()),
+            language: None,
+        };
+
+        assert_eq!(translation_visual_area_scale(None, "longer target"), 1.0);
+        assert_eq!(
+            translation_visual_area_scale(Some(&source("source")), "short"),
+            1.0
+        );
+        assert_eq!(
+            translation_visual_area_scale(Some(&source("abcd")), "abcdefghijkl"),
+            3.0
+        );
+        assert_eq!(
+            translation_visual_area_scale(Some(&source("a")), "abcdefghijkl"),
+            MAX_TRANSLATION_VISUAL_AREA_SCALE
+        );
+    }
+
+    #[test]
     fn overlap_separator_uses_the_nearest_source_footprint_gap() {
         let source = |left: f32, right: f32| FlowSource {
             anchor: ((left + right) * 0.5, 700.0),
+            bounds: LayoutBox {
+                x: left,
+                y: 600.0,
+                width: right - left,
+                height: 200.0,
+            },
             footprint: vec![(left, 600.0), (right, 600.0), (right, 800.0), (left, 800.0)],
         };
         let near_large_source = source(760.0, 840.0);
@@ -2599,6 +2960,70 @@ mod tests {
         assert_eq!(
             resolve_stroke(Some(&user_typography), Some(&role), [0, 0, 0, 255]),
             None
+        );
+    }
+
+    #[test]
+    fn generated_automatic_text_replaces_a_nonopposing_detected_stroke() {
+        let generated = koharu_scene::Origin::Generated(Generation::new(
+            ProducerId::new("dev.koharu.test").unwrap(),
+        ));
+        let role = TextRole {
+            origin: generated.clone(),
+            role: FREE_TEXT_ROLE.to_owned(),
+        };
+        let typography = Typography {
+            origin: generated,
+            preferred_font: None,
+            font_weight: None,
+            font_style: None,
+            size: Some(24.0),
+            auto_fit: true,
+            color: None,
+            stroke_color: Some([125, 125, 125, 255]),
+            stroke_width: Some(2.0),
+            alignment: None,
+            writing_mode: None,
+            extensions: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            resolve_stroke(Some(&typography), Some(&role), [0, 0, 0, 255]),
+            Some(StrokeOptions {
+                color: [255; 4],
+                width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
+            })
+        );
+        assert_eq!(
+            free_text_clearance(Some(&typography), Some(&role), [0, 0, 0, 255]),
+            1.92
+        );
+
+        let opposing_typography = Typography {
+            stroke_color: Some([255; 4]),
+            ..typography.clone()
+        };
+        assert_eq!(
+            resolve_stroke(Some(&opposing_typography), Some(&role), [0, 0, 0, 255],),
+            Some(StrokeOptions {
+                color: [255; 4],
+                width: StrokeWidth::Generated {
+                    width_px: 2.0,
+                    reference_font_size: Some(24.0),
+                },
+            })
+        );
+
+        let user_typography = Typography {
+            origin: koharu_scene::Origin::User,
+            ..typography
+        };
+        assert_eq!(
+            resolve_stroke(Some(&user_typography), Some(&role), [0, 0, 0, 255]),
+            Some(StrokeOptions {
+                color: [125, 125, 125, 255],
+                width: StrokeWidth::Absolute(2.0),
+            })
         );
     }
 

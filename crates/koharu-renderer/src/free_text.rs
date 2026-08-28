@@ -10,9 +10,12 @@ use crate::{
 const BOUNDARY_SEARCH_ITERATIONS: usize = 24;
 const MINIMUM_USEFUL_INLINE_EXTENT: f32 = 0.5;
 const PARALLEL_AXIS_COSINE: f32 = 0.999_390_84;
-// Source, balanced, and logically transposed footprints cover the principal
-// composition choices without multiplying font shaping work during page open.
 const ORTHOGONAL_ASPECT_INTERVALS: usize = 2;
+const TRANSLATION_VISUAL_AREA_INTERVALS: usize = 3;
+// Multiline source-shape targets need enough resolution to represent the
+// transition between adjacent line counts without densifying every free-text
+// layout on page open.
+const REFINED_ORTHOGONAL_ASPECT_INTERVALS: usize = 8;
 
 #[derive(Clone)]
 pub(crate) struct SpatialRegion {
@@ -52,12 +55,26 @@ struct InlineLimits {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+enum InlineCorridorRejection {
+    InvalidContainerProjection,
+    AnchorOutsideContainer,
+    ClearanceExcludesAnchor,
+    TextSiteCell(EntityId),
+    TextSiteExcludesAnchor(EntityId),
+    ObstacleStraddlesAnchor(EntityId),
+    NoInlineExtent(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FreeTextCandidate {
     /// Candidate layout rectangle in the detected source frame's local space.
     pub(crate) bounds: LayoutBox,
     /// Original detected center in the same local space.
     pub(crate) preferred_center: (f32, f32),
     pub(crate) maximum_visual_area: f32,
+    /// Visual-area budget relative to the detected source. Values above one
+    /// progressively relax source occupancy for a longer translation.
+    pub(crate) translation_visual_area_scale: f32,
     /// Normalized departure from the detected composition, including any shift
     /// forced by neighboring semantic regions.
     pub(crate) source_distance: f32,
@@ -86,8 +103,8 @@ impl FreeTextSpace {
     /// so the source footprint is followed by samples on the continuous
     /// area-preserving path to the logical-axis transpose. Both paths also expose
     /// unused inline corridor space while retaining the source visual-area budget
-    /// and anchor. The text renderer ranks every candidate after resolving the
-    /// actual fonts, line breaks, and outline.
+    /// and anchor. Longer translations add progressive visual-area families; the
+    /// text renderer stops at the first tier that leaves the emergency fit band.
     pub(crate) fn candidates(
         &self,
         source: EntityId,
@@ -95,6 +112,8 @@ impl FreeTextSpace {
         source_frame: GeometryFrame,
         source_writing_mode: WritingMode,
         target_writing_mode: WritingMode,
+        refine_orthogonal_shape: bool,
+        translation_visual_area_scale: f32,
         clearance: f32,
     ) -> Vec<FreeTextCandidate> {
         let maximum_visual_area = geometry_area(source_geometry);
@@ -112,11 +131,32 @@ impl FreeTextSpace {
         }
         let preferred_center = (source_width * 0.5, source_height * 0.5);
         let same_direction = source_writing_mode == target_writing_mode;
-        let mut candidates = Vec::with_capacity(if same_direction {
+        let aspect_intervals = if refine_orthogonal_shape {
+            REFINED_ORTHOGONAL_ASPECT_INTERVALS
+        } else {
+            ORTHOGONAL_ASPECT_INTERVALS
+        };
+        let family_capacity = if same_direction {
             2
         } else {
-            ORTHOGONAL_ASPECT_INTERVALS + 2
-        });
+            aspect_intervals + 2
+        };
+        let translation_visual_area_scale = if translation_visual_area_scale.is_finite() {
+            translation_visual_area_scale.max(1.0)
+        } else {
+            1.0
+        };
+        let family_count = 1 + TRANSLATION_VISUAL_AREA_INTERVALS
+            * usize::from(translation_visual_area_scale > 1.0 + f32::EPSILON);
+        let mut candidates = Vec::with_capacity(family_capacity * family_count);
+        #[cfg(debug_assertions)]
+        let probe_enabled = tracing::enabled!(
+            target: "koharu_typesetting_probe",
+            tracing::Level::TRACE
+        );
+        #[cfg(debug_assertions)]
+        let mut rejections =
+            probe_enabled.then(|| Vec::with_capacity(family_capacity * family_count));
 
         let source_center = (
             source_frame.bounds.x + source_frame.bounds.width * 0.5,
@@ -153,10 +193,39 @@ impl FreeTextSpace {
             panels_are_obstacles: panel.is_none(),
             clearance: clearance.max(0.0),
         };
-        let mut push_candidate = |target_frame: GeometryFrame, expand_inline: bool| {
-            let Some(frame) = self.fit_inline_corridor(&corridor, target_frame, expand_inline)
-            else {
-                return;
+        #[cfg(debug_assertions)]
+        let source_containing_obstacles = probe_enabled.then(|| {
+            self.obstacles
+                .iter()
+                .chain(
+                    corridor
+                        .panels_are_obstacles
+                        .then_some(self.panels.iter())
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter(|obstacle| geometry_contains_point(&obstacle.geometry, source_center))
+                .map(|obstacle| obstacle.entity)
+                .collect::<Vec<_>>()
+        });
+        let mut push_candidate = |target_frame: GeometryFrame,
+                                  expand_inline: bool,
+                                  maximum_visual_area: f32,
+                                  visual_area_scale: f32| {
+            let frame = match self.fit_inline_corridor(&corridor, target_frame, expand_inline) {
+                Ok(frame) => frame,
+                Err(rejection) => {
+                    #[cfg(debug_assertions)]
+                    if let Some(rejections) = &mut rejections {
+                        rejections.push((
+                            target_frame.bounds,
+                            expand_inline,
+                            visual_area_scale,
+                            rejection,
+                        ));
+                    }
+                    return;
+                }
             };
             let center = (
                 frame.bounds.x + frame.bounds.width * 0.5,
@@ -174,6 +243,7 @@ impl FreeTextSpace {
                     && approximately_equal(candidate.bounds.y, bounds.y)
                     && approximately_equal(candidate.bounds.width, bounds.width)
                     && approximately_equal(candidate.bounds.height, bounds.height)
+                    && approximately_equal(candidate.maximum_visual_area, maximum_visual_area)
             }) {
                 return;
             }
@@ -184,35 +254,110 @@ impl FreeTextSpace {
                 bounds,
                 preferred_center,
                 maximum_visual_area,
-                source_distance: (aspect / source_aspect).ln().abs() + shift_x.hypot(shift_y),
+                translation_visual_area_scale: visual_area_scale,
+                source_distance: (aspect / source_aspect).ln().abs()
+                    + visual_area_scale.ln().abs() * 0.5
+                    + shift_x.hypot(shift_y),
             });
         };
 
-        if same_direction {
-            push_candidate(source_frame, false);
-            push_candidate(source_frame, true);
-            return candidates;
-        }
-
-        let logical_transpose = source_target_frame;
-        for index in 0..=ORTHOGONAL_ASPECT_INTERVALS {
-            let progress = index as f32 / ORTHOGONAL_ASPECT_INTERVALS as f32;
-            let width =
-                logarithmic_interpolation(source_width, logical_transpose.bounds.width, progress);
-            let height =
-                logarithmic_interpolation(source_height, logical_transpose.bounds.height, progress);
-            let target_frame = GeometryFrame {
+        let mut push_family = |visual_area_scale: f32| {
+            let linear_scale = visual_area_scale.sqrt();
+            let family_area = maximum_visual_area * linear_scale * linear_scale;
+            let family_source = GeometryFrame {
                 bounds: LayoutBox {
-                    x: source_center.0 - width * 0.5,
-                    y: source_center.1 - height * 0.5,
-                    width,
-                    height,
+                    x: source_center.0 - source_width * linear_scale * 0.5,
+                    y: source_center.1 - source_height * linear_scale * 0.5,
+                    width: source_width * linear_scale,
+                    height: source_height * linear_scale,
                 },
                 angle_degrees: source_frame.angle_degrees,
             };
-            push_candidate(target_frame, false);
+            if same_direction {
+                push_candidate(family_source, false, family_area, visual_area_scale);
+                push_candidate(family_source, true, family_area, visual_area_scale);
+                return;
+            }
+
+            let logical_transpose = logical_frame(
+                source_center,
+                source_frame.angle_degrees,
+                target_writing_mode,
+                inline_extent(source_frame, source_writing_mode) * linear_scale,
+                block_extent(source_frame, source_writing_mode) * linear_scale,
+            );
+            for index in 0..=aspect_intervals {
+                let progress = index as f32 / aspect_intervals as f32;
+                let width = logarithmic_interpolation(
+                    family_source.bounds.width,
+                    logical_transpose.bounds.width,
+                    progress,
+                );
+                let height = logarithmic_interpolation(
+                    family_source.bounds.height,
+                    logical_transpose.bounds.height,
+                    progress,
+                );
+                let target_frame = GeometryFrame {
+                    bounds: LayoutBox {
+                        x: source_center.0 - width * 0.5,
+                        y: source_center.1 - height * 0.5,
+                        width,
+                        height,
+                    },
+                    angle_degrees: source_frame.angle_degrees,
+                };
+                push_candidate(target_frame, false, family_area, visual_area_scale);
+            }
+            push_candidate(logical_transpose, true, family_area, visual_area_scale);
+        };
+
+        push_family(1.0);
+        if translation_visual_area_scale > 1.0 + f32::EPSILON {
+            for index in 1..=TRANSLATION_VISUAL_AREA_INTERVALS {
+                let progress = index as f32 / TRANSLATION_VISUAL_AREA_INTERVALS as f32;
+                push_family(logarithmic_interpolation(
+                    1.0,
+                    translation_visual_area_scale,
+                    progress,
+                ));
+            }
         }
-        push_candidate(logical_transpose, true);
+        drop(push_family);
+        #[cfg(debug_assertions)]
+        if source_containing_obstacles
+            .as_ref()
+            .is_some_and(|obstacles| !obstacles.is_empty())
+        {
+            tracing::trace!(
+                target: "koharu_typesetting_probe",
+                marker = "free_text_source_ownership",
+                source = %source,
+                source_site = ?source_center,
+                source_containing_obstacles = ?source_containing_obstacles,
+                candidate_count = candidates.len(),
+            );
+        }
+        #[cfg(debug_assertions)]
+        if candidates.is_empty() && probe_enabled {
+            tracing::trace!(
+                target: "koharu_typesetting_probe",
+                marker = "free_text_space",
+                source = %source,
+                source_geometry_area = maximum_visual_area,
+                source_frame = ?source_frame,
+                source_writing_mode = ?source_writing_mode,
+                target_writing_mode = ?target_writing_mode,
+                refine_orthogonal_shape,
+                translation_visual_area_scale,
+                clearance,
+                panel = ?panel.map(|panel| panel.entity),
+                container_point_count = container.len(),
+                text_site_count = self.text_sites.len(),
+                obstacle_count = self.obstacles.len(),
+                rejections = ?rejections,
+            );
+        }
         candidates
     }
 
@@ -221,13 +366,14 @@ impl FreeTextSpace {
         corridor: &InlineCorridor<'_>,
         target_frame: GeometryFrame,
         expand_inline: bool,
-    ) -> Option<GeometryFrame> {
+    ) -> Result<GeometryFrame, InlineCorridorRejection> {
         let target_writing_mode = corridor.writing_mode;
         let container = corridor.container;
         let target_inline_extent = inline_extent(target_frame, target_writing_mode);
         let target_block_extent = block_extent(target_frame, target_writing_mode);
         let (container_minimum, container_maximum) =
-            projected_inline_bounds(target_frame, target_writing_mode, container)?;
+            projected_inline_bounds(target_frame, target_writing_mode, container)
+                .ok_or(InlineCorridorRejection::InvalidContainerProjection)?;
         let anchor_inline = target_inline_extent * 0.5;
         if !interval_inside(
             target_frame,
@@ -236,7 +382,7 @@ impl FreeTextSpace {
             anchor_inline,
             container,
         ) {
-            return None;
+            return Err(InlineCorridorRejection::AnchorOutsideContainer);
         }
         let clearance = corridor.clearance;
         let mut limits = InlineLimits {
@@ -256,7 +402,7 @@ impl FreeTextSpace {
             ) - clearance,
         };
         if anchor_inline < limits.minimum || anchor_inline > limits.maximum {
-            return None;
+            return Err(InlineCorridorRejection::ClearanceExcludesAnchor);
         }
 
         for text_site in &self.text_sites {
@@ -269,9 +415,12 @@ impl FreeTextSpace {
             if !polygon_contains_point(container, site) {
                 continue;
             }
-            constrain_to_text_site_cell(target_frame, corridor, text_site, &mut limits)?;
+            constrain_to_text_site_cell(target_frame, corridor, text_site, &mut limits)
+                .ok_or(InlineCorridorRejection::TextSiteCell(text_site.entity))?;
             if anchor_inline < limits.minimum || anchor_inline > limits.maximum {
-                return None;
+                return Err(InlineCorridorRejection::TextSiteExcludesAnchor(
+                    text_site.entity,
+                ));
             }
         }
 
@@ -283,6 +432,13 @@ impl FreeTextSpace {
                 .flatten(),
         ) {
             if obstacle.entity == corridor.source {
+                continue;
+            }
+            // An automatically detected free-text site already claims its source
+            // anchor. A containing analysis region cannot be an exclusion zone for
+            // that same site; other text regions and obstacles still bound its
+            // corridor normally.
+            if geometry_contains_point(&obstacle.geometry, corridor.source_site) {
                 continue;
             }
             let Some(bounds) = projected_bounds(target_frame, &obstacle.geometry) else {
@@ -322,13 +478,17 @@ impl FreeTextSpace {
             } else if obstacle_minimum >= anchor_inline {
                 limits.maximum = limits.maximum.min(obstacle_minimum - clearance);
             } else {
-                return None;
+                return Err(InlineCorridorRejection::ObstacleStraddlesAnchor(
+                    obstacle.entity,
+                ));
             }
         }
 
         let available_inline_extent = limits.maximum - limits.minimum;
         if available_inline_extent < MINIMUM_USEFUL_INLINE_EXTENT {
-            return None;
+            return Err(InlineCorridorRejection::NoInlineExtent(
+                available_inline_extent,
+            ));
         }
         let inline_extent = if expand_inline {
             available_inline_extent
@@ -350,7 +510,7 @@ impl FreeTextSpace {
             local_left + width * 0.5,
             local_top + height * 0.5,
         );
-        Some(GeometryFrame {
+        Ok(GeometryFrame {
             bounds: LayoutBox {
                 x: center.0 - width * 0.5,
                 y: center.1 - height * 0.5,
@@ -901,6 +1061,8 @@ mod tests {
             geometry_frame(&source).unwrap(),
             WritingMode::Horizontal,
             WritingMode::Horizontal,
+            false,
+            1.0,
             8.0,
         );
 
@@ -917,6 +1079,54 @@ mod tests {
         assert!(corridor.bounds.width > candidate.bounds.width);
         assert_eq!(corridor.bounds.height, candidate.bounds.height);
         assert_eq!(corridor.maximum_visual_area, candidate.maximum_visual_area);
+    }
+
+    #[test]
+    fn translation_demand_adds_a_separate_expanded_candidate_family() {
+        let source = Geometry::rectangle(200.0, 200.0, 80.0, 40.0);
+        let source_id = EntityId::new();
+        let space = FreeTextSpace::new(
+            LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 500.0,
+                height: 500.0,
+            },
+            Vec::new(),
+            vec![site(
+                source_id,
+                source.clone(),
+                WritingMode::Horizontal,
+                WritingMode::Horizontal,
+                0.0,
+            )],
+            Vec::new(),
+        );
+
+        let candidates = space.candidates(
+            source_id,
+            &source,
+            geometry_frame(&source).unwrap(),
+            WritingMode::Horizontal,
+            WritingMode::Horizontal,
+            false,
+            4.0,
+            0.0,
+        );
+
+        assert_eq!(candidates.len(), 8);
+        let expected_scales = [1.0, 4.0_f32.powf(1.0 / 3.0), 4.0_f32.powf(2.0 / 3.0), 4.0];
+        for (family, expected_scale) in candidates.chunks_exact(2).zip(expected_scales) {
+            assert!(family.iter().all(|candidate| {
+                approximately_equal(candidate.translation_visual_area_scale, expected_scale)
+                    && approximately_equal(
+                        candidate.maximum_visual_area,
+                        80.0 * 40.0 * expected_scale,
+                    )
+            }));
+        }
+        assert!(approximately_equal(candidates[6].bounds.width, 160.0));
+        assert!(approximately_equal(candidates[6].bounds.height, 80.0));
     }
 
     #[test]
@@ -947,6 +1157,8 @@ mod tests {
             geometry_frame(&source).unwrap(),
             WritingMode::VerticalRl,
             WritingMode::Horizontal,
+            false,
+            1.0,
             0.0,
         );
 
@@ -1003,6 +1215,8 @@ mod tests {
             geometry_frame(&source).unwrap(),
             WritingMode::VerticalRl,
             WritingMode::Horizontal,
+            false,
+            1.0,
             6.0,
         );
         let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
@@ -1043,6 +1257,8 @@ mod tests {
             geometry_frame(&source).unwrap(),
             WritingMode::VerticalRl,
             WritingMode::Horizontal,
+            false,
+            1.0,
             4.0,
         );
         let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
@@ -1052,6 +1268,49 @@ mod tests {
         assert!((transposed.bounds.width - 275.4375).abs() < 0.01);
         assert!((transposed.preferred_center.0 - 26.40625).abs() < 0.01);
         assert!((transposed.maximum_visual_area - 52.8125 * 275.4375).abs() < 0.01);
+    }
+
+    #[test]
+    fn obstacle_containing_the_source_anchor_does_not_erase_owned_layout_space() {
+        let source = Geometry::rectangle(115.0, 652.9199, 31.25, 70.58594);
+        let source_id = EntityId::new();
+        let containing_obstacle = Geometry::rectangle(8.0, 314.0, 195.0, 417.0);
+        let space = FreeTextSpace::new(
+            LayoutBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 1807.0,
+            },
+            vec![region(Geometry::rectangle(0.0, 300.0, 320.0, 600.0))],
+            vec![site(
+                source_id,
+                source.clone(),
+                WritingMode::VerticalRl,
+                WritingMode::Horizontal,
+                2.0,
+            )],
+            vec![region(containing_obstacle)],
+        );
+
+        let source_frame = geometry_frame(&source).unwrap();
+        let candidates = space.candidates(
+            source_id,
+            &source,
+            source_frame,
+            WritingMode::VerticalRl,
+            WritingMode::Horizontal,
+            true,
+            4.0,
+            2.0,
+        );
+
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| { candidate.bounds.width >= source_frame.bounds.height - 0.01 })
+        );
     }
 
     #[test]
@@ -1098,6 +1357,8 @@ mod tests {
                 left_frame,
                 WritingMode::VerticalRl,
                 WritingMode::Horizontal,
+                false,
+                1.0,
                 clearance,
             )
             .into_iter()
@@ -1110,6 +1371,8 @@ mod tests {
                 right_frame,
                 WritingMode::VerticalRl,
                 WritingMode::Horizontal,
+                false,
+                1.0,
                 clearance,
             )
             .into_iter()
@@ -1162,6 +1425,8 @@ mod tests {
             geometry_frame(&upper).unwrap(),
             WritingMode::VerticalRl,
             WritingMode::Horizontal,
+            false,
+            1.0,
             4.0,
         );
         let widest = candidates
@@ -1211,6 +1476,8 @@ mod tests {
             geometry_frame(&upper).unwrap(),
             WritingMode::VerticalRl,
             WritingMode::Horizontal,
+            false,
+            1.0,
             4.0,
         );
 
