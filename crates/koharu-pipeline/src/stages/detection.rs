@@ -25,8 +25,7 @@ use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, Component, DetectionAnalysis,
     DetectionLabel, EntityId, EntityOrigin, FitsTo, FlowsIn, Generation, Geometry, Inside, Origin,
     PanelRegion, Point, Presents, ProducerId, RecognizedFrom, Region, RegionKind, RegionSpec,
-    RemovePolicy, SourceText, TextContent, TextLayout, TextLayoutKind, TextRegion, TextRole,
-    Translation, Typography, Visibility, WritingMode,
+    TextContent, TextLayout, TextLayoutKind, TextRegion, TextRole, Typography, WritingMode,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -100,47 +99,6 @@ impl Processor {
 impl StageProcessor for Processor {
     fn model(&self) -> &'static str {
         MODEL_NAME
-    }
-
-    fn skip(&self, input: &StageInput) -> Result<bool> {
-        let producer = ProducerId::new(PRODUCER)?;
-        for entity in input.scene.descendants(input.page)? {
-            let id = entity.id();
-            let detector_authored_text = entity
-                .component::<TextContent>()?
-                .is_some_and(|value| generated_by(&value.origin, &producer))
-                || entity
-                    .component::<TextLayout>()?
-                    .is_some_and(|value| generated_by(&value.origin, &producer));
-            if input.region.is_none()
-                && detector_authored_text
-                && !replaceable_text_entity(&input.scene, id, &producer)?
-            {
-                bail!(protected_text_error(&input.scene, id)?);
-            }
-            if !input.contains_entity(id)?
-                || !entity
-                    .component::<Region>()?
-                    .is_some_and(|region| region.kind == TextRegion::kind())
-            {
-                continue;
-            }
-            if !entity_owned_by(&input.scene, id, &producer)? {
-                return Ok(true);
-            }
-            for recognized in input.scene.relations_to_as::<RecognizedFrom>(id) {
-                let content = recognized.value().source;
-                if !replaceable_text_entity(&input.scene, content, &producer)? {
-                    bail!(protected_text_error(&input.scene, content)?);
-                }
-                for presents in input.scene.relations_to_as::<Presents>(content) {
-                    if !replaceable_text_entity(&input.scene, presents.value().source, &producer)? {
-                        bail!(protected_text_error(&input.scene, presents.value().source,)?);
-                    }
-                }
-            }
-        }
-        Ok(false)
     }
 
     fn unload(&self) -> bool {
@@ -269,22 +227,15 @@ fn remove_previous_output(
     let mut layers = BTreeSet::new();
     for entity in input.scene.descendants(input.page)? {
         let id = entity.id();
-        if entity.component::<Region>()?.is_some()
+        if component_generated_by::<Region>(&input.scene, id, producer)?
             && input.contains_entity(id)?
-            && entity_owned_by(&input.scene, id, producer)?
         {
             regions.insert(id);
         }
-        if page_scope
-            && entity.component::<TextContent>()?.is_some()
-            && replaceable_text_entity(&input.scene, id, producer)?
-        {
+        if page_scope && component_generated_by::<TextContent>(&input.scene, id, producer)? {
             contents.insert(id);
         }
-        if page_scope
-            && entity.component::<TextLayout>()?.is_some()
-            && replaceable_text_entity(&input.scene, id, producer)?
-        {
+        if page_scope && component_generated_by::<TextLayout>(&input.scene, id, producer)? {
             layers.insert(id);
         }
     }
@@ -293,15 +244,11 @@ fn remove_previous_output(
         for region in &regions {
             for recognized in input.scene.relations_to_as::<RecognizedFrom>(*region) {
                 let content = recognized.value().source;
-                if replaceable_text_entity(&input.scene, content, producer)?
-                    && input.scene.component::<TextContent>(content)?.is_some()
-                {
+                if component_generated_by::<TextContent>(&input.scene, content, producer)? {
                     contents.insert(content);
                     for presents in input.scene.relations_to_as::<Presents>(content) {
                         let layer = presents.value().source;
-                        if replaceable_text_entity(&input.scene, layer, producer)?
-                            && input.scene.component::<TextLayout>(layer)?.is_some()
-                        {
+                        if component_generated_by::<TextLayout>(&input.scene, layer, producer)? {
                             layers.insert(layer);
                         }
                     }
@@ -310,144 +257,32 @@ fn remove_previous_output(
         }
     }
 
-    for entity in layers.into_iter().chain(contents).chain(regions) {
-        edit.remove_entity(entity, RemovePolicy::Cascade)?;
+    for entity in layers {
+        edit.remove_entity_for_regeneration::<TextLayout>(entity)?;
+    }
+    for entity in contents {
+        edit.remove_entity_for_regeneration::<TextContent>(entity)?;
+    }
+    for entity in regions {
+        edit.remove_entity_for_regeneration::<Region>(entity)?;
     }
     Ok(())
 }
 
-fn entity_owned_by(
+fn component_generated_by<T: Component>(
     snapshot: &koharu_scene::Snapshot,
     entity: EntityId,
     producer: &ProducerId,
 ) -> Result<bool> {
-    Ok(snapshot
-        .component::<EntityOrigin>(entity)?
-        .is_some_and(|origin| generated_by(&origin.origin, producer)))
+    Ok(snapshot.component::<T>(entity)?.is_some_and(|value| {
+        value
+            .origin()
+            .is_some_and(|origin| generated_by(origin, producer))
+    }))
 }
 
 fn generated_by(origin: &Origin, producer: &ProducerId) -> bool {
     matches!(origin, Origin::Generated(owner) if &owner.producer == producer)
-}
-
-fn protected_text_error(snapshot: &koharu_scene::Snapshot, entity: EntityId) -> Result<String> {
-    let mut entities = BTreeSet::from([entity]);
-    if snapshot.component::<TextLayout>(entity)?.is_some()
-        && let Some(presents) = snapshot.relation_from::<Presents>(entity)?
-    {
-        entities.insert(presents.value().target);
-    }
-    if snapshot.component::<TextContent>(entity)?.is_some() {
-        entities.extend(
-            snapshot
-                .relations_to_as::<Presents>(entity)
-                .map(|relation| relation.value().source),
-        );
-    }
-
-    let mut authored = BTreeSet::new();
-    for entity in entities {
-        record_user_component::<Geometry>(snapshot, entity, "geometry", &mut authored)?;
-        record_user_component::<Visibility>(snapshot, entity, "visibility", &mut authored)?;
-        record_user_component::<Typography>(snapshot, entity, "typography", &mut authored)?;
-        record_user_component::<SourceText>(snapshot, entity, "source text", &mut authored)?;
-        record_user_component::<Translation>(snapshot, entity, "translation", &mut authored)?;
-        record_user_component::<TextRole>(snapshot, entity, "text role", &mut authored)?;
-        record_user_component::<TextLayout>(snapshot, entity, "text layout", &mut authored)?;
-        record_user_component::<TextContent>(snapshot, entity, "text content", &mut authored)?;
-    }
-    let state = if authored.is_empty() {
-        "user-owned layer placement or lifecycle".to_owned()
-    } else {
-        authored.into_iter().collect::<Vec<_>>().join(", ")
-    };
-    Ok(format!(
-        "detection cannot replace text entity {entity} because its {state} must be preserved; reset or delete that text layer before reprocessing"
-    ))
-}
-
-fn record_user_component<T: Component>(
-    snapshot: &koharu_scene::Snapshot,
-    entity: EntityId,
-    label: &'static str,
-    authored: &mut BTreeSet<&'static str>,
-) -> Result<()> {
-    if snapshot
-        .component::<T>(entity)?
-        .is_some_and(|value| matches!(value.origin(), Some(Origin::User)))
-    {
-        authored.insert(label);
-    }
-    Ok(())
-}
-
-fn replaceable_text_entity(
-    snapshot: &koharu_scene::Snapshot,
-    entity: EntityId,
-    producer: &ProducerId,
-) -> Result<bool> {
-    if snapshot.component::<TextLayout>(entity)?.is_some() {
-        if !machine_owned_layer_components(snapshot, entity, producer)? {
-            return Ok(false);
-        }
-        return match entity_lifecycle(snapshot, entity)? {
-            Some(origin) if generated_by(&origin, producer) => Ok(true),
-            _ => Ok(false),
-        };
-    }
-    if snapshot.component::<TextContent>(entity)?.is_some() {
-        if !machine_owned_content_components(snapshot, entity, producer)? {
-            return Ok(false);
-        }
-        return match entity_lifecycle(snapshot, entity)? {
-            Some(origin) if generated_by(&origin, producer) => Ok(true),
-            _ => Ok(false),
-        };
-    }
-    Ok(false)
-}
-
-fn entity_lifecycle(snapshot: &koharu_scene::Snapshot, entity: EntityId) -> Result<Option<Origin>> {
-    Ok(snapshot
-        .component::<EntityOrigin>(entity)?
-        .map(|value| value.origin))
-}
-
-fn machine_owned_layer_components(
-    snapshot: &koharu_scene::Snapshot,
-    layer: EntityId,
-    producer: &ProducerId,
-) -> Result<bool> {
-    let detector_layout = snapshot
-        .component::<TextLayout>(layer)?
-        .is_some_and(|layout| generated_by(&layout.origin, producer));
-    Ok(detector_layout
-        && generated_component_or_absent::<Typography>(snapshot, layer)?
-        && generated_component_or_absent::<Geometry>(snapshot, layer)?
-        && generated_component_or_absent::<Visibility>(snapshot, layer)?)
-}
-
-fn machine_owned_content_components(
-    snapshot: &koharu_scene::Snapshot,
-    content: EntityId,
-    producer: &ProducerId,
-) -> Result<bool> {
-    let detector_content = snapshot
-        .component::<TextContent>(content)?
-        .is_some_and(|content| generated_by(&content.origin, producer));
-    Ok(detector_content
-        && generated_component_or_absent::<TextRole>(snapshot, content)?
-        && generated_component_or_absent::<SourceText>(snapshot, content)?
-        && generated_component_or_absent::<Translation>(snapshot, content)?)
-}
-
-fn generated_component_or_absent<T: Component>(
-    snapshot: &koharu_scene::Snapshot,
-    entity: EntityId,
-) -> Result<bool> {
-    Ok(snapshot
-        .component::<T>(entity)?
-        .is_none_or(|value| matches!(value.origin(), Some(Origin::Generated(_)))))
 }
 
 async fn write_page(
@@ -2193,7 +2028,7 @@ mod tests {
     use koharu_scene::{
         At, Authored, BubbleRegion, Edit, EntityId, FitsTo, FlowsIn, Geometry, Inside, Origin,
         PageDraft, RecognizedFrom, Session, SourceText, TextLayout, TextLayoutKind, TextRegion,
-        Translation, Typography, WritingMode,
+        Translation, Typography, Visibility, WritingMode,
     };
 
     use super::{
@@ -2249,7 +2084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detection_skips_a_page_with_existing_text() {
+    async fn detection_runs_on_a_page_with_user_created_regions() {
         let mut session = Session::memory().await.unwrap();
         let mut page = None;
         let patch = session
@@ -2262,15 +2097,20 @@ mod tests {
                     &Geometry::rectangle(10.0, 10.0, 20.0, 20.0),
                     None,
                 )?;
+                edit.add_analysis_region::<BubbleRegion>(
+                    id,
+                    At::End,
+                    &Geometry::rectangle(40.0, 40.0, 20.0, 20.0),
+                    None,
+                )?;
                 page = Some(id);
                 Ok(())
             })
             .unwrap();
         let snapshot = session.commit(patch).await.unwrap().snapshot;
-        let page = page.unwrap();
         let input = StageInput::new(
-            snapshot.clone(),
-            page,
+            snapshot,
+            page.unwrap(),
             None,
             None,
             std::sync::Arc::new(crate::ImageCache::default()),
@@ -2281,11 +2121,11 @@ mod tests {
             koharu_ml::Device::cpu(),
         );
 
-        assert!(processor.skip(&input).unwrap());
+        assert!(!processor.skip(&input).unwrap());
     }
 
     #[tokio::test]
-    async fn detection_protects_a_user_promoted_graph_before_component_edits() {
+    async fn detection_replacement_discards_manual_edits_to_generated_output_and_is_undoable() {
         let mut session = Session::memory().await.unwrap();
         let mut page = None;
         let create = session
@@ -2298,35 +2138,61 @@ mod tests {
         let snapshot = session.commit(create).await.unwrap().snapshot;
         let page = page.unwrap();
         let detection = generation(super::PRODUCER, super::MODEL_ID).unwrap();
-        let mut generated = snapshot.edit_as(detection);
-        let (_, content, layer) = add_text_graph(&mut generated, page, 10.0);
+        let mut generated = snapshot.edit_as(detection.clone());
+        let (region, content, layer) = add_text_graph(&mut generated, page, 10.0);
         let snapshot = session
             .commit(generated.finish().unwrap())
             .await
             .unwrap()
             .snapshot;
-        let input = StageInput::new(
-            snapshot.clone(),
-            page,
-            None,
-            None,
-            std::sync::Arc::new(crate::ImageCache::default()),
-            None,
-        );
-        let processor = Processor::new(
-            DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig::default()),
-            koharu_ml::Device::cpu(),
-        );
-
-        assert!(!processor.skip(&input).unwrap());
-
-        let promoted = snapshot
+        let fits = snapshot
+            .relation_from::<FitsTo>(layer)
+            .unwrap()
+            .unwrap()
+            .id();
+        let edited = snapshot
             .patch(|edit| {
+                edit.promote_entity_to_user(region)?;
                 edit.promote_entity_to_user(layer)?;
-                edit.promote_entity_to_user(content)
+                edit.promote_entity_to_user(content)?;
+                edit.set(region, &Geometry::rectangle(8.0, 9.0, 24.0, 25.0))?;
+                edit.set(layer, &Geometry::rectangle(12.0, 14.0, 24.0, 18.0))?;
+                edit.set(
+                    layer,
+                    &Typography {
+                        origin: Origin::User,
+                        preferred_font: None,
+                        font_weight: None,
+                        font_style: None,
+                        size: Some(18.0),
+                        auto_fit: false,
+                        color: None,
+                        stroke_color: None,
+                        stroke_width: None,
+                        alignment: None,
+                        writing_mode: None,
+                        extensions: Default::default(),
+                    },
+                )?;
+                edit.set(
+                    content,
+                    &Translation {
+                        text: Authored::user("manual translation".to_owned()),
+                        language: None,
+                    },
+                )?;
+                edit.promote_relation_to_user(fits)?;
+                edit.set_relation(
+                    fits,
+                    &Visibility {
+                        origin: Origin::User,
+                        visible: true,
+                        opacity: 1.0,
+                    },
+                )
             })
             .unwrap();
-        let snapshot = session.commit(promoted).await.unwrap().snapshot;
+        let snapshot = session.commit(edited).await.unwrap().snapshot;
         let input = StageInput::new(
             snapshot.clone(),
             page,
@@ -2335,11 +2201,49 @@ mod tests {
             std::sync::Arc::new(crate::ImageCache::default()),
             None,
         );
+        let mut replacement = snapshot.edit_as(detection.clone());
+        replacement.observe_subtree(page).unwrap();
+        remove_previous_output(&input, &mut replacement, &detection).unwrap();
+        let commit = session.commit(replacement.finish().unwrap()).await.unwrap();
+        for removed in [region, content, layer] {
+            assert!(commit.snapshot.entity(removed).is_err());
+        }
+        assert!(commit.snapshot.relation(fits).is_err());
 
-        let error = processor.skip(&input).unwrap_err().to_string();
-        assert!(
-            error.contains("user-owned layer placement or lifecycle"),
-            "{error}"
+        let restored = session.undo(commit.revision).await.unwrap().snapshot;
+        assert_eq!(
+            restored.component::<Geometry>(region).unwrap().unwrap(),
+            Geometry::rectangle(8.0, 9.0, 24.0, 25.0)
+        );
+        assert_eq!(
+            restored.component::<Geometry>(layer).unwrap().unwrap(),
+            Geometry::rectangle(12.0, 14.0, 24.0, 18.0)
+        );
+        let restored_typography = restored.component::<Typography>(layer).unwrap().unwrap();
+        assert_eq!(restored_typography.size, Some(18.0));
+        assert!(!restored_typography.auto_fit);
+        assert_eq!(
+            restored
+                .component::<Translation>(content)
+                .unwrap()
+                .unwrap()
+                .text
+                .value,
+            "manual translation"
+        );
+        assert!(matches!(
+            restored.relation(fits).unwrap().value().origin,
+            Origin::User
+        ));
+        assert_eq!(
+            restored
+                .relation(fits)
+                .unwrap()
+                .component::<Visibility>()
+                .unwrap()
+                .unwrap()
+                .opacity,
+            1.0
         );
     }
 

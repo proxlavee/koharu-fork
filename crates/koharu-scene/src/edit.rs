@@ -200,6 +200,67 @@ impl Edit {
     }
 
     pub fn remove_entity(&mut self, entity: EntityId, policy: RemovePolicy) -> Result<()> {
+        self.remove_entity_inner(entity, policy, true)
+    }
+
+    /// Removes a generated leaf during an explicitly requested authoritative regeneration.
+    ///
+    /// `T` is the structural component that proves which producer created the entity. Mutable
+    /// components and lifecycle ownership may have become user-authored since then; their state
+    /// is still retained in the inverse patch so the regeneration remains undoable. Nested
+    /// entities are rejected because they may be unrelated user-created content.
+    pub fn remove_entity_for_regeneration<T: Component>(&mut self, entity: EntityId) -> Result<()> {
+        let producer = self
+            .generation
+            .as_ref()
+            .map(|generation| generation.producer.clone())
+            .ok_or_else(|| {
+                Error::Authorship(
+                    "authoritative regeneration requires a pipeline generation".to_owned(),
+                )
+            })?;
+        let component = self.state.component(entity, &key::<T>()?)?.ok_or_else(|| {
+            Error::Authorship(format!(
+                "entity {entity} is not managed through component {}",
+                T::KIND
+            ))
+        })?;
+        let record_exists = |id| self.state.contains_entity(id);
+        let blob_exists = |_id| true;
+        let marker: T = decode(
+            component,
+            &ValidationContext::new(&record_exists, &blob_exists),
+        )?;
+        match marker.origin() {
+            Some(Origin::Generated(owner)) if owner.producer == producer => {}
+            Some(Origin::Generated(owner)) => {
+                return Err(Error::Authorship(format!(
+                    "producer {} owns entity {entity}, not {producer}",
+                    owner.producer
+                )));
+            }
+            Some(Origin::User) | None => {
+                return Err(Error::Authorship(format!(
+                    "component {} does not identify entity {entity} as pipeline-managed",
+                    T::KIND
+                )));
+            }
+        }
+        let page = self.state.page_for(entity)?;
+        if !self.state.page(page)?.entity(entity)?.children.is_empty() {
+            return Err(Error::Authorship(format!(
+                "authoritative regeneration cannot remove nested content from entity {entity}"
+            )));
+        }
+        self.remove_entity_inner(entity, RemovePolicy::Cascade, false)
+    }
+
+    fn remove_entity_inner(
+        &mut self,
+        entity: EntityId,
+        policy: RemovePolicy,
+        validate_authorship: bool,
+    ) -> Result<()> {
         let page = self.state.page_for(entity)?;
         if entity != page
             && self
@@ -214,8 +275,10 @@ impl Edit {
             self.observe_page_order_write();
         }
         let subtree = self.state.page(page)?.descendants(entity)?;
-        for id in &subtree {
-            self.validate_lifecycle_removal(*id)?;
+        if validate_authorship {
+            for id in &subtree {
+                self.validate_lifecycle_removal(*id)?;
+            }
         }
         let children = self
             .state
@@ -258,7 +321,7 @@ impl Edit {
             }
             RemovePolicy::Cascade => {
                 for relation in incident {
-                    self.remove_relation(relation)?;
+                    self.remove_relation_inner(relation, validate_authorship)?;
                 }
                 for id in subtree.into_iter().rev() {
                     self.remove_leaf(id)?;
@@ -452,13 +515,19 @@ impl Edit {
     }
 
     pub fn remove_relation(&mut self, id: RelationId) -> Result<()> {
+        self.remove_relation_inner(id, true)
+    }
+
+    fn remove_relation_inner(&mut self, id: RelationId, validate_authorship: bool) -> Result<()> {
         let relation = self
             .state
             .relations
             .get(&id)
             .cloned()
             .ok_or(Error::RelationNotFound(id))?;
-        self.validate_origin_removal(Some(&relation.value.origin))?;
+        if validate_authorship {
+            self.validate_origin_removal(Some(&relation.value.origin))?;
+        }
         let components = store_components(&relation.components);
         let value = relation.value.clone();
         self.state.remove_relation(id)?;

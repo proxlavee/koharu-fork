@@ -35,13 +35,10 @@ impl PageWork {
     }
 
     fn ready(&self, index: usize) -> bool {
-        let Some(prerequisite) = prerequisite(self.stages[index].stage) else {
-            return true;
-        };
+        let stage = self.stages[index].stage;
         self.stages
             .iter()
-            .find(|work| work.stage == prerequisite)
-            .is_none_or(|work| work.state == WorkState::Finished)
+            .all(|work| !depends_on(stage, work.stage) || work.state == WorkState::Finished)
     }
 }
 
@@ -150,6 +147,16 @@ const fn prerequisite(stage: Stage) -> Option<Stage> {
     }
 }
 
+fn depends_on(mut stage: Stage, ancestor: Stage) -> bool {
+    while let Some(parent) = prerequisite(stage) {
+        if parent == ancestor {
+            return true;
+        }
+        stage = parent;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +223,24 @@ mod tests {
         assert!(scheduler.complete_stage(pages[0], Stage::Inpainting));
         busy.clear();
         assert_eq!(scheduler.start_next(&busy), Some((pages[1], Stage::Ocr)));
+    }
+
+    #[test]
+    fn selected_descendant_waits_for_its_transitive_selected_ancestor() {
+        let pages = pages(1);
+        let mut scheduler = Scheduler::new(&pages, &[Stage::Detection, Stage::Translation]);
+        let busy = BTreeSet::new();
+
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Detection))
+        );
+        assert!(scheduler.start_next(&busy).is_none());
+
+        assert!(!scheduler.complete_stage(pages[0], Stage::Detection));
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Translation))
+        );
     }
 }
