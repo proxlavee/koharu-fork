@@ -43,31 +43,6 @@ Page changes publish a generation before the browser requests its lightweight ma
 
 Validate visual changes through the final Tauri window because WebGPU adapter availability, device loss, sizing, and display scaling depend on the system webview. Native PNG and PSD checks still verify the shared rasterizer's readback path independently.
 
-## Image-driven typesetting audit
-
-The successful Windows **Build** workflow uploads the short-lived `koharu-windows-dev-tools` artifact. It is separate from the installed application and is not bundled into the installer. Extract it to its own directory and keep `typesetting-audit.exe` beside `koharu-torch.dll`; do not copy either file into Koharu's installation directory. Put the source pages in a child directory, for example:
-
-```text
-C:\koharu-dev-tools\
-  typesetting-audit.exe
-  koharu-torch.dll
-  test-images\
-```
-
-If Windows blocks a downloaded archive, open the ZIP's **Properties**, select **Unblock**, and extract it again before running the executable. The tool checks translated balloon text without driving the desktop interface. It initializes Torch for detection and Torch-based models, plus llama.cpp only when the selected OCR backend requires it (including the default PaddleOCR-VL 1.6); the diffusion runtime is not installed. Native runtime and model files used by those selected stages may still be downloaded into Koharu's normal runtime cache on the first run. The tool processes one image or a directory, preserves the application's natural page order, applies translations by page and text order, renders the actual native frames, and fails when translated balloon text overflows or falls below the configured size and source-size ratio.
-
-Open PowerShell in the extracted developer-tools directory and run it once to create an ordered English and Turkish translation fixture:
-
-```powershell
-.\typesetting-audit.exe --input .\test-images --output .\audit
-```
-
-Replace each ordered source string under `translations.en-US` and `translations.tr-TR`, without adding, removing, or reordering entries. Then run the sizing and rendering pass:
-
-```powershell
-.\typesetting-audit.exe --input .\test-images --output .\audit --translations .\audit\typesetting-translations.json
-```
-
-Add `--include-inpainting` only when the final cleanup pixels also need inspection; omitting it avoids the optional LaMa model and keeps a sizing-only audit lighter. The second pass writes rendered PNGs per language and `typesetting-report.json`. A successful process exit means every detected translated balloon met the requested thresholds. The sizing-only PNGs show bubble shape and text placement; only an inpainting pass represents the final cleanup pixels. Keep source pages, completed fixtures, reports, and rendered outputs outside Git because they are local test data and generated artifacts.
+## Desktop debugging
 
 In debug builds, the CEF remote debugging endpoint is `http://127.0.0.1:4000`; use semantic CDP inspection for the DOM and canvas lifecycle, and native window capture when the final pixels matter.

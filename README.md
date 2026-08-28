@@ -7,11 +7,11 @@
 </p>
 
 <p align="center">
-<a href="https://trendshift.io/repositories/20649" target="_blank"><img src="https://trendshift.io/api/badge/repositories/20649" alt="mayocream%2Fkoharu | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/20649" target="_blank"><img src="https://trendshift.io/api/badge/repositories/20649" alt="koharu-rs%2Fkoharu | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 <p align="center">
-<a href="https://koharu.rs/getting-started/install/" target="_blank">Getting Started</a> · <a href="https://koharu.rs/" target="_blank">Docs</a> · <a href="https://github.com/mayocream/koharu/issues" target="_blank">Bug reports</a> · <a href="https://discord.gg/mHvHkxGnUY" target="_blank">Discord</a>
+<a href="https://koharu.rs/getting-started/install/" target="_blank">Getting Started</a> · <a href="https://koharu.rs/" target="_blank">Docs</a> · <a href="https://github.com/koharu-rs/koharu/issues" target="_blank">Bug reports</a> · <a href="https://discord.gg/mHvHkxGnUY" target="_blank">Discord</a>
 </p>
 
 <p align="center">
@@ -89,6 +89,7 @@ OCR reads source text from detected regions.
 - [PaddleOCR VL 1.6](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6)
 - [Manga OCR](https://huggingface.co/mayocream/manga-ocr)
 - [Baberu OCR](https://huggingface.co/genshiai-daichi/baberu-ocr)
+- [Hayai OCR](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2)
 
 #### Inpainting
 
@@ -190,8 +191,8 @@ If Koharu is useful in your workflow, consider sponsoring the project.
 
 Thanks to all the contributors who have helped make Koharu better!
 
-<a href="https://github.com/mayocream/koharu/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=mayocream/koharu" />
+<a href="https://github.com/koharu-rs/koharu/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=koharu-rs/koharu" />
 </a>
 
 ## License

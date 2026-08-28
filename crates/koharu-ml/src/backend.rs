@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use koharu_runtime::{Backend, Device, Hardware};
-use koharu_torch::{Kind, nn};
+use koharu_torch::{Cuda, Kind, nn};
 
 pub(crate) trait TryIntoDevice<T> {
     fn try_into_device(self) -> Result<T>;
@@ -8,9 +8,18 @@ pub(crate) trait TryIntoDevice<T> {
 
 impl TryIntoDevice<koharu_torch::Device> for Device {
     fn try_into_device(self) -> Result<koharu_torch::Device> {
-        match self.backend {
+        match &self.backend {
             Backend::Cpu => Ok(koharu_torch::Device::Cpu),
-            Backend::Cuda | Backend::Rocm => Ok(koharu_torch::Device::Cuda(self.index)),
+            Backend::Cuda | Backend::Rocm => {
+                // PyTorch's cuDNN switch controls MIOpen on ROCm. MIOpen is not reliable
+                // on Windows and causes runtime issues, so disable it there.
+                Cuda::set_user_enabled_cudnn(if cfg!(windows) {
+                    matches!(&self.backend, Backend::Cuda)
+                } else {
+                    true
+                });
+                Ok(koharu_torch::Device::Cuda(self.index))
+            }
             Backend::Vulkan if self.index == 0 => Ok(if koharu_torch::utils::has_vulkan() {
                 koharu_torch::Device::Vulkan
             } else {

@@ -4,8 +4,7 @@ use anyhow::Result;
 use strum::EnumProperty;
 
 use crate::{
-    Hardware, Store,
-    downloads::Transfer,
+    Hardware, Store, download,
     runtime::{
         DiscoverablePackage, Package, RuntimePackage,
         graph::Component,
@@ -16,64 +15,43 @@ use crate::{
     source::extract,
 };
 
-const RELEASE: &str = "stable-diffusion.cpp-master-827-97d2990";
+const RELEASE: &str = "master-827-97d2990";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::Display, strum::EnumProperty)]
 pub(crate) enum Diffusion {
     #[strum(
         serialize = "windows-cuda",
-        props(
-            asset = "stable-diffusion-cuda-windows-2022.tar.gz",
-            library = "stable-diffusion.dll"
-        )
+        props(asset = "Windows-cuda.tar.gz", library = "stable-diffusion.dll")
     )]
     WindowsCuda,
     #[strum(
         serialize = "linux-cuda",
-        props(
-            asset = "stable-diffusion-cuda-ubuntu-latest.tar.gz",
-            library = "libstable-diffusion.so"
-        )
+        props(asset = "Linux-cuda.tar.gz", library = "libstable-diffusion.so")
     )]
     LinuxCuda,
     #[strum(
         serialize = "windows-hip",
-        props(
-            asset = "stable-diffusion-hip-windows-2022.tar.gz",
-            library = "stable-diffusion.dll"
-        )
+        props(asset = "Windows-hip.tar.gz", library = "stable-diffusion.dll")
     )]
     WindowsHip,
     #[strum(
         serialize = "linux-hip",
-        props(
-            asset = "stable-diffusion-hip-ubuntu-latest.tar.gz",
-            library = "libstable-diffusion.so"
-        )
+        props(asset = "Linux-hip.tar.gz", library = "libstable-diffusion.so")
     )]
     LinuxHip,
     #[strum(
         serialize = "windows-vulkan",
-        props(
-            asset = "stable-diffusion-vulkan-windows-2022.tar.gz",
-            library = "stable-diffusion.dll"
-        )
+        props(asset = "Windows-vulkan.tar.gz", library = "stable-diffusion.dll")
     )]
     WindowsVulkan,
     #[strum(
         serialize = "linux-vulkan",
-        props(
-            asset = "stable-diffusion-vulkan-ubuntu-latest.tar.gz",
-            library = "libstable-diffusion.so"
-        )
+        props(asset = "Linux-vulkan.tar.gz", library = "libstable-diffusion.so")
     )]
     LinuxVulkan,
     #[strum(
         serialize = "macos-metal",
-        props(
-            asset = "stable-diffusion-metal-macos-latest.tar.gz",
-            library = "libstable-diffusion.dylib"
-        )
+        props(asset = "macOS-metal.tar.gz", library = "libstable-diffusion.dylib")
     )]
     MacosMetal,
 }
@@ -108,10 +86,10 @@ impl Package for Diffusion {
             move |stage| async move {
                 let asset = self.asset();
                 let url = format!(
-                    "https://github.com/mayocream/koharu/releases/download/{RELEASE}/{asset}"
+                    "https://github.com/koharu-rs/diffusion/releases/download/{RELEASE}/{asset}"
                 );
                 let archive = tempfile::Builder::new().suffix(".tar.gz").tempfile()?;
-                Transfer::new()?.fetch(&url, archive.path()).await?;
+                download::fetch(&url, archive.path()).await?;
                 extract(
                     archive.path(),
                     &stage,

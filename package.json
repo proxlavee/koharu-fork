@@ -5,7 +5,7 @@
   ],
   "scripts": {
     "tauri": "cargo tauri",
-    "postinstall": "cargo install --git https://github.com/tauri-apps/tauri --branch feat/cef --locked tauri-cli",
+    "postinstall": "cargo install --git https://github.com/tauri-apps/tauri --rev 78b9e169eefcc6ff052f2e3e99225f7dce8144cd --locked tauri-cli",
     "predev": "kill-port 3000",
     "dev": "cargo tauri dev --features default",
     "build": "cargo tauri build --no-bundle",
@@ -20,7 +20,7 @@
     "check": "oxfmt --check packages tests package.json .oxfmtrc.json .vscode"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.4.0",
     "git-cliff": "^2.13.1",
     "kill-port": "^2.0.1",
     "oxfmt": "^0.56.0",
