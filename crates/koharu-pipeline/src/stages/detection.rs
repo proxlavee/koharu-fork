@@ -2276,6 +2276,22 @@ mod tests {
             .await
             .unwrap()
             .snapshot;
+
+        let ocr_generation = generation("dev.koharu.pipeline.ocr", "test-ocr").unwrap();
+        let mut ocr = snapshot.edit_as(ocr_generation.clone());
+        ocr.set(
+            content,
+            &SourceText {
+                text: Authored::generated("source".to_owned(), ocr_generation),
+                language: None,
+            },
+        )
+        .unwrap();
+        let snapshot = session
+            .commit(ocr.finish().unwrap())
+            .await
+            .unwrap()
+            .snapshot;
         let fits = snapshot
             .relation_from::<FitsTo>(layer)
             .unwrap()
@@ -2353,6 +2369,15 @@ mod tests {
         let restored_typography = restored.component::<Typography>(layer).unwrap().unwrap();
         assert_eq!(restored_typography.size, Some(18.0));
         assert!(!restored_typography.auto_fit);
+        assert_eq!(
+            restored
+                .component::<SourceText>(content)
+                .unwrap()
+                .unwrap()
+                .text
+                .value,
+            "source"
+        );
         assert_eq!(
             restored
                 .component::<Translation>(content)
