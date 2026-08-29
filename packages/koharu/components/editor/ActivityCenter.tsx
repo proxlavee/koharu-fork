@@ -7,6 +7,7 @@ import { call } from '@/lib/backend'
 import { useKoharuStore } from '@/lib/store'
 import { commands, type Download as DownloadState, type Job } from '@koharu/bridge/protocol'
 import { Button } from '@koharu/ui/components/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@koharu/ui/components/tooltip'
 
 export function ActivityCenter() {
   const { t } = useTranslation()
@@ -100,15 +101,22 @@ function JobItem({ job }: { job: Job }) {
         <span className='pt-0.5 text-right text-[10px] tabular-nums'>
           {percent !== null ? `${percent}%` : null}
         </span>
-        <Button
-          size='icon-xs'
-          variant='ghost'
-          className='-mt-1'
-          aria-label={t('activity.stop')}
-          onClick={() => void call(commands.stopJob, job.id).catch(() => undefined)}
-        >
-          <Square className='size-2.5 fill-current' />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                size='icon-xs'
+                variant='ghost'
+                className='-mt-1'
+                aria-label={t('activity.stop')}
+                onClick={() => void call(commands.stopJob, job.id).catch(() => undefined)}
+              />
+            }
+          >
+            <Square className='size-2.5 fill-current' />
+          </TooltipTrigger>
+          <TooltipContent side='left'>{t('activity.stop')}</TooltipContent>
+        </Tooltip>
         <div className='col-start-2 col-end-4'>
           <Progress value={percent} />
         </div>
@@ -152,15 +160,22 @@ function Failure({ message, onDismiss }: { message: string; onDismiss: () => voi
     <div className='grid grid-cols-[1rem_minmax(0,1fr)_2.25rem_1.5rem] items-start gap-x-2.5 border-b p-3 text-[11px] last:border-b-0'>
       <CircleAlert className='mt-0.5 size-3.5 justify-self-center text-destructive' />
       <span className='col-start-2 col-end-4 min-w-0 text-destructive'>{message}</span>
-      <Button
-        size='icon-xs'
-        variant='ghost'
-        className='-mt-1'
-        aria-label={t('activity.dismiss')}
-        onClick={onDismiss}
-      >
-        <X />
-      </Button>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              size='icon-xs'
+              variant='ghost'
+              className='-mt-1'
+              aria-label={t('activity.dismiss')}
+              onClick={onDismiss}
+            />
+          }
+        >
+          <X />
+        </TooltipTrigger>
+        <TooltipContent side='left'>{t('activity.dismiss')}</TooltipContent>
+      </Tooltip>
     </div>
   )
 }
