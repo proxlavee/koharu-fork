@@ -1,0 +1,3 @@
+## 2024-05-22 - Optimize Layer Lookup Complexity
+**Learning:** In operations like `effectiveLayerVisibility` and `expandLayerSelection`, layers are being searched with `layers.find()` in `while` loops or recursive functions. Since `hitTestLayers` also calls `effectiveLayerVisibility` for each layer (which triggers the O(N^2) parent lookup), this causes a significant performance bottleneck during rendering/hit-testing on the canvas with many layers.
+**Action:** Use a `Map<string, Layer>` or build a lookup map up front when doing frequent parent/child traversal to make lookups O(1) instead of O(N) in `effectiveLayerVisibility` and `expandLayerSelection`.
