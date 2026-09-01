@@ -1,0 +1,3 @@
+## 2023-10-27 - [Optimize O(N^2) Layer Lookups in Recursive & Rendering Functions]
+**Learning:** Functions like `effectiveLayerVisibility` and `expandLayerSelection` that need to trace upwards to a parent or downward to children were relying on `layers.find()` in the render loop or deep recursions, causing O(N^2) complexity. This codebase pattern significantly bottlenecks performance when hit-testing real-time canvas interactions over many layers.
+**Action:** Always pre-compute a `Map<string, Layer>` for fast O(1) lookups before iterating or recursing over large arrays of layers, modifying signatures to accept `Map` as an alternative where needed.
