@@ -359,6 +359,12 @@ impl TextRenderer {
                     !descriptor.flow_contours.is_empty(),
                 );
             }
+            if let Some(source_size) = descriptor.source_font_size {
+                // Flow ownership remains a hard constraint inside TextLayout. It
+                // does not need to disable soft source-scale guidance: the candidate
+                // must still fit every contour before it can be selected.
+                template = template.with_comic_source_font_size(source_size);
+            }
         }
         let selected = if !descriptor.free_text_candidates.is_empty()
             && descriptor.auto_fit
@@ -1472,6 +1478,29 @@ mod tests {
             .unwrap();
         assert!(rendered.metadata.font_size > descriptor.minimum_font_size);
         assert!(rendered.diagnostics.is_empty());
+
+        let baseline_size = rendered.metadata.font_size;
+        let mut nearby_source = render_descriptor.clone();
+        nearby_source.source_font_size = Some(baseline_size - 3.0);
+        let source_guided = TextRenderer::new()
+            .render_descriptor(&nearby_source, &fonts)
+            .unwrap();
+        assert!((source_guided.metadata.font_size - (baseline_size - 3.0)).abs() < 0.01);
+
+        let mut flow_guided = nearby_source.clone();
+        flow_guided.flow_contours =
+            vec![vec![(0.0, 0.0), (240.0, 0.0), (240.0, 120.0), (0.0, 120.0)]];
+        let source_guided_flow = TextRenderer::new()
+            .render_descriptor(&flow_guided, &fonts)
+            .unwrap();
+        assert!((source_guided_flow.metadata.font_size - (baseline_size - 3.0)).abs() < 0.01);
+
+        let mut distant_source = render_descriptor.clone();
+        distant_source.source_font_size = Some(baseline_size - 5.0);
+        let unrestricted = TextRenderer::new()
+            .render_descriptor(&distant_source, &fonts)
+            .unwrap();
+        assert!((unrestricted.metadata.font_size - baseline_size).abs() < 0.01);
 
         let mut expanded_translation = render_descriptor.clone();
         expanded_translation.text =

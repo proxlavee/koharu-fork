@@ -148,10 +148,12 @@ function TypeInspector() {
 
   const apply = (update: (value: Typography) => Typography) => {
     if (!selected.length) return
-    const updates = selected.map((layer) => ({
-      layer: layer.id,
-      typography: update(layer.typography ?? defaultTypography),
-    }))
+    const updates = selected.flatMap((layer) => {
+      const current = layer.typography ?? defaultTypography
+      const typography = update(current)
+      return typography === current ? [] : [{ layer: layer.id, typography }]
+    })
+    if (!updates.length) return
     const optimistic = current && updates.find(({ layer }) => layer === current.id)
     if (optimistic) setDraft(optimistic)
     const sequence = ++updateSequence.current
@@ -206,15 +208,24 @@ function TypeInspector() {
               onChange={(preferred_font) => {
                 const family = findFontFamily(families, preferred_font)
                 const nextStyles = usableFontStyles(family)
-                const fontStyle = nextStyles.includes(style) ? style : (nextStyles[0] ?? 'normal')
-                const nextWeights = usableFontWeights(family, fontStyle)
-                const fontWeight = nearestFontWeight(nextWeights, weight)
-                apply((value) => ({
-                  ...value,
-                  preferred_font,
-                  font_weight: fontWeight,
-                  font_style: fontStyle,
-                }))
+                apply((value) => {
+                  const effectiveFont = value.preferred_font ?? defaultFont.name
+                  if (normalizeFontName(effectiveFont) === normalizeFontName(preferred_font)) {
+                    return value
+                  }
+                  const currentStyle = value.font_style ?? 'normal'
+                  const fontStyle = nextStyles.includes(currentStyle)
+                    ? currentStyle
+                    : (nextStyles[0] ?? 'normal')
+                  const nextWeights = usableFontWeights(family, fontStyle)
+                  const fontWeight = nearestFontWeight(nextWeights, value.font_weight ?? 400)
+                  return {
+                    ...value,
+                    preferred_font,
+                    font_weight: fontWeight,
+                    font_style: fontStyle,
+                  }
+                })
               }}
             />
           </InspectorField>

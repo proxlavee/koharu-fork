@@ -244,6 +244,7 @@ pub struct TextLayout<'a> {
     word_spacing: f32,
     cjk_punctuation_layout: bool,
     natural_line_breaks: bool,
+    comic_source_font_size: Option<f32>,
 }
 
 fn largest_fitting_font_size<T>(
@@ -346,6 +347,7 @@ impl<'a> TextLayout<'a> {
             word_spacing: 0.0,
             cjk_punctuation_layout: false,
             natural_line_breaks: false,
+            comic_source_font_size: None,
         }
     }
 
@@ -453,6 +455,11 @@ impl<'a> TextLayout<'a> {
             balloon.preferred_block_center = center.is_finite().then_some(center);
             balloon.strict_source_locality = strict_source_locality;
         }
+        self
+    }
+
+    pub(crate) fn with_comic_source_font_size(mut self, size: f32) -> Self {
+        self.comic_source_font_size = (size.is_finite() && size > 0.0).then_some(size);
         self
     }
 
@@ -675,22 +682,33 @@ impl<'a> TextLayout<'a> {
         if self.comic_center_error(&largest) <= COMIC_CENTER_RASTER_TOLERANCE
             && discretionary_hyphen_count(text, &largest.lines) == 0
         {
+            let selected = self.prefer_equivalent_source_scale(
+                text,
+                minimum,
+                &largest,
+                largest.clone(),
+                &fits,
+            )?;
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: "koharu_typesetting_probe",
                 marker = "comic_choice",
-                decision = "largest_centered_clean",
+                decision = if selected.font_size + f32::EPSILON < largest.font_size {
+                    "equivalent_source_scale"
+                } else {
+                    "largest_centered_clean"
+                },
                 text,
                 minimum,
                 largest_size = largest.font_size,
                 largest_lines = largest.lines.len(),
                 largest_hyphens = 0,
                 largest_center_error = self.comic_center_error(&largest),
-                selected_size = largest.font_size,
-                selected_lines = largest.lines.len(),
-                selected_hyphens = 0,
-                selected_center_error = self.comic_center_error(&largest),
-                selected_source_local = self.comic_layout_is_source_local(&largest),
+                selected_size = selected.font_size,
+                selected_lines = selected.lines.len(),
+                selected_hyphens = discretionary_hyphen_count(text, &selected.lines),
+                selected_center_error = self.comic_center_error(&selected),
+                selected_source_local = self.comic_layout_is_source_local(&selected),
             );
             #[cfg(debug_assertions)]
             if tracing::enabled!(
@@ -700,14 +718,18 @@ impl<'a> TextLayout<'a> {
                 tracing::trace!(
                     target: "koharu_typesetting_probe",
                     marker = "comic_quality",
-                    decision = "largest_centered_clean",
+                    decision = if selected.font_size + f32::EPSILON < largest.font_size {
+                        "equivalent_source_scale"
+                    } else {
+                        "largest_centered_clean"
+                    },
                     text,
-                    selected_size = largest.font_size,
-                    selected_lines = largest.lines.len(),
-                    selected_center_error = self.comic_center_error(&largest),
+                    selected_size = selected.font_size,
+                    selected_lines = selected.lines.len(),
+                    selected_center_error = self.comic_center_error(&selected),
                 );
             }
-            return Ok(Some(largest));
+            return Ok(Some(selected));
         }
 
         // Font size, line breaks, contour capacity, and block position are coupled.
@@ -859,12 +881,11 @@ impl<'a> TextLayout<'a> {
             );
         }
 
-        let mut decision = "quality";
-        if !self.comic_layout_is_source_local(&quality_choice)
+        let source_locality_fallback_required = !self.comic_layout_is_source_local(&quality_choice)
             && self.comic_balloon.as_ref().is_some_and(|balloon| {
                 balloon.preferred_block_center.is_some() && balloon.strict_source_locality
-            })
-        {
+            });
+        if source_locality_fallback_required {
             // A preserved OCR anchor is provenance, not merely an aesthetic
             // centering hint. Touching narration boxes can form one concave region;
             // a larger setting may then jump into a roomier lobe and collide with a
@@ -873,25 +894,39 @@ impl<'a> TextLayout<'a> {
             // local setting exists, retain the bounded quality choice instead of
             // collapsing blindly to the readability floor.
             let minimum_whole_size = minimum.ceil() as i64;
+            let mut found_source_local = false;
             while next_size >= minimum_whole_size {
                 let candidate = self.run_with_size(text, next_size as f32)?;
                 last_checked_size = next_size as f32;
                 next_size -= 1;
                 if fits(&candidate) && self.comic_layout_is_source_local(&candidate) {
                     quality_choice = candidate;
-                    decision = "source_locality";
+                    found_source_local = true;
                     break;
                 }
             }
-            if decision == "quality" && (minimum - last_checked_size).abs() > f32::EPSILON {
+            if !found_source_local && (minimum - last_checked_size).abs() > f32::EPSILON {
                 let candidate = self.run_with_size(text, minimum)?;
                 if fits(&candidate) && self.comic_layout_is_source_local(&candidate) {
                     quality_choice = candidate;
-                    decision = "source_locality";
                 }
             }
         }
 
+        let pre_source_scale_size = quality_choice.font_size;
+        quality_choice =
+            self.prefer_equivalent_source_scale(text, minimum, &largest, quality_choice, &fits)?;
+
+        #[cfg(debug_assertions)]
+        let decision = if quality_choice.font_size + f32::EPSILON < pre_source_scale_size {
+            "equivalent_source_scale"
+        } else if source_locality_fallback_required
+            && self.comic_layout_is_source_local(&quality_choice)
+        {
+            "source_locality"
+        } else {
+            "quality"
+        };
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: "koharu_typesetting_probe",
@@ -913,6 +948,66 @@ impl<'a> TextLayout<'a> {
         );
 
         Ok(Some(quality_choice))
+    }
+
+    fn prefer_equivalent_source_scale(
+        &self,
+        text: &str,
+        minimum: f32,
+        largest: &LayoutRun<'a>,
+        selected: LayoutRun<'a>,
+        fits: &impl Fn(&LayoutRun<'_>) -> bool,
+    ) -> Result<LayoutRun<'a>> {
+        let Some(source_size) = self.comic_source_font_size else {
+            return Ok(selected);
+        };
+        if source_size + f32::EPSILON >= selected.font_size {
+            return Ok(selected);
+        }
+
+        // Source typography is scale guidance, not a hard cap. This is the final
+        // size preference after geometry, centering, and line quality have chosen
+        // the composition, so bound the alternate to the ordinary visible 2--4 px
+        // window around that actual result. Never spend this optional preference
+        // into the emergency feasibility band; geometry may still require a smaller
+        // layout, but source similarity alone must not make readable text tiny.
+        let quality_floor = (selected.font_size - quality_font_reduction(selected.font_size))
+            .max(minimum + COMIC_QUALITY_FONT_REDUCTION_MAX);
+        if source_size + f32::EPSILON < quality_floor {
+            return Ok(selected);
+        }
+
+        let candidate = self.run_with_size(text, source_size)?;
+        let same_lines = candidate.lines.len() == selected.lines.len()
+            && candidate
+                .lines
+                .iter()
+                .zip(&selected.lines)
+                .all(|(left, right)| left.range == right.range);
+        let candidate_hyphens = discretionary_hyphen_count(text, &candidate.lines);
+        let selected_hyphens = discretionary_hyphen_count(text, &selected.lines);
+        let candidate_fits = fits(&candidate);
+        if !candidate_fits || !same_lines || candidate_hyphens > selected_hyphens {
+            return Ok(selected);
+        }
+
+        #[cfg(debug_assertions)]
+        tracing::trace!(
+            target: "koharu_typesetting_probe",
+            marker = "comic_source_scale",
+            text,
+            largest_size = largest.font_size,
+            selected_size = selected.font_size,
+            source_size,
+            quality_floor,
+            line_count = candidate.lines.len(),
+            selected_hyphens,
+            candidate_hyphens,
+            selected_center_error = self.comic_center_error(&selected),
+            candidate_center_error = self.comic_center_error(&candidate),
+            decision = "equivalent_source_scale",
+        );
+        Ok(candidate)
     }
 
     fn preferred_clean_comic_layout(
