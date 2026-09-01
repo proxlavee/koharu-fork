@@ -591,6 +591,36 @@ describe('greenfield editor', () => {
     )
   })
 
+  it('does not promote generated typography when its effective font is reselected', async () => {
+    const user = userEvent.setup()
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: page.layers.map((layer) =>
+        layer.type === 'text'
+          ? {
+              ...layer,
+              typography: {
+                ...layer.typography,
+                preferred_font: null,
+                font_weight: null,
+                font_style: null,
+                size: 35,
+              },
+            }
+          : layer,
+      ),
+    }))
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    render(<Inspector />)
+
+    expect(screen.getByTestId('type-font-picker')).toHaveTextContent('CCWildWords')
+    await user.click(screen.getByTestId('type-font-picker'))
+    await user.click(await screen.findByRole('option', { name: 'CCWildWords, Bundled' }))
+
+    expect(setTypography).not.toHaveBeenCalled()
+  })
+
   it('defaults vertical text alignment to top and maps end to bottom', async () => {
     const user = userEvent.setup()
     installProject()
