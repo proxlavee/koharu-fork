@@ -102,17 +102,33 @@ export function SelectionControls({
     onTransformFrame([{ element, frame: next }])
   }
 
-  const finish = (event: ReactPointerEvent<HTMLDivElement>) => {
+  const complete = (event: ReactPointerEvent<HTMLDivElement>, applyReleasePoint: boolean) => {
     const current = gesture.current
     if (!current || current.pointer !== event.pointerId) return
     event.preventDefault()
     event.stopPropagation()
+    const releasePoint = applyReleasePoint ? eventPoint(event) : null
+    if (releasePoint) {
+      const frame =
+        current.kind === 'resize'
+          ? resizeFrame(
+              current.original,
+              current.handle,
+              releasePoint,
+              window.devicePixelRatio / camera.zoom,
+            )
+          : rotateFrame(current.original, current.start, releasePoint)
+      onTransformFrame([{ element, frame }])
+    }
     gesture.current = null
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId)
     }
     onTransformEnd()
   }
+
+  const finish = (event: ReactPointerEvent<HTMLDivElement>) => complete(event, true)
+  const cancel = (event: ReactPointerEvent<HTMLDivElement>) => complete(event, false)
 
   const lostCapture = (event: ReactPointerEvent<HTMLDivElement>) => {
     const current = gesture.current
@@ -124,7 +140,7 @@ export function SelectionControls({
   const pointerEvents = {
     onPointerMove: update,
     onPointerUp: finish,
-    onPointerCancel: finish,
+    onPointerCancel: cancel,
     onLostPointerCapture: lostCapture,
   }
 
