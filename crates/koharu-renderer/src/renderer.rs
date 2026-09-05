@@ -36,7 +36,7 @@ use crate::{
     TextAlign, TextMetadata, TypesettingConfig, WritingMode,
     bubble::{
         GeometryFrame, LayoutBox, clip_half_plane, contour, flow_cells, geometry_bounds,
-        geometry_frame, point_in_frame, polygon_centroid, polygons_overlap,
+        geometry_frame, intersected_centroid, point_in_frame, polygon_centroid, polygons_overlap,
     },
     fonts::{FontPreview, FontRequest, Fonts},
     frame::{
@@ -859,25 +859,30 @@ impl Traversal<'_> {
         let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
             Some(placement.clone())
-        } else if let Some(placement) =
-            self.balloon_flow(entity, authored.is_none().then_some(content), dependencies)?
-        {
+        } else if let Some(placement) = self.balloon_flow(entity, dependencies)? {
             Some(placement)
         } else {
             self.fit(entity, dependencies)?
         };
         let typography = self.snapshot.component::<Typography>(entity)?;
-        let analysis =
+        let (analysis, source_frame) =
             if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
                 dependencies.insert(RenderDependency::Relation(recognized.id()));
                 dependencies.insert(RenderDependency::Entity(recognized.value().target));
                 dependencies.insert(component_dependency::<OcrAnalysis>(
                     recognized.value().target,
                 ));
-                self.snapshot
-                    .component::<OcrAnalysis>(recognized.value().target)?
+                dependencies.insert(component_dependency::<Geometry>(recognized.value().target));
+                (
+                    self.snapshot
+                        .component::<OcrAnalysis>(recognized.value().target)?,
+                    self.snapshot
+                        .component::<Geometry>(recognized.value().target)?
+                        .as_ref()
+                        .and_then(geometry_frame),
+                )
             } else {
-                None
+                (None, None)
             };
         let initial_frame = if let Some(geometry) = authored.as_ref() {
             geometry_frame(geometry)
@@ -888,7 +893,7 @@ impl Traversal<'_> {
             return Ok(None);
         };
         let source_writing_mode = resolve_detected_writing_mode(
-            initial_frame.bounds,
+            source_frame.unwrap_or(initial_frame).bounds,
             typography.as_ref(),
             analysis.as_ref(),
         );
@@ -905,16 +910,6 @@ impl Traversal<'_> {
         let automatic_free_text = authored.is_none()
             && layout.kind == TextLayoutKind::Paragraph
             && is_generated_free_text(text_role.as_ref());
-        let preferred_free_text_line_count = if automatic_free_text {
-            preferred_transposed_free_text_line_count(
-                &text,
-                initial_frame.bounds,
-                source_writing_mode,
-                writing_mode,
-            )
-        } else {
-            None
-        };
         let free_text_candidates = if automatic_free_text
             && let Some(placement) = placement.as_ref()
             && placement.balloon_contour.is_none()
@@ -925,7 +920,9 @@ impl Traversal<'_> {
                 source_frame: placement.frame,
                 source_writing_mode,
                 target_writing_mode: writing_mode,
-                refine_orthogonal_shape: preferred_free_text_line_count.is_some(),
+                // Changing axes needs alternate shapes, not a prescribed line
+                // count inferred from square source-language glyphs.
+                refine_orthogonal_shape: source_writing_mode != writing_mode,
                 translation_visual_area_scale: translation_visual_area_scale(
                     source_text.as_ref(),
                     &text,
@@ -973,9 +970,6 @@ impl Traversal<'_> {
                 placement.balloon_contour,
             )
         };
-        let preferred_block_center = balloon_contour.as_ref().and_then(|_| {
-            preferred_center.map(|(x, y)| if writing_mode.is_vertical() { x } else { y })
-        });
         let (direction, _) = shaping_direction_for_text(&text, writing_mode);
         let alignment = resolve_alignment(
             typography.as_ref().and_then(|value| value.alignment),
@@ -1009,9 +1003,8 @@ impl Traversal<'_> {
             height: frame.bounds.height,
             balloon_contour,
             flow_contours,
-            preferred_block_center,
+            preferred_center,
             free_text_candidates,
-            preferred_free_text_line_count,
             automatic_free_text,
             preferred_font,
             font_families,
@@ -1022,6 +1015,7 @@ impl Traversal<'_> {
                 .map(Into::into),
             font_size,
             source_font_size,
+            preferred_font_size: source_font_size,
             minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
@@ -1085,7 +1079,6 @@ impl Traversal<'_> {
     fn balloon_flow(
         &self,
         entity: EntityId,
-        anchor_content: Option<EntityId>,
         dependencies: &mut BTreeSet<RenderDependency>,
     ) -> Result<Option<ResolvedPlacement>> {
         let Some(relation) = self.snapshot.relation_from::<FlowsIn>(entity)? else {
@@ -1102,11 +1095,7 @@ impl Traversal<'_> {
         let Some(frame) = geometry_frame(&geometry) else {
             return Ok(None);
         };
-        let preferred_center = anchor_content
-            .map(|content| flow_source(self.snapshot, content, dependencies))
-            .transpose()?
-            .flatten()
-            .map(|source| local_flow_anchor(frame, source.anchor));
+        let preferred_center = polygon_centroid(&contour(&geometry, frame));
         Ok(Some(ResolvedPlacement {
             target,
             balloon_contour: Some(contour(&geometry, frame)),
@@ -1148,6 +1137,7 @@ struct FlowSeed {
 
 struct FlowSource {
     anchor: (f32, f32),
+    #[cfg(debug_assertions)]
     bounds: LayoutBox,
     footprint: Vec<(f32, f32)>,
 }
@@ -1684,27 +1674,13 @@ fn resolve_balloon_flows(
             if let Some(cell) = &ownership_cell {
                 flow_contours.push(cell.clone());
             }
-            let preferred_center = seed
-                .source
-                .as_ref()
-                .map(|source| local_flow_anchor(group.frame, source.anchor))
-                .or_else(|| {
-                    ownership_cell.as_ref()?;
-                    // Without an OCR anchor, preserve the center that the physical
-                    // balloon or its joined-flow cell supplied before the page-space
-                    // ownership contour was appended as the final constraint.
-                    Some(
-                        joined_cells
-                            .as_ref()
-                            .and_then(|cells| cells.get(index))
-                            .and_then(|cell| polygon_centroid(cell))
-                            .or_else(|| polygon_centroid(&group.contour))
-                            .unwrap_or((
-                                group.frame.bounds.width * 0.5,
-                                group.frame.bounds.height * 0.5,
-                            )),
-                    )
-                });
+            // OCR assigns ownership; it must not pin a translated paragraph to
+            // the old script's position. Center in the intersection with the
+            // physical balloon, never in a page-sized ownership polygon alone.
+            let contours = std::iter::once(group.contour.as_slice())
+                .chain(flow_contours.iter().map(Vec::as_slice))
+                .collect::<Vec<_>>();
+            let preferred_center = intersected_centroid(&contours);
             #[cfg(debug_assertions)]
             if tracing::enabled!(
                 target: "koharu_typesetting_probe",
@@ -1744,14 +1720,6 @@ fn resolve_balloon_flows(
     })
 }
 
-fn local_flow_anchor(frame: GeometryFrame, anchor: (f32, f32)) -> (f32, f32) {
-    let (x, y) = point_in_frame(frame, anchor.0, anchor.1);
-    (
-        x.clamp(0.0, frame.bounds.width),
-        y.clamp(0.0, frame.bounds.height),
-    )
-}
-
 fn flow_source(
     snapshot: &Snapshot,
     content: EntityId,
@@ -1772,6 +1740,7 @@ fn flow_source(
             bounds.x + bounds.width * 0.5,
             bounds.y + bounds.height * 0.5,
         ),
+        #[cfg(debug_assertions)]
         bounds,
         footprint: geometry
             .points
@@ -2172,40 +2141,6 @@ fn resolve_detected_writing_mode(
         Some(TextDirection::Auto) | None if bounds.height > bounds.width => WritingMode::VerticalRl,
         Some(TextDirection::Auto) | None => WritingMode::Horizontal,
     }
-}
-
-fn preferred_transposed_free_text_line_count(
-    text: &str,
-    source_bounds: LayoutBox,
-    source_writing_mode: WritingMode,
-    target_writing_mode: WritingMode,
-) -> Option<usize> {
-    // A vertical source footprint becomes a horizontal target block. Preserve
-    // that transposed shape rather than blindly treating the narrow OCR bounds
-    // as the final line width: for N roughly square glyph cells split across L
-    // lines, the block aspect is proportional to N / L^2. Solving against the
-    // transposed source aspect gives L ~= sqrt(N * source_width/source_height).
-    if !source_writing_mode.is_vertical()
-        || target_writing_mode.is_vertical()
-        || !source_bounds.width.is_finite()
-        || !source_bounds.height.is_finite()
-        || source_bounds.width <= 0.0
-        || source_bounds.height <= 0.0
-    {
-        return None;
-    }
-    let character_count = text
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .count();
-    if character_count == 0 {
-        return None;
-    }
-    let estimated = ((character_count as f32 * source_bounds.width / source_bounds.height)
-        .sqrt()
-        .round() as usize)
-        .clamp(1, character_count);
-    (estimated > 1).then_some(estimated)
 }
 
 fn translation_visual_area_scale(source: Option<&SourceText>, target: &str) -> f32 {
@@ -2727,68 +2662,6 @@ mod tests {
     }
 
     #[test]
-    fn direction_changed_free_text_uses_the_transposed_source_shape() {
-        let narrow_vertical_source = LayoutBox {
-            x: 0.0,
-            y: 0.0,
-            width: 40.0,
-            height: 280.0,
-        };
-        assert_eq!(
-            preferred_transposed_free_text_line_count(
-                "abcdefghijklmnop",
-                narrow_vertical_source,
-                WritingMode::VerticalRl,
-                WritingMode::Horizontal,
-            ),
-            Some(2)
-        );
-
-        let broader_vertical_source = LayoutBox {
-            width: 60.0,
-            height: 100.0,
-            ..narrow_vertical_source
-        };
-        assert_eq!(
-            preferred_transposed_free_text_line_count(
-                "abcdefghijklmnopqrstuvwxyzabcdefghijklmn",
-                broader_vertical_source,
-                WritingMode::VerticalRl,
-                WritingMode::Horizontal,
-            ),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn unchanged_or_empty_free_text_has_no_transposed_shape_target() {
-        let bounds = LayoutBox {
-            x: 0.0,
-            y: 0.0,
-            width: 60.0,
-            height: 100.0,
-        };
-        assert_eq!(
-            preferred_transposed_free_text_line_count(
-                "ordinary caption",
-                bounds,
-                WritingMode::Horizontal,
-                WritingMode::Horizontal,
-            ),
-            None
-        );
-        assert_eq!(
-            preferred_transposed_free_text_line_count(
-                "...!!",
-                bounds,
-                WritingMode::VerticalRl,
-                WritingMode::Horizontal,
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn translation_demand_scales_visual_area_only_when_the_target_is_longer() {
         let source = |text: &str| SourceText {
             text: Authored::user(text.to_owned()),
@@ -2814,6 +2687,7 @@ mod tests {
     fn overlap_separator_uses_the_nearest_source_footprint_gap() {
         let source = |left: f32, right: f32| FlowSource {
             anchor: ((left + right) * 0.5, 700.0),
+            #[cfg(debug_assertions)]
             bounds: LayoutBox {
                 x: left,
                 y: 600.0,
@@ -3117,6 +2991,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generated_free_text_reflows_without_an_inferred_source_line_count() {
+        let mut session = Session::memory().await.unwrap();
+        let generation = Generation::new(ProducerId::new("dev.koharu.pipeline.detection").unwrap());
+        let origin = Origin::Generated(generation.clone());
+        let mut edit = session.snapshot().edit_as(generation);
+        let create = (|| -> koharu_scene::Result<_> {
+            let page = edit.add_page(PageDraft::new("page", 400.0, 400.0), At::End)?;
+            let source = edit.add_analysis_region::<TextRegion>(
+                page,
+                At::End,
+                &Geometry::rectangle(120.0, 60.0, 60.0, 180.0),
+                None,
+            )?;
+            let content = edit.add_text_content(page, At::End)?;
+            edit.set(
+                content,
+                &SourceText {
+                    text: Authored::user("縦書きの文章".to_owned()),
+                    language: Some(koharu_scene::LanguageTag::new("ja").unwrap()),
+                },
+            )?;
+            edit.set(
+                content,
+                &Translation {
+                    text: Authored::user(
+                        "A translated caption can choose its own line breaks.".to_owned(),
+                    ),
+                    language: Some(koharu_scene::LanguageTag::new("en").unwrap()),
+                },
+            )?;
+            edit.set(
+                content,
+                &TextRole {
+                    origin: origin.clone(),
+                    role: FREE_TEXT_ROLE.to_owned(),
+                },
+            )?;
+            edit.relate::<RecognizedFrom>(content, source)?;
+            let layer = edit.add_text_layer(
+                page,
+                At::End,
+                content,
+                &SceneTextLayout {
+                    origin: origin.clone(),
+                    kind: TextLayoutKind::Paragraph,
+                },
+            )?;
+            edit.relate::<FitsTo>(layer, source)?;
+            edit.set(
+                layer,
+                &Typography {
+                    origin: origin.clone(),
+                    preferred_font: None,
+                    font_weight: None,
+                    font_style: None,
+                    size: Some(24.0),
+                    auto_fit: true,
+                    color: None,
+                    stroke_color: None,
+                    stroke_width: None,
+                    alignment: None,
+                    writing_mode: Some(koharu_scene::WritingMode::Vertical),
+                    extensions: BTreeMap::new(),
+                },
+            )?;
+            Ok((edit.finish()?, page, layer))
+        })()
+        .unwrap();
+        let (patch, page, layer) = create;
+        let base = session.commit(patch).await.unwrap().snapshot;
+        let renderer = Renderer::default();
+        let compiled = renderer.compile(&base, page).unwrap();
+        let draft = compiled
+            .layers
+            .iter()
+            .find(|draft| draft.entity == layer)
+            .unwrap();
+        let NodeDescriptor::Text(descriptor) = &draft.descriptor else {
+            panic!("expected text");
+        };
+        assert!(descriptor.automatic_free_text);
+        assert_eq!(descriptor.writing_mode, WritingMode::Horizontal);
+        assert_eq!(descriptor.preferred_font_size, Some(24.0));
+        assert!(descriptor.free_text_candidates.len() > 1);
+    }
+
+    #[tokio::test]
     async fn analysis_regions_are_not_promoted_to_image_layers() {
         let mut session = Session::memory().await.unwrap();
         let source = AssetRole::new("source").unwrap();
@@ -3260,6 +3221,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn balloon_center_does_not_follow_an_offset_ocr_footprint() {
+        let mut session = Session::memory().await.unwrap();
+        let mut ids = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let page = edit.add_page(PageDraft::new("page", 300.0, 300.0), At::End)?;
+                let bubble = edit.add_analysis_region::<BubbleRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(20.0, 20.0, 200.0, 240.0),
+                    None,
+                )?;
+                let source = edit.add_analysis_region::<koharu_scene::TextRegion>(
+                    page,
+                    At::End,
+                    &Geometry::rectangle(150.0, 160.0, 30.0, 80.0),
+                    None,
+                )?;
+                let content = edit.add_text_content(page, At::End)?;
+                edit.set(
+                    content,
+                    &Translation {
+                        text: Authored::user("A translated phrase".to_owned()),
+                        language: None,
+                    },
+                )?;
+                edit.set(
+                    content,
+                    &SourceText {
+                        text: Authored::user("Original phrase".to_owned()),
+                        language: None,
+                    },
+                )?;
+                edit.relate::<RecognizedFrom>(content, source)?;
+                let layer = edit.add_text_layer(
+                    page,
+                    At::End,
+                    content,
+                    &SceneTextLayout {
+                        origin: Origin::User,
+                        kind: TextLayoutKind::Paragraph,
+                    },
+                )?;
+                edit.relate::<FlowsIn>(layer, bubble)?;
+                ids = Some((page, source, layer));
+                Ok(())
+            })
+            .unwrap();
+        let before = session.commit(create).await.unwrap().snapshot;
+        let (page, source, layer) = ids.unwrap();
+        let renderer = Renderer::default();
+        let compiled_before = renderer.compile(&before, page).unwrap();
+        let first = compiled_before
+            .layers
+            .iter()
+            .find(|candidate| candidate.entity == layer)
+            .unwrap();
+        let NodeDescriptor::Text(descriptor) = &first.descriptor else {
+            panic!("expected text");
+        };
+        assert_eq!(descriptor.preferred_center, Some((100.0, 120.0)));
+        let offset = before
+            .patch(|edit| edit.set(source, &Geometry::rectangle(45.0, 45.0, 30.0, 80.0)))
+            .unwrap();
+        let after = session.commit(offset).await.unwrap();
+        let compiled_after = renderer.compile(&after.snapshot, page).unwrap();
+        let second = compiled_after
+            .layers
+            .iter()
+            .find(|candidate| candidate.entity == layer)
+            .unwrap();
+        assert_eq!(first.descriptor, second.descriptor);
+    }
+
+    #[tokio::test]
     async fn joined_balloon_flows_receive_disjoint_layout_cells() {
         let mut session = Session::memory().await.unwrap();
         let mut ids = None;
@@ -3334,7 +3371,7 @@ mod tests {
             panic!("expected a text descriptor");
         };
         assert!(descriptor.flow_contours.is_empty());
-        assert_eq!(descriptor.preferred_block_center, Some(20.0));
+        assert_eq!(descriptor.preferred_center, Some((60.0, 30.0)));
 
         let add_sibling = base
             .patch(|edit| edit.relate::<FlowsIn>(layers[1], bubble).map(|_| ()))
@@ -3355,7 +3392,7 @@ mod tests {
                 let NodeDescriptor::Text(descriptor) = &layer.descriptor else {
                     panic!("expected a text descriptor");
                 };
-                assert_eq!(descriptor.preferred_block_center, Some(20.0));
+                assert!((descriptor.preferred_center.unwrap().1 - 30.0).abs() < 1e-4);
                 assert_eq!(descriptor.flow_contours.len(), 1);
                 descriptor.flow_contours[0].clone()
             })

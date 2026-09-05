@@ -29,8 +29,6 @@ const MAX_GENERATED_STROKE_FONT_RATIO: f32 = 0.12;
 const FREE_TEXT_PAUSE_FONT_REDUCTION_RATIO: f32 = 0.25;
 const FREE_TEXT_PAUSE_FONT_REDUCTION_MAX: f32 = 6.0;
 const FREE_TEXT_LOCALITY_FONT_REDUCTION_MAX: f32 = 2.0;
-const FREE_TEXT_SHAPE_FONT_REDUCTION_RATIO: f32 = 0.3;
-const FREE_TEXT_SHAPE_FONT_REDUCTION_MAX: f32 = 12.0;
 
 fn free_text_semantic_font_reduction(text: &str, font_size: f32) -> f32 {
     let ordinary = quality_font_reduction(font_size);
@@ -94,9 +92,8 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) height: f32,
     pub(crate) balloon_contour: Option<Vec<(f32, f32)>>,
     pub(crate) flow_contours: Vec<Vec<(f32, f32)>>,
-    pub(crate) preferred_block_center: Option<f32>,
+    pub(crate) preferred_center: Option<(f32, f32)>,
     pub(crate) free_text_candidates: Vec<FreeTextCandidate>,
-    pub(crate) preferred_free_text_line_count: Option<usize>,
     pub(crate) automatic_free_text: bool,
     pub(crate) preferred_font: Option<String>,
     pub(crate) font_families: Vec<String>,
@@ -104,6 +101,7 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) font_style: Option<FontStyle>,
     pub(crate) font_size: Option<f32>,
     pub(crate) source_font_size: Option<f32>,
+    pub(crate) preferred_font_size: Option<f32>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
@@ -321,6 +319,13 @@ impl TextRenderer {
         if descriptor.automatic_free_text && descriptor.writing_mode == WritingMode::Horizontal {
             template = template.with_natural_line_breaks();
         }
+        if descriptor.auto_fit
+            && !descriptor.point_text
+            && descriptor.font_size.is_none()
+            && let Some(source) = descriptor.preferred_font_size
+        {
+            template = template.with_preferred_font_size(source);
+        }
 
         if let Some(contour) = &descriptor.balloon_contour {
             let [top, _, _, left] = descriptor.text_inset;
@@ -348,22 +353,12 @@ impl TextRenderer {
                     descriptor.text_inset.into_iter().fold(0.0, f32::max),
                 );
             }
-            if let Some(center) = descriptor.preferred_block_center {
-                let block_inset = if descriptor.writing_mode.is_vertical() {
-                    left
-                } else {
-                    top
-                };
-                template = template.with_comic_preferred_block_center(
-                    center - block_inset,
-                    !descriptor.flow_contours.is_empty(),
+            if let Some(center) = descriptor.preferred_center {
+                let strict_centering = !descriptor.flow_contours.is_empty();
+                template = template.with_comic_preferred_center(
+                    (center.0 - left, center.1 - top),
+                    strict_centering,
                 );
-            }
-            if let Some(source_size) = descriptor.source_font_size {
-                // Flow ownership remains a hard constraint inside TextLayout. It
-                // does not need to disable soft source-scale guidance: the candidate
-                // must still fit every contour before it can be selected.
-                template = template.with_comic_source_font_size(source_size);
             }
         }
         let selected = if !descriptor.free_text_candidates.is_empty()
@@ -527,9 +522,8 @@ impl TextRenderer {
                     layout_bounds = ?bounds,
                     balloon_contour = ?contour,
                     flow_contours = ?flow_contours,
-                    preferred_block_center = ?descriptor.preferred_block_center,
+                    preferred_center = ?descriptor.preferred_center,
                     free_text_candidate_count = descriptor.free_text_candidates.len(),
-                    preferred_free_text_line_count = ?descriptor.preferred_free_text_line_count,
                     selected_size = layout.font_size,
                     selected_width = layout.width,
                     selected_height = layout.height,
@@ -596,8 +590,7 @@ impl TextRenderer {
                     target: "koharu_typesetting_probe",
                     tracing::Level::TRACE
                 ) {
-                    let reference_font_size =
-                        measured_free_text_reference_font_size(descriptor, &measured);
+                    let reference_font_size = measured_free_text_reference_font_size(&measured);
                     tracing::trace!(
                         target: "koharu_typesetting_probe",
                         marker = "free_text_expansion_gate",
@@ -630,7 +623,7 @@ impl TextRenderer {
                 let (minimum, maximum) = font_size_limits(descriptor, candidate.bounds);
                 let builder = template.clone();
                 let layout = match builder
-                    .run_largest_fitting_with_bounds(
+                    .run_fitting_with_bounds(
                         &descriptor.text,
                         minimum,
                         maximum,
@@ -678,7 +671,6 @@ impl TextRenderer {
                 let hyphens = layout.discretionary_hyphen_count(&descriptor.text);
                 let natural_pauses = layout.natural_pause_break_count(&descriptor.text);
                 let weak_breaks = layout.weak_line_break_count(&descriptor.text);
-                let line_count = layout.lines.len();
                 let within_quality_window = layout.font_size + f32::EPSILON
                     >= maximum
                         - free_text_quality_font_reduction(&descriptor.text, maximum, hyphens);
@@ -686,10 +678,7 @@ impl TextRenderer {
                     && fits
                     && hyphens == 0
                     && within_quality_window
-                    && (weak_breaks == 0 || !has_internal_natural_pause(&descriptor.text))
-                    && descriptor
-                        .preferred_free_text_line_count
-                        .is_none_or(|preferred| line_count == preferred);
+                    && (weak_breaks == 0 || !has_internal_natural_pause(&descriptor.text));
                 measured.push(MeasuredFreeTextLayout {
                     layout,
                     candidate: *candidate,
@@ -704,6 +693,7 @@ impl TextRenderer {
                 }
             }
             if family_index == 0
+                && descriptor.preferred_font_size.is_none()
                 && let Some(selected_index) = clean_source_candidate
                 && !measured_free_text_needs_more_space(descriptor, &measured)
             {
@@ -757,43 +747,11 @@ impl TextRenderer {
                 .map(|candidate| candidate.hyphens)
                 .min()
                 .expect("the largest fitted candidate is extended-quality-eligible");
-            let mut quality_floor = if extended_minimum_hyphens < ordinary_minimum_hyphens {
+            let quality_floor = if extended_minimum_hyphens < ordinary_minimum_hyphens {
                 extended_quality_floor
             } else {
                 ordinary_quality_floor
             };
-            let preferred_line_count = descriptor.preferred_free_text_line_count;
-            if let Some(preferred_line_count) = preferred_line_count {
-                let current_line_penalty = measured
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.fits && candidate.layout.font_size + f32::EPSILON >= quality_floor
-                    })
-                    .map(|candidate| candidate.layout.lines.len().abs_diff(preferred_line_count))
-                    .min()
-                    .expect("the largest fitted candidate is shape-eligible");
-                if current_line_penalty > 0 {
-                    let shape_reduction = (largest * FREE_TEXT_SHAPE_FONT_REDUCTION_RATIO)
-                        .min(FREE_TEXT_SHAPE_FONT_REDUCTION_MAX);
-                    let shape_floor = (largest - shape_reduction)
-                        .max(descriptor.minimum_font_size)
-                        .min(quality_floor);
-                    let shape_line_penalty = measured
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.fits
-                                && candidate.layout.font_size + f32::EPSILON >= shape_floor
-                        })
-                        .map(|candidate| {
-                            candidate.layout.lines.len().abs_diff(preferred_line_count)
-                        })
-                        .min()
-                        .expect("the largest fitted candidate is shape-eligible");
-                    if shape_line_penalty < current_line_penalty {
-                        quality_floor = shape_floor;
-                    }
-                }
-            }
             let mut eligible = measured
                 .iter()
                 .enumerate()
@@ -801,19 +759,6 @@ impl TextRenderer {
                     candidate.fits && candidate.layout.font_size + f32::EPSILON >= quality_floor
                 })
                 .collect::<Vec<_>>();
-            if let Some(preferred_line_count) = preferred_line_count {
-                let minimum_line_penalty = eligible
-                    .iter()
-                    .map(|(_, candidate)| {
-                        candidate.layout.lines.len().abs_diff(preferred_line_count)
-                    })
-                    .min()
-                    .expect("a fitted free-text shape candidate exists");
-                eligible.retain(|(_, candidate)| {
-                    candidate.layout.lines.len().abs_diff(preferred_line_count)
-                        == minimum_line_penalty
-                });
-            }
             let minimum_hyphens = eligible
                 .iter()
                 .map(|(_, candidate)| candidate.hyphens)
@@ -919,7 +864,6 @@ impl TextRenderer {
             source_font_size = ?descriptor.source_font_size,
             frame_width = descriptor.width,
             frame_height = descriptor.height,
-            preferred_line_count = ?descriptor.preferred_free_text_line_count,
             decision,
             selected_index,
             ?trace,
@@ -1098,40 +1042,17 @@ fn measured_free_text_needs_more_space(
     descriptor: &TextNodeDescriptor,
     measured: &[MeasuredFreeTextLayout<'_>],
 ) -> bool {
-    let Some(reference_font_size) = measured_free_text_reference_font_size(descriptor, measured)
-    else {
+    let Some(reference_font_size) = measured_free_text_reference_font_size(measured) else {
         return true;
     };
     reference_font_size
         <= descriptor.minimum_font_size + quality_font_reduction(reference_font_size) + f32::EPSILON
 }
 
-fn measured_free_text_reference_font_size(
-    descriptor: &TextNodeDescriptor,
-    measured: &[MeasuredFreeTextLayout<'_>],
-) -> Option<f32> {
-    let fitted = measured
+fn measured_free_text_reference_font_size(measured: &[MeasuredFreeTextLayout<'_>]) -> Option<f32> {
+    measured
         .iter()
         .filter(|candidate| candidate.fits)
-        .collect::<Vec<_>>();
-    let preferred_line_count = descriptor.preferred_free_text_line_count;
-    let minimum_line_penalty = preferred_line_count.map(|preferred| {
-        fitted
-            .iter()
-            .map(|candidate| candidate.layout.lines.len().abs_diff(preferred))
-            .min()
-            .unwrap_or(usize::MAX)
-    });
-    fitted
-        .into_iter()
-        .filter(
-            |candidate| match (preferred_line_count, minimum_line_penalty) {
-                (Some(preferred), Some(penalty)) => {
-                    candidate.layout.lines.len().abs_diff(preferred) == penalty
-                }
-                _ => true,
-            },
-        )
         .map(|candidate| candidate.layout.font_size)
         .max_by(f32::total_cmp)
 }
@@ -1387,9 +1308,8 @@ mod tests {
             height: 120.0,
             balloon_contour: Some(vec![(0.0, 0.0), (240.0, 0.0), (240.0, 120.0), (0.0, 120.0)]),
             flow_contours: Vec::new(),
-            preferred_block_center: None,
+            preferred_center: None,
             free_text_candidates: Vec::new(),
-            preferred_free_text_line_count: None,
             automatic_free_text: false,
             preferred_font: Some("Arial".to_owned()),
             font_families: vec!["Arial".to_owned()],
@@ -1397,6 +1317,7 @@ mod tests {
             font_style: None,
             font_size: None,
             source_font_size: Some(6.0),
+            preferred_font_size: None,
             minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: true,
             alignment: TextAlign::Center,
@@ -1480,27 +1401,30 @@ mod tests {
         assert!(rendered.diagnostics.is_empty());
 
         let baseline_size = rendered.metadata.font_size;
-        let mut nearby_source = render_descriptor.clone();
-        nearby_source.source_font_size = Some(baseline_size - 3.0);
-        let source_guided = TextRenderer::new()
-            .render_descriptor(&nearby_source, &fonts)
+        let mut source_guided = render_descriptor.clone();
+        source_guided.preferred_font_size = Some(30.0);
+        let guided = TextRenderer::new()
+            .render_descriptor(&source_guided, &fonts)
             .unwrap();
-        assert!((source_guided.metadata.font_size - (baseline_size - 3.0)).abs() < 0.01);
+        assert!(baseline_size - guided.metadata.font_size > 4.0);
+        assert!((guided.metadata.font_size - 30.0).abs() < 1.0);
+        assert!(guided.diagnostics.is_empty());
 
-        let mut flow_guided = nearby_source.clone();
+        let mut flow_guided = source_guided.clone();
         flow_guided.flow_contours =
             vec![vec![(0.0, 0.0), (240.0, 0.0), (240.0, 120.0), (0.0, 120.0)]];
-        let source_guided_flow = TextRenderer::new()
+        flow_guided.preferred_center = Some((120.0, 60.0));
+        let guided_flow = TextRenderer::new()
             .render_descriptor(&flow_guided, &fonts)
             .unwrap();
-        assert!((source_guided_flow.metadata.font_size - (baseline_size - 3.0)).abs() < 0.01);
+        assert_eq!(guided_flow.metadata.font_size, guided.metadata.font_size);
 
-        let mut distant_source = render_descriptor.clone();
-        distant_source.source_font_size = Some(baseline_size - 5.0);
-        let unrestricted = TextRenderer::new()
-            .render_descriptor(&distant_source, &fonts)
+        source_guided.auto_fit = false;
+        source_guided.font_size = Some(40.0);
+        let authored = TextRenderer::new()
+            .render_descriptor(&source_guided, &fonts)
             .unwrap();
-        assert!((unrestricted.metadata.font_size - baseline_size).abs() < 0.01);
+        assert_eq!(authored.metadata.font_size, 40.0);
 
         let mut expanded_translation = render_descriptor.clone();
         expanded_translation.text =
@@ -1596,9 +1520,8 @@ mod tests {
             height: 40.0,
             balloon_contour: None,
             flow_contours: Vec::new(),
-            preferred_block_center: None,
+            preferred_center: None,
             free_text_candidates: vec![base],
-            preferred_free_text_line_count: None,
             automatic_free_text: true,
             preferred_font: Some(family.clone()),
             font_families: vec![family],
@@ -1606,6 +1529,7 @@ mod tests {
             font_style: None,
             font_size: None,
             source_font_size: None,
+            preferred_font_size: None,
             minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: true,
             alignment: TextAlign::Center,

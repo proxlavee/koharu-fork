@@ -8,6 +8,122 @@ type Point = (f32, f32);
 type Polygon = Vec<Point>;
 type IndexedPolygon = (usize, Polygon);
 
+/// Scanline intervals use the same even-odd interior for placement and fitting.
+pub(crate) fn polygon_spans(contour: &[Point], transposed: bool, block: f32) -> Vec<(f32, f32)> {
+    let mut intersections = Vec::new();
+    for index in 0..contour.len() {
+        let first = contour[index];
+        let second = contour[(index + 1) % contour.len()];
+        let (a, b, c, d) = if transposed {
+            (first.0, first.1, second.0, second.1)
+        } else {
+            (first.1, first.0, second.1, second.0)
+        };
+        if (a <= block && c > block) || (c <= block && a > block) {
+            intersections.push(b + (d - b) * (block - a) / (c - a));
+        }
+    }
+    intersections.sort_by(f32::total_cmp);
+    intersections
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
+}
+
+/// Centers the usable physical region, not an OCR footprint or an unbounded
+/// ownership cell. Integrating the intersected scanlines also handles concave
+/// flow contours without treating their edges as convex clipping planes.
+pub(crate) fn intersected_centroid(contours: &[&[Point]]) -> Option<Point> {
+    let contours = contours
+        .iter()
+        .copied()
+        .filter(|contour| contour.len() >= 3)
+        .collect::<Vec<_>>();
+    if contours.len() == 1 {
+        return polygon_centroid(contours[0]);
+    }
+    if contours.is_empty()
+        || contours
+            .iter()
+            .flat_map(|contour| contour.iter())
+            .any(|(x, y)| !x.is_finite() || !y.is_finite())
+    {
+        return None;
+    }
+    let mut ordinates = contours
+        .iter()
+        .flat_map(|contour| contour.iter().map(|point| f64::from(point.1)))
+        .collect::<Vec<_>>();
+    for (index, first) in contours.iter().enumerate() {
+        for second in &contours[index + 1..] {
+            for (a, b) in first
+                .iter()
+                .zip(first.iter().cycle().skip(1))
+                .take(first.len())
+            {
+                for (c, d) in second
+                    .iter()
+                    .zip(second.iter().cycle().skip(1))
+                    .take(second.len())
+                {
+                    let a = (f64::from(a.0), f64::from(a.1));
+                    let c = (f64::from(c.0), f64::from(c.1));
+                    let u = (f64::from(b.0) - a.0, f64::from(b.1) - a.1);
+                    let v = (f64::from(d.0) - c.0, f64::from(d.1) - c.1);
+                    let cross = u.0 * v.1 - u.1 * v.0;
+                    if cross == 0.0 {
+                        continue;
+                    }
+                    let delta = (c.0 - a.0, c.1 - a.1);
+                    let t = (delta.0 * v.1 - delta.1 * v.0) / cross;
+                    let s = (delta.0 * u.1 - delta.1 * u.0) / cross;
+                    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&s) {
+                        ordinates.push(a.1 + t * u.1);
+                    }
+                }
+            }
+        }
+    }
+    ordinates.sort_by(f64::total_cmp);
+    ordinates.dedup();
+    let (mut area, mut moment_x, mut moment_y) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for band in ordinates.windows(2) {
+        let half_height = (band[1] - band[0]) * 0.5;
+        let middle = (band[0] + band[1]) * 0.5;
+        // Between vertices and edge crossings, span endpoints are linear.
+        // Two-point Gauss integration is exact for their quadratic moments.
+        for y in [
+            middle - half_height / 3.0_f64.sqrt(),
+            middle + half_height / 3.0_f64.sqrt(),
+        ] {
+            let mut spans = polygon_spans(contours[0], false, y as f32);
+            for contour in &contours[1..] {
+                let other = polygon_spans(contour, false, y as f32);
+                spans = spans
+                    .iter()
+                    .flat_map(|&(left, right)| {
+                        other.iter().filter_map(move |&(other_left, other_right)| {
+                            let span = (left.max(other_left), right.min(other_right));
+                            (span.1 > span.0).then_some(span)
+                        })
+                    })
+                    .collect();
+            }
+            for (left, right) in spans {
+                let left = f64::from(left);
+                let right = f64::from(right);
+                let strip_area = (right - left) * half_height;
+                area += strip_area;
+                moment_x += (left + right) * 0.5 * strip_area;
+                moment_y += y * strip_area;
+            }
+        }
+    }
+    (area > 0.0).then(|| ((moment_x / area) as f32, (moment_y / area) as f32))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LayoutBox {
     pub x: f32,
@@ -768,6 +884,62 @@ mod tests {
     use koharu_scene::{Geometry, Origin, Point};
 
     use super::*;
+
+    #[test]
+    fn intersected_centroid_uses_the_physical_body_inside_an_ownership_cell() {
+        let body = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
+        let cell = [
+            (50.0, -1000.0),
+            (2000.0, -1000.0),
+            (2000.0, 2000.0),
+            (50.0, 2000.0),
+        ];
+        for contours in [
+            [body.as_slice(), cell.as_slice()],
+            [cell.as_slice(), body.as_slice()],
+        ] {
+            let center = intersected_centroid(&contours).unwrap();
+            assert!((center.0 - 75.0).abs() < 1e-4);
+            assert!((center.1 - 50.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn intersected_centroid_splits_at_edge_crossings_between_vertices() {
+        let first = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)];
+        let second = [(0.0, 0.0), (100.0, 0.0), (0.0, 100.0)];
+        let center = intersected_centroid(&[&first, &second]).unwrap();
+        assert!((center.0 - 50.0).abs() < 1e-4);
+        assert!((center.1 - 50.0 / 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn intersected_centroid_preserves_concave_interiors_and_empty_intersections() {
+        let body = [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 40.0),
+            (40.0, 40.0),
+            (40.0, 100.0),
+            (0.0, 100.0),
+        ];
+        let cell = [
+            (-100.0, -100.0),
+            (60.0, -100.0),
+            (60.0, 200.0),
+            (-100.0, 200.0),
+        ];
+        let center = intersected_centroid(&[&body, &cell]).unwrap();
+        assert!((center.0 - 25.0).abs() < 1e-4);
+        assert!((center.1 - 45.0).abs() < 1e-4);
+        let outside = [
+            (200.0, 200.0),
+            (300.0, 200.0),
+            (300.0, 300.0),
+            (200.0, 300.0),
+        ];
+        assert!(intersected_centroid(&[&body, &outside]).is_none());
+    }
 
     #[test]
     fn polygon_bounds_use_all_points() {
