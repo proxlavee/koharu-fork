@@ -22,6 +22,7 @@ import {
 import { Button } from '@koharu/ui/components/button'
 import { Input } from '@koharu/ui/components/input'
 import { ScrollArea } from '@koharu/ui/components/scroll-area'
+import { Spinner } from '@koharu/ui/components/spinner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@koharu/ui/components/tooltip'
 
 export function StartView() {
@@ -156,7 +157,11 @@ export function StartView() {
                     className='h-9 justify-center gap-1.5 text-[11px]'
                     disabled={!name.trim() || busy !== null}
                   >
-                    <Plus className='size-3.5' />
+                    {busy === 'create' ? (
+                      <Spinner className='size-3.5' />
+                    ) : (
+                      <Plus className='size-3.5' />
+                    )}
                     {t('start.create')}
                   </Button>
                 </form>
@@ -217,7 +222,11 @@ export function StartView() {
                             disabled={busy !== null}
                           >
                             <span className='grid size-8 shrink-0 place-items-center rounded-lg bg-accent text-accent-foreground'>
-                              <Folder className='size-4' />
+                              {busy === project.name ? (
+                                <Spinner className='size-4' />
+                              ) : (
+                                <Folder className='size-4' />
+                              )}
                             </span>
                             <span className='min-w-0'>
                               <span className='block truncate text-[11px] font-medium'>
