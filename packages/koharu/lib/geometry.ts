@@ -123,9 +123,14 @@ export function hitTestLayers(
   point: Point,
   frames: Readonly<Record<EntityId, Frame>>,
 ): Layer | null {
+  const layerMap = new Map<string, Layer>()
+  for (const layer of layers) {
+    layerMap.set(layer.id, layer)
+  }
+
   for (let index = layers.length - 1; index >= 0; index -= 1) {
     const layer = layers[index]
-    const visibility = effectiveLayerVisibility(layers, layer)
+    const visibility = effectiveLayerVisibility(layerMap, layer)
     if (!selectableLayer(layer) || !visibility.visible || visibility.opacity <= 0) continue
     const frame = controlFrame(layer, frames)
     if (frame && frameContains(frame, point)) return layer
