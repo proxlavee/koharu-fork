@@ -657,7 +657,7 @@ fn infer_typography(
 // quadrilaterals. RF-DETR provides foreground pixels instead, so occupied runs
 // in the same rotated projection recover individual line heights without
 // counting the whitespace between lines.
-// https://github.com/dmMaze/BallonsTranslator/blob/c02102e89b7deb52cd3c01468d3f93134475b4cd/ballontranslator/utils/textblock.py#L587-L608
+// https://github.com/dmMaze/BallonsTranslator/blob/c02102e89b7deb52cd3c01468d3f93134475b4cd/ballontranslator/utils/textblock.py#L530-L549
 fn mask_font_size(points: &[MaskPoint], angle_degrees: f32, vertical: bool) -> f32 {
     let (sin, cos) = f64::from(angle_degrees).to_radians().sin_cos();
     let (axis_x, axis_y) = if vertical { (cos, sin) } else { (-sin, cos) };
@@ -710,8 +710,7 @@ fn mask_font_size(points: &[MaskPoint], angle_degrees: f32, vertical: bool) -> f
         }
     }
 
-    let minimum_run = ((profile_len as f32 * 0.01).ceil() as usize).max(1);
-    let mut run_lengths = Vec::new();
+    let mut runs: Vec<(usize, usize, u32)> = Vec::new();
     let mut index = 0;
     while index < occupied.len() {
         if !occupied[index] {
@@ -722,10 +721,31 @@ fn mask_font_size(points: &[MaskPoint], angle_degrees: f32, vertical: bool) -> f
         while index < occupied.len() && occupied[index] {
             index += 1;
         }
-        if index - start >= minimum_run {
-            run_lengths.push(index - start);
+        let run_peak = profile[start..index].iter().copied().max().unwrap();
+        if let Some((_, previous_end, previous_peak)) = runs.last_mut() {
+            // A short line can have much less ink than its neighbors. Recover
+            // its thin strokes using local density, without letting faint
+            // artwork join two otherwise dense text columns.
+            let local_threshold = (*previous_peak).min(run_peak).div_ceil(32).max(1);
+            let mut gap = 0;
+            let connected = profile[*previous_end..start].iter().all(|count| {
+                gap = if *count < local_threshold { gap + 1 } else { 0 };
+                gap <= maximum_internal_gap
+            });
+            if connected {
+                *previous_end = index;
+                *previous_peak = (*previous_peak).max(run_peak);
+                continue;
+            }
         }
+        runs.push((start, index, run_peak));
     }
+    let minimum_run = ((profile_len as f32 * 0.01).ceil() as usize).max(1);
+    let run_lengths = runs
+        .into_iter()
+        .map(|(start, end, _)| end - start)
+        .filter(|length| *length >= minimum_run)
+        .collect::<Vec<_>>();
     if run_lengths.is_empty() {
         return (maximum - minimum + 1.0) as f32;
     }
@@ -3243,6 +3263,107 @@ mod tests {
         assert_eq!(inferred.stroke_width, None);
         assert!((inferred.font_size - 12.0).abs() < 2.0);
         assert_eq!(inferred.writing_mode, WritingMode::Horizontal);
+    }
+
+    #[test]
+    fn font_measurement_preserves_sparse_strokes_within_a_line() {
+        for vertical in [false, true] {
+            for scale in [1, 2, 3] {
+                for angle in [-12.0_f32, 0.0, 9.0] {
+                    let (sin, cos) = f64::from(angle).to_radians().sin_cos();
+                    let line_width = 24 * scale;
+                    let mut points = Vec::new();
+                    for line in 0..3 {
+                        for cross in 0..line_width {
+                            let length = if line < 2 {
+                                160 * scale
+                            } else if cross < 4 * scale || cross >= 20 * scale {
+                                20 * scale
+                            } else {
+                                2 * scale
+                            };
+                            for inline in 0..length {
+                                let cross = f64::from(line * 40 * scale + cross) + 0.5;
+                                let inline = f64::from(inline) + 0.5;
+                                let (x, y) = if vertical {
+                                    (cross, inline)
+                                } else {
+                                    (inline, cross)
+                                };
+                                points.push(super::MaskPoint {
+                                    x: x * cos - y * sin + 120.0,
+                                    y: x * sin + y * cos + 80.0,
+                                });
+                            }
+                        }
+                    }
+                    let measured = super::mask_font_size(&points, angle, vertical);
+                    assert!(
+                        (measured - line_width as f32).abs() <= 1.0,
+                        "vertical={vertical}, scale={scale}, angle={angle}: {measured}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn font_measurement_rejects_isolated_faint_noise_without_joining_lines() {
+        let mut points = Vec::new();
+        for start in [0, 40] {
+            for x in start..start + 24 {
+                for y in 0..160 {
+                    points.push(super::MaskPoint {
+                        x: f64::from(x) + 0.5,
+                        y: f64::from(y) + 0.5,
+                    });
+                }
+            }
+        }
+        for x in 29..35 {
+            points.push(super::MaskPoint {
+                x: f64::from(x) + 0.5,
+                y: 0.5,
+            });
+        }
+        assert_eq!(super::mask_font_size(&points, 0.0, true), 24.0);
+    }
+
+    #[test]
+    fn font_measurement_separates_lines_connected_by_faint_ink() {
+        for vertical in [false, true] {
+            for scale in [1, 2, 3] {
+                for angle in [-12.0_f32, 0.0, 9.0] {
+                    let (sin, cos) = f64::from(angle).to_radians().sin_cos();
+                    let mut points = Vec::new();
+                    for cross in 0..64 * scale {
+                        let length = if cross < 24 * scale || cross >= 40 * scale {
+                            160 * scale
+                        } else {
+                            2 * scale
+                        };
+                        for inline in 0..length {
+                            let cross = f64::from(cross) + 0.5;
+                            let inline = f64::from(inline) + 0.5;
+                            let (x, y) = if vertical {
+                                (cross, inline)
+                            } else {
+                                (inline, cross)
+                            };
+                            points.push(super::MaskPoint {
+                                x: x * cos - y * sin + 120.0,
+                                y: x * sin + y * cos + 80.0,
+                            });
+                        }
+                    }
+                    let measured = super::mask_font_size(&points, angle, vertical);
+                    assert!(
+                        (measured - (24 * scale) as f32).abs() <= 1.0,
+                        "vertical={vertical}, scale={scale}, angle={angle}: {measured}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
