@@ -7,7 +7,8 @@
 use crate::{
     BubbleRegion, DetectionAnalysis, EntityId, EntityOrigin, Error, Geometry, Group, OcrAnalysis,
     Page, Project, RasterLayer, Region, RegionSpec, Relation, Result, SourceText, TextContent,
-    TextGroup, TextLayout, TextRegion, TextRole, Translation, Typography, Visibility,
+    TextGroup, TextLayout, TextRegion, TextRole, Translation, TypesettingReview, Typography,
+    Visibility,
     component::{Component, ComponentRecord, ValidationContext, decode, key},
     components::Assets,
     state::{Components, State},
@@ -60,6 +61,7 @@ component_schema! {
     DETECTION_ANALYSIS = 15 => DetectionAnalysis,
     ASSETS = 16 => Assets,
     ENTITY_ORIGIN = 17 => EntityOrigin,
+    TYPESETTING_REVIEW = 18 => TypesettingReview,
 }
 
 pub(crate) fn validate_components(
@@ -88,6 +90,7 @@ pub(crate) fn validate_entity(state: &State, id: EntityId) -> Result<()> {
     let has_assets = has(ASSETS);
     let has_layout = has(TEXT_LAYOUT);
     let has_typography = has(TYPOGRAPHY);
+    let has_typesetting_review = has(TYPESETTING_REVIEW);
     let has_detection = has(DETECTION_ANALYSIS);
     let has_ocr = has(OCR_ANALYSIS);
     let has_group = has(GROUP);
@@ -123,6 +126,7 @@ pub(crate) fn validate_entity(state: &State, id: EntityId) -> Result<()> {
             || has_assets
             || has_layout
             || has_typography
+            || has_typesetting_review
             || has_detection
             || has_ocr)
     {
@@ -152,12 +156,20 @@ pub(crate) fn validate_entity(state: &State, id: EntityId) -> Result<()> {
             "text layer {id} is not contained by the page text group"
         )))
     } else if has_content
-        && (has_region || has_geometry || has_layout || has_typography || has_detection || has_ocr)
+        && (has_region
+            || has_geometry
+            || has_layout
+            || has_typography
+            || has_typesetting_review
+            || has_detection
+            || has_ocr)
     {
         Err(Error::invalid(format!(
             "text content entity {id} also carries analysis or presentation components"
         )))
-    } else if has_region && (has_layout || has_typography || has_source || has_translation) {
+    } else if has_region
+        && (has_layout || has_typography || has_typesetting_review || has_source || has_translation)
+    {
         Err(Error::invalid(format!(
             "analysis region {id} also carries text presentation or content components"
         )))
@@ -171,9 +183,9 @@ pub(crate) fn validate_entity(state: &State, id: EntityId) -> Result<()> {
         Err(Error::invalid(format!(
             "text layer {id} also carries content or analysis components"
         )))
-    } else if has_typography && !has_layout {
+    } else if (has_typography || has_typesetting_review) && !has_layout {
         Err(Error::invalid(format!(
-            "entity {id} has typography but is not a text layer"
+            "entity {id} has text presentation intent but is not a text layer"
         )))
     } else if (has_detection || has_ocr) && !has_region {
         Err(Error::invalid(format!(

@@ -167,3 +167,63 @@ impl Component for Typography {
         true
     }
 }
+
+/// A final, generated visual-QA adjustment layered over the deterministic
+/// typesetting intent. The translation and automatic placement relations remain
+/// authoritative; this component only records the bounded presentation choices
+/// selected and validated by the review stage.
+#[revisioned(revision = 1)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+pub struct TypesettingReview {
+    pub origin: Origin,
+    pub preferred_font: Option<String>,
+    pub font_weight: Option<u16>,
+    pub font_style: Option<FontStyle>,
+    pub font_size: Option<f32>,
+    pub color: Option<[u8; 4]>,
+    pub stroke_color: Option<[u8; 4]>,
+    pub stroke_width: Option<f32>,
+    pub alignment: Option<TextAlignment>,
+    pub preferred_line_count: Option<u16>,
+    pub allow_discretionary_hyphenation: Option<bool>,
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
+impl Component for TypesettingReview {
+    const KIND: &'static str = "dev.koharu.text.typesetting-review";
+
+    fn validate(&self, _context: &ValidationContext<'_>) -> Result<()> {
+        if self
+            .preferred_font
+            .as_ref()
+            .is_some_and(|font| font.len() > 4096 || font.contains('\0'))
+            || self
+                .font_weight
+                .is_some_and(|weight| !(1..=1000).contains(&weight))
+            || self
+                .font_size
+                .is_some_and(|size| !size.is_finite() || size <= 0.0)
+            || self
+                .stroke_width
+                .is_some_and(|width| !width.is_finite() || width < 0.0)
+            || self
+                .preferred_line_count
+                .is_some_and(|count| !(1..=128).contains(&count))
+            || !self.offset_x.is_finite()
+            || !self.offset_y.is_finite()
+        {
+            return Err(Error::invalid("typesetting review intent is invalid"));
+        }
+        self.origin.validate()
+    }
+
+    fn origin(&self) -> Option<&Origin> {
+        Some(&self.origin)
+    }
+
+    fn set_origin(&mut self, origin: Origin) -> bool {
+        self.origin = origin;
+        true
+    }
+}

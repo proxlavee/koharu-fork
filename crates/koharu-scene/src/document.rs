@@ -3,7 +3,7 @@
 use crate::{
     At, DetectionAnalysis, Edit, EntityId, Geometry, Group, OcrAnalysis, Origin, PageRef, Presents,
     Region, RegionSpec, Result, Snapshot, SourceText, TextContent, TextGroup, TextLayout, TextRole,
-    Translation, Typography, Visibility,
+    Translation, TypesettingReview, Typography, Visibility,
 };
 
 #[derive(Copy, Clone)]
@@ -67,6 +67,10 @@ impl<'a> TextLayerRef<'a> {
     }
 
     pub fn typography(self) -> Result<Option<Typography>> {
+        self.snapshot.component(self.id)
+    }
+
+    pub fn typesetting_review(self) -> Result<Option<TypesettingReview>> {
         self.snapshot.component(self.id)
     }
 

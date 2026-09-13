@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use crate::{
     Asset, AssetInput, AssetRole, BlobId, ComponentOwner, EntityId, EntityOrigin, Error,
     Generation, Group, Origin, Page, PageDraft, Patch, Relation, RelationId, RelationKind,
-    RelationSpec, Result, Snapshot, TextGroup, Visibility,
+    RelationSpec, Result, Snapshot, TextGroup, TypesettingReview, Visibility,
     component::{Component, ComponentKey, ComponentRecord, ValidationContext, decode, encode, key},
     components::Assets,
     patch::{Observation, Operation},
@@ -255,6 +255,55 @@ impl Edit {
         self.remove_entity_inner(entity, RemovePolicy::Cascade, false)
     }
 
+    /// Removes a presentation component from structurally generated content during an
+    /// explicitly requested authoritative regeneration.
+    ///
+    /// `M` is the structural marker that proves the entity belongs to a generated graph. This
+    /// deliberately ignores the mutable ownership of `T`: a user may have edited a generated
+    /// presentation after the previous run, and selecting that page for regeneration authorizes
+    /// replacing that presentation. The inverse patch still retains the complete prior value.
+    pub fn remove_component_for_regeneration<T: Component, M: Component>(
+        &mut self,
+        entity: EntityId,
+    ) -> Result<()> {
+        if self.generation.is_none() {
+            return Err(Error::Authorship(
+                "authoritative regeneration requires a pipeline generation".to_owned(),
+            ));
+        }
+        if matches!(
+            T::KIND,
+            Relation::KIND | Page::KIND | EntityOrigin::KIND | TextGroup::KIND
+        ) {
+            return Err(Error::invalid(
+                "required structural component cannot be removed",
+            ));
+        }
+        let marker = self.state.component(entity, &key::<M>()?)?.ok_or_else(|| {
+            Error::Authorship(format!(
+                "entity {entity} is not managed through component {}",
+                M::KIND
+            ))
+        })?;
+        let record_exists = |id| self.state.contains_entity(id);
+        let blob_exists = |_id| true;
+        let marker: M = decode(
+            marker,
+            &ValidationContext::new(&record_exists, &blob_exists),
+        )?;
+        if !matches!(marker.origin(), Some(Origin::Generated(_))) {
+            return Err(Error::Authorship(format!(
+                "component {} does not identify entity {entity} as pipeline-managed",
+                M::KIND
+            )));
+        }
+        let key = key::<T>()?;
+        self.observe_component(ComponentOwner::Entity(entity), key.clone())?;
+        self.replace_component(ComponentOwner::Entity(entity), key, None)?;
+        self.validate_entities.insert(entity);
+        Ok(())
+    }
+
     fn remove_entity_inner(
         &mut self,
         entity: EntityId,
@@ -343,7 +392,11 @@ impl Edit {
             Some(self.encode_value(&EntityOrigin {
                 origin: Origin::User,
             })?),
-        )
+        )?;
+        // A manual edit to a generated text layer supersedes its final QA
+        // adjustment. The ordinary component edit that follows now becomes the
+        // sole presentation intent; no reset or ownership workflow is required.
+        self.remove::<TypesettingReview>(entity)
     }
 
     pub fn set<T: Component>(&mut self, entity: EntityId, value: &T) -> Result<()> {

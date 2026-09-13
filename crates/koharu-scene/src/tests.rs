@@ -122,6 +122,7 @@ async fn built_in_component_schemas_remain_revision_one() {
             schema::<Group>(),
             schema::<TextGroup>(),
             schema::<Typography>(),
+            schema::<TypesettingReview>(),
             schema::<Region>(),
             schema::<DetectionAnalysis>(),
             schema::<EntityOrigin>(),
@@ -129,7 +130,7 @@ async fn built_in_component_schemas_remain_revision_one() {
             schema::<crate::components::Assets>(),
             schema::<Relation>(),
         ],
-        [1; 19]
+        [1; 20]
     );
 }
 
@@ -152,6 +153,7 @@ async fn built_in_component_kinds_express_domain_ownership() {
             Group::KIND,
             TextGroup::KIND,
             Typography::KIND,
+            TypesettingReview::KIND,
             Region::KIND,
             DetectionAnalysis::KIND,
             OcrAnalysis::KIND,
@@ -173,11 +175,236 @@ async fn built_in_component_kinds_express_domain_ownership() {
             "dev.koharu.group",
             "dev.koharu.text.group",
             "dev.koharu.text.typography",
+            "dev.koharu.text.typesetting-review",
             "dev.koharu.analysis.region",
             "dev.koharu.analysis.detection",
             "dev.koharu.analysis.ocr",
             "dev.koharu.assets",
         ]
+    );
+}
+
+#[tokio::test]
+async fn manual_text_edit_supersedes_review_and_undo_restores_it() {
+    let mut session = Session::memory().await.unwrap();
+    let mut layer = None;
+    let create = session
+        .snapshot()
+        .patch(|edit| {
+            let page = edit.add_page(page(), At::End)?;
+            let content = edit.add_text_content(page, At::End)?;
+            edit.set(content, &source("source"))?;
+            layer = Some(edit.add_text_layer(
+                page,
+                At::End,
+                content,
+                &TextLayout {
+                    origin: Origin::User,
+                    kind: TextLayoutKind::Paragraph,
+                },
+            )?);
+            Ok(())
+        })
+        .unwrap();
+    let snapshot = session.commit(create).await.unwrap().snapshot;
+    let layer = layer.unwrap();
+    let mut review = snapshot.edit_as(Generation::new(
+        ProducerId::new("dev.koharu.pipeline.visual-qa").unwrap(),
+    ));
+    review
+        .set(
+            layer,
+            &TypesettingReview {
+                origin: Origin::User,
+                preferred_font: None,
+                font_weight: None,
+                font_style: None,
+                font_size: Some(22.0),
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                alignment: None,
+                preferred_line_count: Some(2),
+                allow_discretionary_hyphenation: Some(false),
+                offset_x: 0.0,
+                offset_y: 2.0,
+            },
+        )
+        .unwrap();
+    let snapshot = session
+        .commit(review.finish().unwrap())
+        .await
+        .unwrap()
+        .snapshot;
+    assert!(matches!(
+        snapshot
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .unwrap()
+            .origin,
+        Origin::Generated(_)
+    ));
+
+    let manual = snapshot
+        .patch(|edit| edit.promote_entity_to_user(layer))
+        .unwrap();
+    let commit = session.commit(manual).await.unwrap();
+    assert!(
+        commit
+            .snapshot
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .is_none()
+    );
+    let undone = session.undo(commit.revision).await.unwrap().snapshot;
+    assert!(
+        undone
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn authoritative_review_rerun_discards_an_edited_generated_overlay_and_is_undoable() {
+    let mut session = Session::memory().await.unwrap();
+    let page_patch = session
+        .snapshot()
+        .patch(|edit| edit.add_page(page(), At::End).map(|_| ()))
+        .unwrap();
+    let snapshot = session.commit(page_patch).await.unwrap().snapshot;
+    let page = snapshot.pages().next().unwrap().id();
+    let detection =
+        Generation::new(ProducerId::new("dev.koharu.pipeline.detection").expect("valid producer"));
+    let mut generated = snapshot.edit_as(detection.clone());
+    let content = generated.add_text_content(page, At::End).unwrap();
+    let layer = generated
+        .add_text_layer(
+            page,
+            At::End,
+            content,
+            &TextLayout {
+                origin: Origin::Generated(detection),
+                kind: TextLayoutKind::Paragraph,
+            },
+        )
+        .unwrap();
+    let snapshot = session
+        .commit(generated.finish().unwrap())
+        .await
+        .unwrap()
+        .snapshot;
+    let edited = snapshot
+        .patch(|edit| {
+            edit.set(
+                layer,
+                &TypesettingReview {
+                    origin: Origin::User,
+                    preferred_font: None,
+                    font_weight: None,
+                    font_style: None,
+                    font_size: Some(19.0),
+                    color: None,
+                    stroke_color: None,
+                    stroke_width: None,
+                    alignment: None,
+                    preferred_line_count: Some(2),
+                    allow_discretionary_hyphenation: Some(false),
+                    offset_x: 1.0,
+                    offset_y: 2.0,
+                },
+            )
+        })
+        .unwrap();
+    let snapshot = session.commit(edited).await.unwrap().snapshot;
+    assert!(matches!(
+        snapshot
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .unwrap()
+            .origin,
+        Origin::User
+    ));
+
+    let mut rerun = snapshot.edit_as(Generation::new(
+        ProducerId::new("dev.koharu.pipeline.visual-qa").expect("valid producer"),
+    ));
+    rerun
+        .remove_component_for_regeneration::<TypesettingReview, TextLayout>(layer)
+        .unwrap();
+    let commit = session.commit(rerun.finish().unwrap()).await.unwrap();
+    assert!(
+        commit
+            .snapshot
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .is_none()
+    );
+    let undone = session.undo(commit.revision).await.unwrap().snapshot;
+    assert!(matches!(
+        undone
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .unwrap()
+            .origin,
+        Origin::User
+    ));
+}
+
+#[tokio::test]
+async fn authoritative_component_regeneration_rejects_genuinely_user_created_text() {
+    let mut session = Session::memory().await.unwrap();
+    let mut layer = None;
+    let create = session
+        .snapshot()
+        .patch(|edit| {
+            let page = edit.add_page(page(), At::End)?;
+            let content = edit.add_text_content(page, At::End)?;
+            let added = edit.add_text_layer(
+                page,
+                At::End,
+                content,
+                &TextLayout {
+                    origin: Origin::User,
+                    kind: TextLayoutKind::Paragraph,
+                },
+            )?;
+            layer = Some(added);
+            edit.set(
+                added,
+                &TypesettingReview {
+                    origin: Origin::User,
+                    preferred_font: None,
+                    font_weight: None,
+                    font_style: None,
+                    font_size: Some(19.0),
+                    color: None,
+                    stroke_color: None,
+                    stroke_width: None,
+                    alignment: None,
+                    preferred_line_count: None,
+                    allow_discretionary_hyphenation: None,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                },
+            )
+        })
+        .unwrap();
+    let snapshot = session.commit(create).await.unwrap().snapshot;
+    let layer = layer.unwrap();
+    let mut rerun = snapshot.edit_as(Generation::new(
+        ProducerId::new("dev.koharu.pipeline.visual-qa").expect("valid producer"),
+    ));
+    assert!(
+        rerun
+            .remove_component_for_regeneration::<TypesettingReview, TextLayout>(layer)
+            .is_err()
+    );
+    assert!(
+        snapshot
+            .component::<TypesettingReview>(layer)
+            .unwrap()
+            .is_some()
     );
 }
 
