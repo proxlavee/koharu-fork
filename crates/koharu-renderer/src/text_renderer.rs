@@ -7,6 +7,7 @@ use koharu_rasterizer::{
     PreparedGlyph, PreparedGlyphRun, PreparedResource, PreparedScene, PreparedSceneCommand,
     ResourceId,
 };
+use parking_lot::Mutex;
 use vello::kurbo::Affine;
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
     fonts::{Fonts, font_key},
     free_text::FreeTextCandidate,
     images::DecodedImage,
-    layout::{CompositionQuality, font_scale_cost},
+    layout::{CompositionQuality, ShapeAdvanceCache, font_scale_cost},
     script::is_chinese_or_japanese_text,
 };
 
@@ -624,6 +625,9 @@ impl TextRenderer {
                 descriptor.entity,
             )));
         }
+        let template = template
+            .clone()
+            .with_measure_cache(Arc::new(Mutex::new(ShapeAdvanceCache::default())));
 
         let artwork = descriptor
             .artwork

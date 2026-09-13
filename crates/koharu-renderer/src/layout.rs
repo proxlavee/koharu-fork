@@ -1,6 +1,10 @@
 //! Unicode-aware text shaping, line breaking, and layout.
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    sync::Arc,
+};
 use unicode_bidi::BidiInfo;
 
 use anyhow::Result;
@@ -11,6 +15,7 @@ use icu_properties::{
     CodePointMapData,
     props::{GeneralCategory, GeneralCategoryGroup},
 };
+use parking_lot::Mutex;
 use skrifa::{MetadataProvider, instance::Size};
 
 use crate::{
@@ -413,6 +418,44 @@ struct InkBand {
     after: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ShapeAdvanceKey {
+    font_size: u32,
+    start: usize,
+    end: usize,
+    hyphen_suffix: bool,
+}
+
+/// Bounded advances shared by the candidate layouts of one generated text
+/// descriptor. Glyph runs are intentionally not retained: the selected line
+/// is shaped normally so the cache cannot become a second rendering source.
+#[derive(Default)]
+pub(crate) struct ShapeAdvanceCache {
+    entries: HashMap<ShapeAdvanceKey, f32>,
+    order: VecDeque<ShapeAdvanceKey>,
+}
+
+impl ShapeAdvanceCache {
+    const CAPACITY: usize = 16_384;
+
+    fn get(&self, key: ShapeAdvanceKey) -> Option<f32> {
+        self.entries.get(&key).copied()
+    }
+
+    fn insert(&mut self, key: ShapeAdvanceKey, advance: f32) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() >= Self::CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(key, advance);
+        self.order.push_back(key);
+    }
+}
+
 impl InkBand {
     fn thickness(self) -> f32 {
         self.before + self.after
@@ -474,6 +517,7 @@ pub struct TextLayout<'a> {
     natural_line_breaks: bool,
     preferred_font_size: Option<f32>,
     ink_outset: f32,
+    measure_cache: Option<Arc<Mutex<ShapeAdvanceCache>>>,
 }
 
 fn largest_fitting_font_size<T>(
@@ -562,9 +606,44 @@ struct ParagraphShaper<'t, 'a> {
     options: ShapingOptions<'t>,
     fonts: Vec<&'a Font>,
     primary_covers_text: bool,
+    measure_cache: Option<Arc<Mutex<ShapeAdvanceCache>>>,
 }
 
 impl<'a> ParagraphShaper<'_, 'a> {
+    fn measured_advance(
+        &mut self,
+        range: Range<usize>,
+        suffix: Option<LineBreakSuffix>,
+    ) -> Result<f32> {
+        let key = ShapeAdvanceKey {
+            font_size: self.options.font_size.to_bits(),
+            start: range.start,
+            end: range.end,
+            hyphen_suffix: suffix.is_some(),
+        };
+        if let Some(cache) = &self.measure_cache
+            && let Some(advance) = cache.lock().get(key)
+        {
+            return Ok(advance);
+        }
+        let advance = self
+            .shape(range, suffix)?
+            .iter()
+            .flat_map(|run| &run.shaped.glyphs)
+            .map(|glyph| {
+                if self.layout.writing_mode.is_vertical() {
+                    glyph.y_advance.abs()
+                } else {
+                    glyph.x_advance
+                }
+            })
+            .sum();
+        if let Some(cache) = &self.measure_cache {
+            cache.lock().insert(key, advance);
+        }
+        Ok(advance)
+    }
+
     fn shape(
         &self,
         range: Range<usize>,
@@ -683,6 +762,7 @@ impl<'a> TextLayout<'a> {
             natural_line_breaks: false,
             preferred_font_size: None,
             ink_outset: 0.0,
+            measure_cache: None,
         }
     }
 
@@ -712,6 +792,11 @@ impl<'a> TextLayout<'a> {
 
     pub(crate) fn with_natural_line_breaks(mut self) -> Self {
         self.natural_line_breaks = true;
+        self
+    }
+
+    pub(crate) fn with_measure_cache(mut self, cache: Arc<Mutex<ShapeAdvanceCache>>) -> Self {
+        self.measure_cache = Some(cache);
         self
     }
 
@@ -1282,12 +1367,13 @@ impl<'a> TextLayout<'a> {
         let mut fonts: Vec<&Font> = Vec::with_capacity(1 + self.fallback_fonts.len());
         fonts.push(self.font);
         fonts.extend(self.fallback_fonts.iter());
-        let shaper = ParagraphShaper {
+        let mut shaper = ParagraphShaper {
             layout: self,
             bidi: bidi_info,
             options,
             fonts,
             primary_covers_text: !self.cjk_punctuation_layout && self.font.covers(text),
+            measure_cache: self.measure_cache.clone(),
         };
 
         let mut shaped_segments = Vec::new();
@@ -1355,7 +1441,7 @@ impl<'a> TextLayout<'a> {
         let mut line_offset = 0usize;
         if self.comic_balloon.is_some() {
             (contour_overflowed, contour_profiled) = self.append_balanced_segment_lines(
-                &shaper,
+                &mut shaper,
                 &shaped_segments,
                 &mut line_offset,
                 text.len(),
@@ -1376,7 +1462,7 @@ impl<'a> TextLayout<'a> {
                 }
                 contour_overflowed |= self
                     .append_balanced_segment_lines(
-                        &shaper,
+                        &mut shaper,
                         &shaped_segments[paragraph_start..=index],
                         &mut line_offset,
                         segment.next_offset,
@@ -1395,7 +1481,7 @@ impl<'a> TextLayout<'a> {
             if paragraph_start < shaped_segments.len() {
                 contour_overflowed |= self
                     .append_balanced_segment_lines(
-                        &shaper,
+                        &mut shaper,
                         &shaped_segments[paragraph_start..],
                         &mut line_offset,
                         text.len(),
@@ -1701,7 +1787,7 @@ impl<'a> TextLayout<'a> {
     #[allow(clippy::too_many_arguments)]
     fn append_balanced_segment_lines(
         &self,
-        shaper: &ParagraphShaper<'_, 'a>,
+        shaper: &mut ParagraphShaper<'_, 'a>,
         segments: &[ShapedSegment<'a>],
         line_offset: &mut usize,
         final_next_offset: usize,
@@ -1753,18 +1839,8 @@ impl<'a> TextLayout<'a> {
                 } else {
                     None
                 };
-                let runs = shaper.shape(segments[start].range.start..last.visible_end, suffix)?;
-                let advance = runs
-                    .iter()
-                    .flat_map(|run| &run.shaped.glyphs)
-                    .map(|glyph| {
-                        if self.writing_mode.is_vertical() {
-                            glyph.y_advance.abs()
-                        } else {
-                            glyph.x_advance
-                        }
-                    })
-                    .sum::<f32>();
+                let advance = shaper
+                    .measured_advance(segments[start].range.start..last.visible_end, suffix)?;
                 advances.push(advance + self.ink_outset * 2.0);
                 if last.is_mandatory {
                     break;
