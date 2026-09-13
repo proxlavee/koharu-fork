@@ -44,6 +44,7 @@ pub struct ShapedRun<'a> {
 pub struct ShapingOptions<'a> {
     pub direction: Direction,
     pub script: Option<Script>,
+    pub language: Option<&'a harfrust::Language>,
     pub font_size: f32,
     pub features: &'a [Feature],
 }
@@ -72,6 +73,9 @@ impl TextShaper {
         buffer.set_direction(options.direction);
         if let Some(script) = options.script {
             buffer.set_script(script);
+        }
+        if let Some(language) = options.language {
+            buffer.set_language(language.clone());
         }
 
         let direction = buffer.direction();
@@ -286,6 +290,61 @@ mod tests {
     }
 
     #[test]
+    fn target_language_matches_direct_harfrust_shaping() -> Result<()> {
+        let mut fonts = FontSystem::new();
+        let font = PRIMARY_FAMILIES
+            .iter()
+            .find_map(|name| query_font(&mut fonts, name))
+            .expect("no font available for language shaping test");
+        let font_ref = font.harfrust_ref()?;
+        for (tag, text) in [
+            ("tr-TR", "fi ffi İstanbul"),
+            ("sr", "бгдпт"),
+            ("en-US", "office"),
+        ] {
+            let language = harfrust::Language::new(tag).unwrap();
+            let options = ShapingOptions {
+                direction: Direction::LeftToRight,
+                script: None,
+                language: Some(&language),
+                font_size: 24.0,
+                features: &[],
+            };
+            let actual = TextShaper::new().shape(text, &font, &options)?;
+            let mut buffer = UnicodeBuffer::new();
+            buffer.push_str(text);
+            buffer.guess_segment_properties();
+            buffer.set_direction(options.direction);
+            buffer.set_language(language.clone());
+            let shaper = font
+                .shaper_data()
+                .shaper(&font_ref)
+                .instance(Some(font.shaper_instance()))
+                .build();
+            let expected = shaper.shape(
+                buffer,
+                ShapeOptions::new().point_size(Some(options.font_size)),
+            );
+            let scale = options.font_size / font.skrifa_ref()?.head()?.units_per_em() as f32;
+            assert_eq!(actual.glyphs.len(), expected.glyph_infos().len());
+            for ((actual, info), position) in actual
+                .glyphs
+                .iter()
+                .zip(expected.glyph_infos())
+                .zip(expected.glyph_positions())
+            {
+                assert_eq!(actual.glyph_id, info.glyph_id, "language={tag}");
+                assert_eq!(actual.cluster, info.cluster, "language={tag}");
+                assert_eq!(actual.x_advance, position.x_advance as f32 * scale);
+                assert_eq!(actual.y_advance, position.y_advance as f32 * scale);
+                assert_eq!(actual.x_offset, position.x_offset as f32 * scale);
+                assert_eq!(actual.y_offset, position.y_offset as f32 * scale);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shape_segment_uses_fallback_font() -> Result<()> {
         let mut fonts = FontSystem::new();
         let primary = PRIMARY_FAMILIES
@@ -316,6 +375,7 @@ mod tests {
             direction: harfrust::Direction::LeftToRight,
             script: None,
             font_size: 16.0,
+            language: None,
             features: &[],
         };
         let runs = shape_script_runs(&shaper, &text, &[&primary, &fallback], &options)?;
@@ -358,6 +418,7 @@ mod tests {
             direction: harfrust::Direction::RightToLeft,
             script: Some(harfrust::Script::from_iso15924_tag(harfrust::Tag::new(b"Arab")).unwrap()),
             font_size: 16.0,
+            language: None,
             features: &[],
         };
 
@@ -391,6 +452,7 @@ mod tests {
             direction: harfrust::Direction::RightToLeft,
             script: Some(harfrust::Script::from_iso15924_tag(harfrust::Tag::new(b"Arab")).unwrap()),
             font_size: 16.0,
+            language: None,
             features: &[],
         };
 

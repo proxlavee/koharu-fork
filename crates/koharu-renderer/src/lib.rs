@@ -1,5 +1,6 @@
 //! Retained rendering of one semantic Koharu page.
 
+mod artwork;
 mod bubble;
 mod config;
 mod error;

@@ -138,6 +138,20 @@ pub(crate) struct GeometryFrame {
     pub angle_degrees: f32,
 }
 
+impl GeometryFrame {
+    pub(crate) fn transform(self) -> vello::kurbo::Affine {
+        use vello::kurbo::Affine;
+        Affine::translate((
+            f64::from(self.bounds.x + self.bounds.width * 0.5),
+            f64::from(self.bounds.y + self.bounds.height * 0.5),
+        )) * Affine::rotate(f64::from(self.angle_degrees).to_radians())
+            * Affine::translate((
+                -f64::from(self.bounds.width * 0.5),
+                -f64::from(self.bounds.height * 0.5),
+            ))
+    }
+}
+
 pub(crate) fn contour(geometry: &Geometry, frame: GeometryFrame) -> Vec<(f32, f32)> {
     if geometry.points.len() > MAX_CONTOUR_POINTS {
         return Vec::new();

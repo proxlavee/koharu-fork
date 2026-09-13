@@ -120,6 +120,49 @@ impl Frame {
             .map_err(|error| Error::Backend(anyhow!(error)))
     }
 
+    /// Returns the composited page background with every text layer omitted.
+    ///
+    /// Visual QA uses this exact retained background to measure the contrast of
+    /// candidate text without trying to reconstruct the post-inpainting pixels
+    /// from individual source assets.
+    pub fn without_text(&self) -> Result<Self> {
+        let layers = self
+            .layers()
+            .iter()
+            .filter(|layer| !matches!(layer.kind(), LayerKind::Text(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let layer_index = layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| (layer.entity(), index))
+            .collect::<HashMap<_, _>>();
+        let layers: Arc<[Layer]> = layers.into();
+        let prepared = prepare_frame(
+            self.revision(),
+            self.page(),
+            self.0.width,
+            self.0.height,
+            self.0.origin,
+            self.0.normalization,
+            &layers,
+        )?;
+        Ok(Self(Arc::new(FrameData {
+            revision: self.revision(),
+            page: self.page(),
+            width: self.0.width,
+            height: self.0.height,
+            origin: self.0.origin,
+            normalization: self.0.normalization,
+            layers,
+            layer_index: Arc::new(layer_index),
+            dependencies: self.0.dependencies.clone(),
+            diagnostics: self.0.diagnostics.clone(),
+            stats: self.0.stats,
+            prepared: Arc::new(prepared),
+        })))
+    }
+
     /// Returns one entity normalized into a tightly cropped frame.
     ///
     /// The original layer retains authored presentation. The isolated copy is
@@ -372,9 +415,15 @@ pub struct TextMetadata {
     pub language: Option<LanguageTag>,
     pub rendered_bounds: RenderBounds,
     pub layout_bounds: RenderBounds,
+    /// Center of the owned balloon body in page coordinates, before review offsets.
+    pub flow_center: Option<(f32, f32)>,
     pub post_script_fonts: Vec<String>,
     pub font_size: f32,
     pub color: [u8; 4],
+    pub stroke_color: Option<[u8; 4]>,
+    pub stroke_width: f32,
+    pub line_ranges: Vec<(usize, usize)>,
+    pub discretionary_hyphens: usize,
     pub alignment: TextAlign,
     pub writing_mode: WritingMode,
     pub angle_degrees: f32,
@@ -469,6 +518,10 @@ pub(crate) struct LocalTextMetadata {
     pub(crate) post_script_fonts: Vec<String>,
     pub(crate) font_size: f32,
     pub(crate) color: [u8; 4],
+    pub(crate) stroke_color: Option<[u8; 4]>,
+    pub(crate) stroke_width: f32,
+    pub(crate) line_ranges: Vec<(usize, usize)>,
+    pub(crate) discretionary_hyphens: usize,
 }
 
 pub(crate) fn prepare_frame(

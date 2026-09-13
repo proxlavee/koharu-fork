@@ -86,9 +86,6 @@ pub(crate) struct FreeTextCandidate {
     /// Visual-area budget relative to the detected source. Values above one
     /// progressively relax source occupancy for a longer translation.
     pub(crate) translation_visual_area_scale: f32,
-    /// Normalized departure from the detected composition, including any shift
-    /// forced by neighboring semantic regions.
-    pub(crate) source_distance: f32,
 }
 
 impl FreeTextSpace {
@@ -114,8 +111,8 @@ impl FreeTextSpace {
     /// so the source footprint is followed by samples on the continuous
     /// area-preserving path to the logical-axis transpose. Both paths also expose
     /// unused inline corridor space while retaining the source visual-area budget
-    /// and anchor. Longer translations add progressive visual-area families; the
-    /// text renderer stops at the first tier that leaves the emergency fit band.
+    /// and anchor. The text renderer compares actual painted compositions across
+    /// all visual-area families; source aspect ratio is not a target-text shape.
     pub(crate) fn candidates(&self, request: FreeTextRequest<'_>) -> Vec<FreeTextCandidate> {
         let FreeTextRequest {
             source,
@@ -187,7 +184,6 @@ impl FreeTextSpace {
             });
         let container =
             panel.map_or_else(|| page_polygon(self.page), |panel| points(&panel.geometry));
-        let source_aspect = source_width / source_height;
         let source_target_frame = logical_frame(
             source_center,
             source_frame.angle_degrees,
@@ -226,14 +222,14 @@ impl FreeTextSpace {
                                       visual_area_scale: f32| {
                 let frame = match self.fit_inline_corridor(&corridor, target_frame, expand_inline) {
                     Ok(frame) => frame,
-                    Err(rejection) => {
+                    Err(_rejection) => {
                         #[cfg(debug_assertions)]
                         if let Some(rejections) = &mut rejections {
                             rejections.push((
                                 target_frame.bounds,
                                 expand_inline,
                                 visual_area_scale,
-                                rejection,
+                                _rejection,
                             ));
                         }
                         return;
@@ -259,17 +255,11 @@ impl FreeTextSpace {
                 }) {
                     return;
                 }
-                let aspect = bounds.width / bounds.height;
-                let shift_x = (local_center.0 - preferred_center.0) / source_width;
-                let shift_y = (local_center.1 - preferred_center.1) / source_height;
                 candidates.push(FreeTextCandidate {
                     bounds,
                     preferred_center,
                     maximum_visual_area,
                     translation_visual_area_scale: visual_area_scale,
-                    source_distance: (aspect / source_aspect).ln().abs()
-                        + visual_area_scale.ln().abs() * 0.5
-                        + shift_x.hypot(shift_y),
                 });
             };
 
@@ -1086,7 +1076,6 @@ mod tests {
         assert_eq!(candidate.bounds.height, 194.21875);
         assert_eq!(candidate.preferred_center, (70.0, 97.109375));
         assert_eq!(candidate.maximum_visual_area, 140.0 * 194.21875);
-        assert_eq!(candidate.source_distance, 0.0);
         let corridor = candidates[1];
         assert!(corridor.bounds.width > candidate.bounds.width);
         assert_eq!(corridor.bounds.height, candidate.bounds.height);
@@ -1180,7 +1169,6 @@ mod tests {
         assert!((source_candidate.bounds.y - 0.0).abs() < 0.01);
         assert!((source_candidate.bounds.width - 92.5).abs() < 0.01);
         assert!((source_candidate.bounds.height - 254.25).abs() < 0.01);
-        assert!(source_candidate.source_distance.abs() < 0.01);
 
         let transposed = &candidates[ORTHOGONAL_ASPECT_INTERVALS];
         assert!((transposed.bounds.x + 80.875).abs() < 0.01);
@@ -1237,7 +1225,7 @@ mod tests {
         assert!((transposed.bounds.height - 55.0).abs() < 0.01);
         assert!((transposed.bounds.width - 264.84375).abs() < 0.01);
         assert!((transposed.preferred_center.0 - 27.5).abs() < 0.01);
-        assert!((transposed.preferred_center.1 - 132.421875).abs() < 0.01);
+        assert!((transposed.preferred_center.1 - 132.421_88).abs() < 0.01);
         assert!((transposed.maximum_visual_area - 55.0 * 264.84375).abs() < 0.01);
     }
 

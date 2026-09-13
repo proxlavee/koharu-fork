@@ -1,6 +1,6 @@
 //! Text layout and portable glyph recording.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use koharu_rasterizer::{
@@ -12,13 +12,12 @@ use vello::kurbo::Affine;
 use crate::{
     Error, FontStyle, HyphenationPolicy, LayoutRun, RenderBounds, RenderDiagnostic,
     Result as RenderResult, TextAlign, TextLayout, WritingMode,
+    artwork::{ArtworkContext, ArtworkField},
     bubble::LayoutBox,
     fonts::{Fonts, font_key},
     free_text::FreeTextCandidate,
-    layout::{
-        fragmentation_quality_font_reduction, has_internal_natural_pause, quality_font_reduction,
-        whole_word_quality_font_reduction,
-    },
+    images::DecodedImage,
+    layout::CompositionQuality,
     script::is_chinese_or_japanese_text,
 };
 
@@ -26,61 +25,6 @@ use crate::{
 // text may auto-fit smaller. Preserve that ratio but bound unusually broad
 // detected bands; explicitly authored widths remain absolute.
 const MAX_GENERATED_STROKE_FONT_RATIO: f32 = 0.12;
-const FREE_TEXT_PAUSE_FONT_REDUCTION_RATIO: f32 = 0.25;
-const FREE_TEXT_PAUSE_FONT_REDUCTION_MAX: f32 = 6.0;
-const FREE_TEXT_LOCALITY_FONT_REDUCTION_MAX: f32 = 2.0;
-
-fn free_text_semantic_font_reduction(text: &str, font_size: f32) -> f32 {
-    let ordinary = quality_font_reduction(font_size);
-    if has_internal_natural_pause(text) {
-        ordinary
-            .max(font_size * FREE_TEXT_PAUSE_FONT_REDUCTION_RATIO)
-            .min(FREE_TEXT_PAUSE_FONT_REDUCTION_MAX)
-    } else {
-        ordinary
-    }
-}
-
-fn free_text_quality_font_reduction(
-    text: &str,
-    font_size: f32,
-    discretionary_hyphens: usize,
-) -> f32 {
-    free_text_semantic_font_reduction(text, font_size).max(fragmentation_quality_font_reduction(
-        text,
-        font_size,
-        discretionary_hyphens,
-    ))
-}
-
-fn free_text_layout_quality_font_reduction(
-    text: &str,
-    largest_font_size: f32,
-    layout: &LayoutRun<'_>,
-) -> f32 {
-    free_text_semantic_font_reduction(text, largest_font_size).max(
-        whole_word_quality_font_reduction(text, largest_font_size, layout),
-    )
-}
-
-fn fragmentation_trade_is_readable(
-    initial_font_size: f32,
-    minimum_font_size: f32,
-    initial_hyphens: usize,
-    candidate_font_size: f32,
-    candidate_hyphens: usize,
-) -> bool {
-    // The configured minimum is an emergency fit boundary, not an aesthetic
-    // budget for removing fragmentation. Mirror the comic-layout invariant so
-    // generated free text cannot buy a cleaner word by becoming unreadably small.
-    let first_visible_size_above_minimum = minimum_font_size.floor() + 1.0;
-    candidate_hyphens >= initial_hyphens
-        || candidate_font_size + f32::EPSILON >= first_visible_size_above_minimum
-        || candidate_font_size + f32::EPSILON
-            >= (initial_font_size - quality_font_reduction(initial_font_size))
-                .max(minimum_font_size)
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextNodeDescriptor {
     pub(crate) entity: koharu_scene::EntityId,
@@ -94,25 +38,70 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) flow_contours: Vec<Vec<(f32, f32)>>,
     pub(crate) preferred_center: Option<(f32, f32)>,
     pub(crate) free_text_candidates: Vec<FreeTextCandidate>,
+    pub(crate) artwork: Option<ArtworkContext>,
+    pub(crate) preferred_line_count: Option<usize>,
     pub(crate) automatic_free_text: bool,
     pub(crate) preferred_font: Option<String>,
     pub(crate) font_families: Vec<String>,
     pub(crate) font_weight: Option<u16>,
     pub(crate) font_style: Option<FontStyle>,
     pub(crate) font_size: Option<f32>,
+    pub(crate) reviewed_font_size: Option<f32>,
     pub(crate) source_font_size: Option<f32>,
-    pub(crate) preferred_font_size: Option<f32>,
+    pub(crate) font_size_reference: Option<FontSizeReference>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
     pub(crate) writing_mode: WritingMode,
     pub(crate) foreground_color: [u8; 4],
     pub(crate) stroke: Option<StrokeOptions>,
+    pub(crate) allow_discretionary_hyphenation: Option<bool>,
+    pub(crate) placement_offset: (f32, f32),
     pub(crate) line_height: f32,
     pub(crate) letter_spacing: f32,
     pub(crate) word_spacing: f32,
     pub(crate) text_inset: [f32; 4],
     pub(crate) point_text: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FontSizeReference {
+    CrossLine(f32),
+    InkArea(f32),
+}
+
+impl FontSizeReference {
+    fn resolve(self, template: &TextLayout<'_>, text: &str) -> Result<f32> {
+        match self {
+            Self::CrossLine(size) => Ok(size),
+            Self::InkArea(area) => {
+                anyhow::ensure!(area.is_finite() && area > 0.0, "invalid source ink area");
+                // A narrow symbol's cross-line thickness is not an em size.
+                // Preserve its two-dimensional visual scale without inheriting
+                // the source writing axis or constraining the target rectangle.
+                // Skrifa quantizes a TrueType metrics probe to 26.6 before
+                // scaling. An integer probe avoids amplifying that truncation
+                // when a thin glyph's measured area is converted back to ems.
+                let probe_size = area.sqrt().ceil();
+                let probe = template.clone().with_font_size(probe_size).run(text)?;
+                let measured = template
+                    .ink_bounds(probe_size, &probe.lines)
+                    .map_or(0.0, |(left, top, right, bottom)| {
+                        (right - left) * (bottom - top)
+                    });
+                anyhow::ensure!(
+                    measured.is_finite() && measured > 0.0,
+                    "symbol has no measurable ink"
+                );
+                let size = probe_size * (area / measured).sqrt();
+                anyhow::ensure!(
+                    size.is_finite() && size > 0.0,
+                    "invalid symbol size reference"
+                );
+                Ok(size)
+            }
+        }
+    }
 }
 
 pub(crate) struct RenderedTextNode {
@@ -129,6 +118,10 @@ pub(crate) struct RenderedTextMetadata {
     pub(crate) post_script_fonts: Vec<String>,
     pub(crate) font_size: f32,
     pub(crate) color: [u8; 4],
+    pub(crate) stroke_color: Option<[u8; 4]>,
+    pub(crate) stroke_width: f32,
+    pub(crate) line_ranges: Vec<(usize, usize)>,
+    pub(crate) discretionary_hyphens: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,7 +141,7 @@ pub(crate) enum StrokeWidth {
 }
 
 impl StrokeOptions {
-    fn for_font_size(self, font_size: f32) -> ResolvedStrokeOptions {
+    pub(crate) fn for_font_size(self, font_size: f32) -> ResolvedStrokeOptions {
         let width_px = match self.width {
             StrokeWidth::Absolute(width_px) => width_px,
             StrokeWidth::Generated {
@@ -164,7 +157,7 @@ impl StrokeOptions {
         };
         ResolvedStrokeOptions {
             color: self.color,
-            width_px,
+            width_px: if self.color[3] == 0 { 0.0 } else { width_px },
         }
     }
 }
@@ -259,6 +252,7 @@ impl TextRenderer {
         &self,
         descriptor: &TextNodeDescriptor,
         fonts: &Fonts,
+        images: &HashMap<koharu_scene::BlobId, Arc<DecodedImage>>,
     ) -> RenderResult<RenderedTextNode> {
         let is_bubble_text = descriptor.balloon_contour.is_some();
         let frame = LayoutBox {
@@ -309,22 +303,37 @@ impl TextRenderer {
                         .is_some_and(|language| is_chinese_or_japanese_language(language.as_str())),
             );
         if let Some(language) = &descriptor.language {
-            template = template.with_hyphenation_language_tag(language.as_str());
+            template = template.with_language_tag(language.as_str());
         }
         if (is_bubble_text || descriptor.automatic_free_text)
             && descriptor.writing_mode == WritingMode::Horizontal
         {
             template = template.with_hyphenation_policy(HyphenationPolicy::LastResort);
         }
+        if descriptor.allow_discretionary_hyphenation == Some(false) {
+            template = template.with_hyphenation_policy(HyphenationPolicy::Disabled);
+        }
         if descriptor.automatic_free_text && descriptor.writing_mode == WritingMode::Horizontal {
             template = template.with_natural_line_breaks();
         }
-        if descriptor.auto_fit
+        let reference = if descriptor.auto_fit
             && !descriptor.point_text
             && descriptor.font_size.is_none()
-            && let Some(source) = descriptor.preferred_font_size
+            && descriptor.reviewed_font_size.is_none()
         {
-            template = template.with_preferred_font_size(source);
+            descriptor
+                .font_size_reference
+                .map(|reference| reference.resolve(&template, &descriptor.text))
+                .transpose()
+                .map_err(|source| Error::Layout {
+                    entity: descriptor.entity,
+                    source,
+                })?
+        } else {
+            None
+        };
+        if let Some(reference) = reference {
+            template = template.with_preferred_font_size(reference);
         }
 
         if let Some(contour) = &descriptor.balloon_contour {
@@ -354,11 +363,18 @@ impl TextRenderer {
                 );
             }
             if let Some(center) = descriptor.preferred_center {
-                let strict_centering = !descriptor.flow_contours.is_empty();
+                // Automatic flow text prefers the usable body's center. Explicit
+                // review proposals can move within the same hard contour limits.
+                let strict_centering = !descriptor.flow_contours.is_empty()
+                    && descriptor.reviewed_font_size.is_none()
+                    && descriptor.preferred_line_count.is_none();
                 template = template.with_comic_preferred_center(
                     (center.0 - left, center.1 - top),
                     strict_centering,
                 );
+            }
+            if let Some(line_count) = descriptor.preferred_line_count {
+                template = template.with_comic_preferred_line_count(line_count);
             }
         }
         let selected = if !descriptor.free_text_candidates.is_empty()
@@ -366,7 +382,7 @@ impl TextRenderer {
             && !descriptor.point_text
             && !is_bubble_text
         {
-            self.select_free_text_layout(descriptor, &template)?
+            self.select_free_text_layout(descriptor, &template, reference, images)?
         } else {
             let (minimum, maximum) = font_size_limits(descriptor, ordinary_bounds);
             let mut builder = template;
@@ -383,12 +399,16 @@ impl TextRenderer {
                 builder.with_font_size(descriptor.font_size.unwrap_or(maximum))
             };
             SelectedTextLayout {
-                layout: self.layout(&builder, &descriptor.text).map_err(|source| {
-                    Error::Layout {
+                layout: builder
+                    .run_with_ink_outset(&descriptor.text, |size| {
+                        descriptor
+                            .stroke
+                            .map_or(0.0, |stroke| stroke.for_font_size(size).width_px)
+                    })
+                    .map_err(|source| Error::Layout {
                         entity: descriptor.entity,
                         source,
-                    }
-                })?,
+                    })?,
                 bounds: ordinary_bounds,
                 preferred_center: None,
                 maximum_visual_area: None,
@@ -418,6 +438,8 @@ impl TextRenderer {
         };
         x += layout.placement_offset_x();
         y += layout.placement_offset_y();
+        x += descriptor.placement_offset.0;
+        y += descriptor.placement_offset.1;
         let transform = Affine::translate((f64::from(x), f64::from(y)));
         let color = descriptor.foreground_color;
         let mut options = TextRenderOptions {
@@ -475,12 +497,11 @@ impl TextRenderer {
             target: "koharu_typesetting_probe",
             tracing::Level::TRACE
         ) {
-            let selected_hyphens = layout.discretionary_hyphen_count(&descriptor.text);
+            let selected_hyphens = layout.discretionary_hyphen_count();
             let source_relative_shrink = descriptor.source_font_size.is_some_and(|source| {
                 source.is_finite() && source > 0.0 && layout.font_size + f32::EPSILON < source * 0.8
             });
-            let emergency_band = layout.font_size
-                <= descriptor.minimum_font_size + quality_font_reduction(layout.font_size);
+            let emergency_band = layout.font_size <= descriptor.minimum_font_size;
             if descriptor.auto_fit
                 && (emergency_band || source_relative_shrink || descriptor.automatic_free_text)
             {
@@ -524,6 +545,7 @@ impl TextRenderer {
                     flow_contours = ?flow_contours,
                     preferred_center = ?descriptor.preferred_center,
                     free_text_candidate_count = descriptor.free_text_candidates.len(),
+                    preferred_line_count = ?descriptor.preferred_line_count,
                     selected_size = layout.font_size,
                     selected_width = layout.width,
                     selected_height = layout.height,
@@ -561,6 +583,14 @@ impl TextRenderer {
                     .collect(),
                 font_size: layout.font_size,
                 color,
+                stroke_color: resolved_stroke.map(|stroke| stroke.color),
+                stroke_width: resolved_stroke.map_or(0.0, |stroke| stroke.width_px),
+                line_ranges: layout
+                    .lines
+                    .iter()
+                    .map(|line| (line.range.start, line.range.end))
+                    .collect(),
+                discretionary_hyphens: layout.discretionary_hyphen_count(),
             },
             diagnostics,
         })
@@ -570,240 +600,156 @@ impl TextRenderer {
         &self,
         descriptor: &TextNodeDescriptor,
         template: &TextLayout<'a>,
+        reference: Option<f32>,
+        images: &HashMap<koharu_scene::BlobId, Arc<DecodedImage>>,
     ) -> RenderResult<SelectedTextLayout<'a>> {
-        let mut measured: Vec<MeasuredFreeTextLayout<'a>> =
-            Vec::with_capacity(descriptor.free_text_candidates.len());
-        let mut visual_area_scales = descriptor
+        let candidates = descriptor
             .free_text_candidates
             .iter()
-            .map(|candidate| candidate.translation_visual_area_scale)
-            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .copied()
+            .filter(|candidate| {
+                candidate.bounds.width.is_finite()
+                    && candidate.bounds.width > 0.0
+                    && candidate.bounds.height.is_finite()
+                    && candidate.bounds.height > 0.0
+                    && candidate.maximum_visual_area.is_finite()
+                    && candidate.maximum_visual_area > 0.0
+                    && candidate.translation_visual_area_scale.is_finite()
+                    && candidate.translation_visual_area_scale > 0.0
+            })
             .collect::<Vec<_>>();
-        visual_area_scales.sort_by(f32::total_cmp);
-        visual_area_scales.dedup_by(|left, right| left.to_bits() == right.to_bits());
-        let mut clean_source_candidate = None;
-        for (family_index, visual_area_scale) in visual_area_scales.into_iter().enumerate() {
-            if family_index > 0 {
-                let needs_more_space = measured_free_text_needs_more_space(descriptor, &measured);
-                #[cfg(debug_assertions)]
-                if tracing::enabled!(
-                    target: "koharu_typesetting_probe",
-                    tracing::Level::TRACE
-                ) {
-                    let reference_font_size = measured_free_text_reference_font_size(&measured);
-                    tracing::trace!(
-                        target: "koharu_typesetting_probe",
-                        marker = "free_text_expansion_gate",
-                        entity = %descriptor.entity,
-                        text = descriptor.text.as_str(),
-                        source_font_size = ?descriptor.source_font_size,
-                        minimum_font_size = descriptor.minimum_font_size,
-                        measured_reference_fit = ?reference_font_size,
-                        measured_candidate_count = measured.len(),
-                        next_visual_area_scale = visual_area_scale,
-                        needs_more_space,
-                    );
-                }
-                if !needs_more_space {
-                    break;
-                }
-            }
-            for candidate in descriptor.free_text_candidates.iter().filter(|candidate| {
-                candidate.translation_visual_area_scale.to_bits() == visual_area_scale.to_bits()
-            }) {
-                if candidate.bounds.width <= 0.0
-                    || candidate.bounds.height <= 0.0
-                    || !candidate.maximum_visual_area.is_finite()
-                    || candidate.maximum_visual_area <= 0.0
-                    || !candidate.translation_visual_area_scale.is_finite()
-                    || candidate.translation_visual_area_scale <= 0.0
-                {
-                    continue;
-                }
+        if candidates.is_empty() {
+            return Err(Error::invalid(format!(
+                "free-text candidate set is invalid for entity {}",
+                descriptor.entity,
+            )));
+        }
+
+        let artwork = descriptor
+            .artwork
+            .as_ref()
+            .map(|context| {
+                let source_em = descriptor.source_font_size.ok_or_else(|| {
+                    Error::invalid("artwork-aware lettering requires its source scale")
+                })?;
+                ArtworkField::build(context, images, &candidates, source_em)
+            })
+            .transpose()?;
+
+        let reference = if let Some(reference) = reference {
+            reference
+        } else {
+            // Missing source typography gets one shared reference from the source
+            // footprint. Each expanded rectangle must not invent a larger scale.
+            let source_family = candidates
+                .iter()
+                .map(|candidate| candidate.translation_visual_area_scale)
+                .min_by(f32::total_cmp)
+                .expect("validated candidates are nonempty");
+            let mut reference: Option<f32> = None;
+            for candidate in candidates
+                .iter()
+                .filter(|candidate| candidate.translation_visual_area_scale == source_family)
+            {
                 let (minimum, maximum) = font_size_limits(descriptor, candidate.bounds);
-                let builder = template.clone();
-                let layout = match builder
+                if let Some(layout) = template
                     .run_fitting_with_bounds(
                         &descriptor.text,
                         minimum,
                         maximum,
-                        |font_size| free_text_content_bounds(descriptor, candidate, font_size),
+                        |size| free_text_content_bounds(descriptor, candidate, size),
                         |layout| free_text_layout_fits(descriptor, candidate, layout),
+                        |layout, reference| CompositionQuality {
+                            cost: layout.composition_cost(&descriptor.text, reference),
+                            ..CompositionQuality::default()
+                        },
                     )
                     .map_err(|source| Error::Layout {
                         entity: descriptor.entity,
                         source,
-                    })? {
-                    Some(layout) => layout,
-                    None => {
-                        let (width, height) =
-                            free_text_content_bounds(descriptor, candidate, minimum);
-                        self.layout(
-                            &builder
-                                .clone()
-                                .with_font_size(minimum)
-                                .with_max_width(width.max(0.5))
-                                .with_max_height(height.max(0.5)),
-                            &descriptor.text,
-                        )
-                        .map_err(|source| Error::Layout {
-                            entity: descriptor.entity,
-                            source,
-                        })?
-                    }
-                };
-                let quality_floor = (layout.font_size
-                    - free_text_layout_quality_font_reduction(
-                        &descriptor.text,
-                        layout.font_size,
-                        &layout,
-                    ))
-                .max(minimum);
-                let layout = self.prefer_free_text_quality(
-                    descriptor,
-                    candidate,
-                    &builder,
-                    layout,
-                    minimum,
-                    quality_floor,
-                )?;
-                let fits = free_text_layout_fits(descriptor, candidate, &layout);
-                let hyphens = layout.discretionary_hyphen_count(&descriptor.text);
-                let natural_pauses = layout.natural_pause_break_count(&descriptor.text);
-                let weak_breaks = layout.weak_line_break_count(&descriptor.text);
-                let within_quality_window = layout.font_size + f32::EPSILON
-                    >= maximum
-                        - free_text_quality_font_reduction(&descriptor.text, maximum, hyphens);
-                let is_clean_source_candidate = candidate.source_distance <= f32::EPSILON
-                    && fits
-                    && hyphens == 0
-                    && within_quality_window
-                    && (weak_breaks == 0 || !has_internal_natural_pause(&descriptor.text));
-                measured.push(MeasuredFreeTextLayout {
-                    layout,
-                    candidate: *candidate,
-                    fits,
-                    hyphens,
-                    natural_pauses,
-                    weak_breaks,
-                    quality_floor,
-                });
-                if is_clean_source_candidate {
-                    clean_source_candidate = Some(measured.len() - 1);
+                    })?
+                {
+                    reference =
+                        Some(reference.map_or(layout.font_size, |size| size.max(layout.font_size)));
                 }
             }
-            if family_index == 0
-                && descriptor.preferred_font_size.is_none()
-                && let Some(selected_index) = clean_source_candidate
-                && !measured_free_text_needs_more_space(descriptor, &measured)
-            {
-                #[cfg(debug_assertions)]
-                self.log_free_text_selection(
-                    descriptor,
-                    &measured,
-                    selected_index,
-                    "source_candidate",
-                );
-                return Ok(measured.swap_remove(selected_index).into_selected());
-            }
-        }
-        if measured.is_empty() {
-            return Err(Error::invalid(format!(
-                "free-text candidate set is invalid for entity {}",
-                descriptor.entity
-            )));
-        }
-
-        let largest_candidate = measured
-            .iter()
-            .filter(|candidate| candidate.fits)
-            .max_by(|left, right| left.layout.font_size.total_cmp(&right.layout.font_size));
-        let selected_index = if let Some(largest_candidate) = largest_candidate {
-            let largest = largest_candidate.layout.font_size;
-            let ordinary_quality_floor =
-                largest - free_text_semantic_font_reduction(&descriptor.text, largest);
-            let extended_quality_floor = (largest
-                - free_text_layout_quality_font_reduction(
-                    &descriptor.text,
-                    largest,
-                    &largest_candidate.layout,
-                ))
-            .max(largest_candidate.quality_floor);
-            let ordinary_minimum_hyphens = measured
-                .iter()
-                .filter(|candidate| {
-                    candidate.fits
-                        && candidate.layout.font_size + f32::EPSILON >= ordinary_quality_floor
-                })
-                .map(|candidate| candidate.hyphens)
-                .min()
-                .expect("the largest fitted candidate is ordinarily quality-eligible");
-            let extended_minimum_hyphens = measured
-                .iter()
-                .filter(|candidate| {
-                    candidate.fits
-                        && candidate.layout.font_size + f32::EPSILON >= extended_quality_floor
-                })
-                .map(|candidate| candidate.hyphens)
-                .min()
-                .expect("the largest fitted candidate is extended-quality-eligible");
-            let quality_floor = if extended_minimum_hyphens < ordinary_minimum_hyphens {
-                extended_quality_floor
-            } else {
-                ordinary_quality_floor
-            };
-            let mut eligible = measured
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| {
-                    candidate.fits && candidate.layout.font_size + f32::EPSILON >= quality_floor
-                })
-                .collect::<Vec<_>>();
-            let minimum_hyphens = eligible
-                .iter()
-                .map(|(_, candidate)| candidate.hyphens)
-                .min()
-                .expect("a fitted free-text shape candidate exists");
-            eligible.retain(|(_, candidate)| candidate.hyphens == minimum_hyphens);
-            if has_internal_natural_pause(&descriptor.text) {
-                let maximum_natural_pauses = eligible
-                    .iter()
-                    .map(|(_, candidate)| candidate.natural_pauses)
-                    .max()
-                    .expect("a fitted free-text quality candidate exists");
-                eligible
-                    .retain(|(_, candidate)| candidate.natural_pauses == maximum_natural_pauses);
-                let minimum_weak_breaks = eligible
-                    .iter()
-                    .map(|(_, candidate)| candidate.weak_breaks)
-                    .min()
-                    .expect("a punctuation-aware free-text candidate exists");
-                eligible.retain(|(_, candidate)| candidate.weak_breaks == minimum_weak_breaks);
-            }
-            let largest_eligible_font_size = eligible
-                .iter()
-                .map(|(_, candidate)| candidate.layout.font_size)
-                .max_by(f32::total_cmp)
-                .expect("a fitted semantic-quality candidate exists");
-            let locality_floor = largest_eligible_font_size - FREE_TEXT_LOCALITY_FONT_REDUCTION_MAX;
-            eligible.retain(|(_, candidate)| {
-                candidate.layout.font_size + f32::EPSILON >= locality_floor
-            });
-            eligible
-                .into_iter()
-                .min_by(|(_, left), (_, right)| {
-                    left.candidate
-                        .source_distance
-                        .total_cmp(&right.candidate.source_distance)
-                        .then_with(|| right.layout.font_size.total_cmp(&left.layout.font_size))
-                })
-                .map(|(index, _)| index)
-                .expect("a fitted quality candidate exists")
-        } else {
-            0
+            reference.unwrap_or_else(|| {
+                descriptor
+                    .source_font_size
+                    .unwrap_or_else(|| {
+                        automatic_maximum(
+                            descriptor,
+                            LayoutBox {
+                                x: 0.0,
+                                y: 0.0,
+                                width: descriptor.width,
+                                height: descriptor.height,
+                            },
+                        )
+                    })
+                    .max(descriptor.minimum_font_size)
+            })
         };
+        let builder = template.clone().with_preferred_font_size(reference);
+        let mut measured = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let (minimum, maximum) = font_size_limits(descriptor, candidate.bounds);
+            let layout = match builder
+                .run_fitting_with_bounds(
+                    &descriptor.text,
+                    minimum,
+                    maximum,
+                    |size| free_text_content_bounds(descriptor, &candidate, size),
+                    |layout| free_text_layout_fits(descriptor, &candidate, layout),
+                    |layout, reference| {
+                        free_text_composition_quality(
+                            descriptor,
+                            &candidate,
+                            layout,
+                            reference,
+                            artwork.as_ref(),
+                        )
+                    },
+                )
+                .map_err(|source| Error::Layout {
+                    entity: descriptor.entity,
+                    source,
+                })? {
+                Some(layout) => layout,
+                None => self.layout_free_text_at(descriptor, &candidate, &builder, minimum)?,
+            };
+            measured.push(MeasuredFreeTextLayout {
+                fits: free_text_layout_fits(descriptor, &candidate, &layout),
+                quality: free_text_composition_quality(
+                    descriptor,
+                    &candidate,
+                    &layout,
+                    reference,
+                    artwork.as_ref(),
+                ),
+                layout,
+                candidate,
+            });
+        }
+        let selected_index = measured
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                right
+                    .fits
+                    .cmp(&left.fits)
+                    .then_with(|| left.quality.compare(right.quality))
+                    .then_with(|| right.layout.font_size.total_cmp(&left.layout.font_size))
+                    .then_with(|| {
+                        left.candidate
+                            .translation_visual_area_scale
+                            .total_cmp(&right.candidate.translation_visual_area_scale)
+                    })
+            })
+            .map(|(index, _)| index)
+            .expect("validated candidates are nonempty");
         #[cfg(debug_assertions)]
-        self.log_free_text_selection(descriptor, &measured, selected_index, "quality");
+        self.log_free_text_selection(descriptor, &measured, selected_index, "composition");
         Ok(measured.swap_remove(selected_index).into_selected())
     }
 
@@ -829,16 +775,13 @@ impl TextRenderer {
                     index == selected_index,
                     candidate.layout.font_size,
                     candidate.layout.lines.len(),
-                    candidate.hyphens,
-                    candidate.natural_pauses,
-                    candidate.weak_breaks,
+                    candidate.layout.discretionary_hyphen_count(),
+                    candidate.quality,
                     candidate.fits,
-                    candidate.quality_floor,
                     (
                         candidate.candidate.bounds,
                         candidate.candidate.maximum_visual_area,
                         candidate.candidate.translation_visual_area_scale,
-                        candidate.candidate.source_distance,
                     ),
                     candidate
                         .layout
@@ -864,107 +807,11 @@ impl TextRenderer {
             source_font_size = ?descriptor.source_font_size,
             frame_width = descriptor.width,
             frame_height = descriptor.height,
+            preferred_line_count = ?descriptor.preferred_line_count,
             decision,
             selected_index,
             ?trace,
         );
-    }
-
-    fn prefer_free_text_quality<'a>(
-        &self,
-        descriptor: &TextNodeDescriptor,
-        candidate: &FreeTextCandidate,
-        template: &TextLayout<'a>,
-        mut selected: LayoutRun<'a>,
-        minimum: f32,
-        quality_floor: f32,
-    ) -> RenderResult<LayoutRun<'a>> {
-        let initial_font_size = selected.font_size;
-        let mut selected_hyphens = selected.discretionary_hyphen_count(&descriptor.text);
-        let initial_hyphens = selected_hyphens;
-        let mut selected_pauses = selected.natural_pause_break_count(&descriptor.text);
-        let mut selected_weak_breaks = selected.weak_line_break_count(&descriptor.text);
-        let initial_pauses = selected_pauses;
-        let initial_weak_breaks = selected_weak_breaks;
-        if selected_hyphens == 0
-            && (selected_weak_breaks == 0 || !has_internal_natural_pause(&descriptor.text))
-        {
-            return Ok(selected);
-        }
-
-        let mut next_size = selected.font_size.floor();
-        if (next_size - selected.font_size).abs() <= f32::EPSILON {
-            next_size -= 1.0;
-        }
-        let mut last_checked = selected.font_size;
-        while next_size + f32::EPSILON >= quality_floor.ceil() {
-            let layout = self.layout_free_text_at(descriptor, candidate, template, next_size)?;
-            last_checked = next_size;
-            let hyphens = layout.discretionary_hyphen_count(&descriptor.text);
-            let pauses = layout.natural_pause_break_count(&descriptor.text);
-            let weak_breaks = layout.weak_line_break_count(&descriptor.text);
-            let semantic_improvements = initial_weak_breaks.saturating_sub(weak_breaks)
-                + pauses.saturating_sub(initial_pauses) * 2;
-            let semantic_budget = (semantic_improvements as f32 * 2.0).min(
-                free_text_semantic_font_reduction(&descriptor.text, initial_font_size),
-            );
-            let semantic_trade_is_bounded =
-                layout.font_size + f32::EPSILON >= initial_font_size - semantic_budget;
-            if free_text_layout_fits(descriptor, candidate, &layout)
-                && fragmentation_trade_is_readable(
-                    initial_font_size,
-                    minimum,
-                    initial_hyphens,
-                    layout.font_size,
-                    hyphens,
-                )
-                && (hyphens < selected_hyphens
-                    || (hyphens == selected_hyphens
-                        && semantic_trade_is_bounded
-                        && (weak_breaks < selected_weak_breaks
-                            || (weak_breaks == selected_weak_breaks && pauses > selected_pauses))))
-            {
-                selected = layout;
-                selected_hyphens = hyphens;
-                selected_pauses = pauses;
-                selected_weak_breaks = weak_breaks;
-                if selected_hyphens == 0 && selected_weak_breaks == 0 {
-                    return Ok(selected);
-                }
-            }
-            next_size -= 1.0;
-        }
-        if (last_checked - quality_floor).abs() > f32::EPSILON {
-            let layout =
-                self.layout_free_text_at(descriptor, candidate, template, quality_floor)?;
-            let hyphens = layout.discretionary_hyphen_count(&descriptor.text);
-            let pauses = layout.natural_pause_break_count(&descriptor.text);
-            let weak_breaks = layout.weak_line_break_count(&descriptor.text);
-            let semantic_improvements = initial_weak_breaks.saturating_sub(weak_breaks)
-                + pauses.saturating_sub(initial_pauses) * 2;
-            let semantic_budget = (semantic_improvements as f32 * 2.0).min(
-                free_text_semantic_font_reduction(&descriptor.text, initial_font_size),
-            );
-            let semantic_trade_is_bounded =
-                layout.font_size + f32::EPSILON >= initial_font_size - semantic_budget;
-            if free_text_layout_fits(descriptor, candidate, &layout)
-                && fragmentation_trade_is_readable(
-                    initial_font_size,
-                    minimum,
-                    initial_hyphens,
-                    layout.font_size,
-                    hyphens,
-                )
-                && (hyphens < selected_hyphens
-                    || (hyphens == selected_hyphens
-                        && semantic_trade_is_bounded
-                        && (weak_breaks < selected_weak_breaks
-                            || (weak_breaks == selected_weak_breaks && pauses > selected_pauses))))
-            {
-                selected = layout;
-            }
-        }
-        Ok(selected)
     }
 
     fn layout_free_text_at<'a>(
@@ -1032,29 +879,55 @@ struct MeasuredFreeTextLayout<'a> {
     layout: LayoutRun<'a>,
     candidate: FreeTextCandidate,
     fits: bool,
-    hyphens: usize,
-    natural_pauses: usize,
-    weak_breaks: usize,
-    quality_floor: f32,
+    quality: CompositionQuality,
 }
 
-fn measured_free_text_needs_more_space(
+fn free_text_composition_quality(
     descriptor: &TextNodeDescriptor,
-    measured: &[MeasuredFreeTextLayout<'_>],
-) -> bool {
-    let Some(reference_font_size) = measured_free_text_reference_font_size(measured) else {
-        return true;
-    };
-    reference_font_size
-        <= descriptor.minimum_font_size + quality_font_reduction(reference_font_size) + f32::EPSILON
-}
-
-fn measured_free_text_reference_font_size(measured: &[MeasuredFreeTextLayout<'_>]) -> Option<f32> {
-    measured
-        .iter()
-        .filter(|candidate| candidate.fits)
-        .map(|candidate| candidate.layout.font_size)
-        .max_by(f32::total_cmp)
+    candidate: &FreeTextCandidate,
+    layout: &LayoutRun<'_>,
+    reference: f32,
+    artwork: Option<&ArtworkField>,
+) -> CompositionQuality {
+    let stroke = descriptor
+        .stroke
+        .map_or(0.0, |stroke| {
+            stroke.for_font_size(layout.font_size).width_px
+        })
+        .max(0.0);
+    let source_area = candidate.maximum_visual_area / candidate.translation_visual_area_scale;
+    let painted_area = (layout.width + 2.0 * stroke) * (layout.height + 2.0 * stroke);
+    let excess_area = (painted_area / source_area).max(1.0).ln();
+    let (x, y) = anchored_placement(
+        inset(candidate.bounds, [stroke; 4]),
+        layout.width,
+        layout.height,
+        candidate.preferred_center,
+    );
+    let center = (
+        x + layout.placement_offset_x() + layout.width * 0.5,
+        y + layout.placement_offset_y() + layout.height * 0.5,
+    );
+    let displacement = (center.0 - candidate.preferred_center.0)
+        .hypot(center.1 - candidate.preferred_center.1)
+        / source_area.sqrt();
+    CompositionQuality {
+        requested_lines_error: descriptor
+            .preferred_line_count
+            .map_or(0, |requested| layout.lines.len().abs_diff(requested)),
+        cost: layout.composition_cost(&descriptor.text, reference)
+            + displacement.powi(2)
+            + excess_area.powi(2) * 0.25
+            + artwork.map_or(0.0, |field| {
+                field.cost(LayoutBox {
+                    x: x + layout.placement_offset_x() - stroke,
+                    y: y + layout.placement_offset_y() - stroke,
+                    width: layout.width + stroke * 2.0,
+                    height: layout.height + stroke * 2.0,
+                })
+            }),
+        ..CompositionQuality::default()
+    }
 }
 
 impl<'a> MeasuredFreeTextLayout<'a> {
@@ -1124,6 +997,9 @@ fn readability_minimum(descriptor: &TextNodeDescriptor) -> f32 {
 }
 
 fn font_size_limits(descriptor: &TextNodeDescriptor, bounds: LayoutBox) -> (f32, f32) {
+    if let Some(size) = descriptor.reviewed_font_size {
+        return (size, size);
+    }
     if descriptor.auto_fit {
         let maximum = descriptor
             .font_size
@@ -1260,40 +1136,179 @@ mod tests {
     use crate::fonts::{FontRequest, FontSystem, Fonts};
 
     #[test]
-    fn natural_pause_extends_but_caps_the_free_text_quality_window() {
-        assert_eq!(
-            free_text_quality_font_reduction("Plain words", 20.0, 0),
-            4.0
-        );
-        assert_eq!(
-            free_text_quality_font_reduction("First... Second", 20.0, 0),
-            5.0
-        );
-        assert_eq!(
-            free_text_quality_font_reduction("First~ Second", 40.0, 0),
-            6.0
-        );
-        assert_eq!(
-            free_text_quality_font_reduction("Ne demek♡", 32.0, 1),
-            32.0 / 3.0
-        );
-        assert_eq!(
-            free_text_quality_font_reduction(
-                "One split inside an otherwise much longer caption",
-                40.0,
-                1,
-            ),
-            4.0
-        );
+    fn symbol_size_reference_measures_ink_across_fonts_and_writing_axes() -> Result<()> {
+        let mut system = FontSystem::new();
+        let mut checked = 0;
+        for family in [
+            "DejaVu Sans",
+            "DejaVu Serif",
+            "Liberation Mono",
+            "Arial",
+            "Times New Roman",
+        ] {
+            let Ok(font) = system.query_family(family) else {
+                continue;
+            };
+            for mode in [WritingMode::Horizontal, WritingMode::VerticalRl] {
+                let template = TextLayout::new(&font).with_writing_mode(mode);
+                for text in ["!", "?!", "..."] {
+                    for size in [18.0, 18.5, 36.25, 72.125] {
+                        let original = template.clone().with_font_size(size).run(text)?;
+                        let (left, top, right, bottom) =
+                            template.ink_bounds(size, &original.lines).unwrap();
+                        let area = (right - left) * (bottom - top);
+                        let reference =
+                            FontSizeReference::InkArea(area).resolve(&template, text)?;
+                        assert!(
+                            (reference - size).abs() < 0.01,
+                            "{family} {mode:?} {text:?}: {reference} != {size}"
+                        );
+                        let doubled =
+                            FontSizeReference::InkArea(area * 4.0).resolve(&template, text)?;
+                        assert!((doubled - size * 2.0).abs() < 0.02);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 18, "no supported system font was exercised");
+        Ok(())
     }
 
-    #[test]
-    fn hard_minimum_does_not_buy_a_large_free_text_fragmentation_trade() {
-        assert!(!fragmentation_trade_is_readable(19.0, 12.0, 1, 12.0, 0));
-        assert!(!fragmentation_trade_is_readable(19.0, 12.0, 1, 12.75, 0));
-        assert!(fragmentation_trade_is_readable(15.0, 12.0, 1, 12.0, 0));
-        assert!(fragmentation_trade_is_readable(19.0, 12.0, 1, 13.0, 0));
-        assert!(fragmentation_trade_is_readable(19.0, 12.0, 1, 12.0, 1));
+    #[tokio::test]
+    async fn paragraph_fitting_reserves_the_painted_outline() -> Result<()> {
+        let font = FontSystem::new().first_font().unwrap();
+        let family = font.family_name().to_owned();
+        let fonts = Fonts::new();
+        fonts
+            .prepare(&[FontRequest {
+                family: family.clone(),
+                weight: None,
+                style: None,
+            }])
+            .await?;
+        for mode in [WritingMode::Horizontal, WritingMode::VerticalRl] {
+            let probe = TextLayout::new(&font)
+                .with_writing_mode(mode)
+                .with_font_size(32.0)
+                .run("Lettering")?;
+            let (width, height) = if mode.is_vertical() {
+                (probe.width + 80.0, probe.height + 8.0)
+            } else {
+                (probe.width + 8.0, probe.height + 80.0)
+            };
+            for bubble in [false, true] {
+                let descriptor = TextNodeDescriptor {
+                    entity: EntityId::new(),
+                    text: "Lettering".to_owned(),
+                    text_role: None,
+                    typography_origin: None,
+                    language: None,
+                    width,
+                    height,
+                    balloon_contour: bubble
+                        .then(|| vec![(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]),
+                    flow_contours: Vec::new(),
+                    preferred_center: Some((width * 0.5, height * 0.5)),
+                    free_text_candidates: Vec::new(),
+                    artwork: None,
+                    preferred_line_count: None,
+                    automatic_free_text: false,
+                    preferred_font: Some(family.clone()),
+                    font_families: vec![family.clone()],
+                    font_weight: None,
+                    font_style: None,
+                    font_size: None,
+                    reviewed_font_size: None,
+                    source_font_size: Some(32.0),
+                    font_size_reference: Some(FontSizeReference::CrossLine(32.0)),
+                    minimum_font_size: 12.0,
+                    auto_fit: true,
+                    alignment: TextAlign::Center,
+                    writing_mode: mode,
+                    foreground_color: [0, 0, 0, 255],
+                    stroke: Some(StrokeOptions {
+                        color: [255; 4],
+                        width: StrokeWidth::Absolute(10.0),
+                    }),
+                    allow_discretionary_hyphenation: Some(false),
+                    placement_offset: (0.0, 0.0),
+                    line_height: 1.2,
+                    letter_spacing: 0.0,
+                    word_spacing: 0.0,
+                    text_inset: [0.0; 4],
+                    point_text: false,
+                };
+                for stroke in [
+                    StrokeWidth::Absolute(10.0),
+                    StrokeWidth::FontRelative(0.12),
+                    StrokeWidth::Generated {
+                        width_px: 20.0,
+                        reference_font_size: None,
+                    },
+                ] {
+                    let mut outlined = descriptor.clone();
+                    outlined.stroke.as_mut().unwrap().width = stroke;
+                    let rendered = TextRenderer::new().render_descriptor(
+                        &outlined,
+                        &fonts,
+                        &HashMap::new(),
+                    )?;
+                    assert!(
+                        rendered.diagnostics.is_empty(),
+                        "{mode:?} bubble={bubble} {stroke:?}: {:?}",
+                        rendered.diagnostics
+                    );
+                    let bounds = rendered.local_bounds;
+                    assert!(bounds.x >= 0.0 && bounds.y >= 0.0, "{bounds:?}");
+                    assert!(
+                        bounds.x + bounds.width <= width && bounds.y + bounds.height <= height,
+                        "{bounds:?}"
+                    );
+                }
+
+                let mut unoutlined = descriptor.clone();
+                unoutlined.stroke = None;
+                let plain =
+                    TextRenderer::new().render_descriptor(&unoutlined, &fonts, &HashMap::new())?;
+                unoutlined.stroke = Some(StrokeOptions {
+                    color: [255, 255, 255, 0],
+                    width: StrokeWidth::Absolute(10.0),
+                });
+                let transparent =
+                    TextRenderer::new().render_descriptor(&unoutlined, &fonts, &HashMap::new())?;
+                assert_eq!(transparent.metadata.font_size, plain.metadata.font_size);
+                assert_eq!(transparent.local_bounds, plain.local_bounds);
+                assert_eq!(transparent.metadata.line_ranges, plain.metadata.line_ranges);
+                assert!(transparent.diagnostics.is_empty());
+
+                let mut fixed = descriptor.clone();
+                fixed.auto_fit = false;
+                fixed.font_size = Some(32.0);
+                let authored =
+                    TextRenderer::new().render_descriptor(&fixed, &fonts, &HashMap::new())?;
+                assert_eq!(authored.metadata.font_size, 32.0);
+                assert!(
+                    authored.diagnostics.iter().any(|diagnostic| matches!(
+                        diagnostic,
+                        RenderDiagnostic::TextOverflow { .. }
+                    ))
+                );
+                fixed.auto_fit = true;
+                fixed.font_size = None;
+                fixed.reviewed_font_size = Some(32.0);
+                let reviewed =
+                    TextRenderer::new().render_descriptor(&fixed, &fonts, &HashMap::new())?;
+                assert_eq!(reviewed.metadata.font_size, 32.0);
+                assert!(
+                    reviewed.diagnostics.iter().any(|diagnostic| matches!(
+                        diagnostic,
+                        RenderDiagnostic::TextOverflow { .. }
+                    ))
+                );
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1310,20 +1325,25 @@ mod tests {
             flow_contours: Vec::new(),
             preferred_center: None,
             free_text_candidates: Vec::new(),
+            artwork: None,
+            preferred_line_count: None,
             automatic_free_text: false,
             preferred_font: Some("Arial".to_owned()),
             font_families: vec!["Arial".to_owned()],
             font_weight: None,
             font_style: None,
             font_size: None,
+            reviewed_font_size: None,
             source_font_size: Some(6.0),
-            preferred_font_size: None,
+            font_size_reference: None,
             minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: true,
             alignment: TextAlign::Center,
             writing_mode: WritingMode::Horizontal,
             foreground_color: [0, 0, 0, 255],
             stroke: None,
+            allow_discretionary_hyphenation: None,
+            placement_offset: (0.0, 0.0),
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -1363,6 +1383,10 @@ mod tests {
         authored_maximum.font_size = Some(6.0);
         assert_eq!(font_size_limits(&authored_maximum, bounds), (6.0, 6.0));
 
+        let mut reviewed = descriptor.clone();
+        reviewed.reviewed_font_size = Some(22.5);
+        assert_eq!(font_size_limits(&reviewed, bounds), (22.5, 22.5));
+
         let mut free_paragraph = descriptor.clone();
         free_paragraph.font_size = None;
         assert_eq!(
@@ -1395,16 +1419,54 @@ mod tests {
         render_descriptor.preferred_font = Some(family.clone());
         render_descriptor.font_families = vec![family];
         let rendered = TextRenderer::new()
-            .render_descriptor(&render_descriptor, &fonts)
+            .render_descriptor(&render_descriptor, &fonts, &HashMap::new())
             .unwrap();
         assert!(rendered.metadata.font_size > descriptor.minimum_font_size);
         assert!(rendered.diagnostics.is_empty());
 
         let baseline_size = rendered.metadata.font_size;
+        let mut symbol = render_descriptor.clone();
+        symbol.text = "!".to_owned();
+        symbol.source_font_size = Some(5.0);
+        symbol.font_size_reference = Some(FontSizeReference::InkArea(400.0));
+        let symbol_rendered = TextRenderer::new()
+            .render_descriptor(&symbol, &fonts, &HashMap::new())
+            .unwrap();
+        assert!(symbol_rendered.metadata.font_size > crate::MINIMUM_READABLE_FONT_SIZE);
+        assert!(symbol_rendered.diagnostics.is_empty());
+        symbol.source_font_size = Some(10.0);
+        let same_ink = TextRenderer::new()
+            .render_descriptor(&symbol, &fonts, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            same_ink.metadata.font_size,
+            symbol_rendered.metadata.font_size
+        );
+        symbol.reviewed_font_size = Some(18.5);
+        assert_eq!(
+            TextRenderer::new()
+                .render_descriptor(&symbol, &fonts, &HashMap::new())
+                .unwrap()
+                .metadata
+                .font_size,
+            18.5
+        );
+        symbol.reviewed_font_size = None;
+        symbol.auto_fit = false;
+        symbol.font_size = Some(21.0);
+        assert_eq!(
+            TextRenderer::new()
+                .render_descriptor(&symbol, &fonts, &HashMap::new())
+                .unwrap()
+                .metadata
+                .font_size,
+            21.0
+        );
+
         let mut source_guided = render_descriptor.clone();
-        source_guided.preferred_font_size = Some(30.0);
+        source_guided.font_size_reference = Some(FontSizeReference::CrossLine(30.0));
         let guided = TextRenderer::new()
-            .render_descriptor(&source_guided, &fonts)
+            .render_descriptor(&source_guided, &fonts, &HashMap::new())
             .unwrap();
         assert!(baseline_size - guided.metadata.font_size > 4.0);
         assert!((guided.metadata.font_size - 30.0).abs() < 1.0);
@@ -1415,14 +1477,20 @@ mod tests {
             vec![vec![(0.0, 0.0), (240.0, 0.0), (240.0, 120.0), (0.0, 120.0)]];
         flow_guided.preferred_center = Some((120.0, 60.0));
         let guided_flow = TextRenderer::new()
-            .render_descriptor(&flow_guided, &fonts)
+            .render_descriptor(&flow_guided, &fonts, &HashMap::new())
             .unwrap();
         assert_eq!(guided_flow.metadata.font_size, guided.metadata.font_size);
 
+        source_guided.reviewed_font_size = Some(22.5);
+        let reviewed = TextRenderer::new()
+            .render_descriptor(&source_guided, &fonts, &HashMap::new())
+            .unwrap();
+        assert_eq!(reviewed.metadata.font_size, 22.5);
+        source_guided.reviewed_font_size = None;
         source_guided.auto_fit = false;
         source_guided.font_size = Some(40.0);
         let authored = TextRenderer::new()
-            .render_descriptor(&source_guided, &fonts)
+            .render_descriptor(&source_guided, &fonts, &HashMap::new())
             .unwrap();
         assert_eq!(authored.metadata.font_size, 40.0);
 
@@ -1434,7 +1502,7 @@ mod tests {
         expanded_translation.balloon_contour = None;
         expanded_translation.source_font_size = Some(100.0);
         let rendered = TextRenderer::new()
-            .render_descriptor(&expanded_translation, &fonts)
+            .render_descriptor(&expanded_translation, &fonts, &HashMap::new())
             .unwrap();
         assert!(rendered.metadata.font_size < readability_minimum(&expanded_translation));
         assert!(rendered.diagnostics.iter().any(|diagnostic| matches!(
@@ -1463,7 +1531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expanded_free_text_candidates_activate_only_for_an_emergency_source_fit() {
+    async fn free_text_composition_compares_all_footprints_at_one_contextual_scale() {
         let family = FontSystem::new()
             .first_font()
             .unwrap()
@@ -1487,7 +1555,6 @@ mod tests {
                 bounds,
                 maximum_visual_area,
                 translation_visual_area_scale,
-                source_distance: 1.0,
             }
         };
         let base = candidate(
@@ -1522,20 +1589,25 @@ mod tests {
             flow_contours: Vec::new(),
             preferred_center: None,
             free_text_candidates: vec![base],
+            artwork: None,
+            preferred_line_count: None,
             automatic_free_text: true,
             preferred_font: Some(family.clone()),
             font_families: vec![family],
             font_weight: None,
             font_style: None,
             font_size: None,
+            reviewed_font_size: None,
             source_font_size: None,
-            preferred_font_size: None,
+            font_size_reference: None,
             minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: true,
             alignment: TextAlign::Center,
             writing_mode: WritingMode::Horizontal,
             foreground_color: [0, 0, 0, 255],
             stroke: None,
+            allow_discretionary_hyphenation: None,
+            placement_offset: (0.0, 0.0),
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -1543,26 +1615,32 @@ mod tests {
             point_text: false,
         };
         let renderer = TextRenderer::new();
-        let base_only = renderer.render_descriptor(&descriptor, &fonts).unwrap();
+        let base_only = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
         descriptor.free_text_candidates.push(expanded);
-        let tiered = renderer.render_descriptor(&descriptor, &fonts).unwrap();
+        let tiered = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
         descriptor.free_text_candidates = vec![expanded];
-        let expanded_only = renderer.render_descriptor(&descriptor, &fonts).unwrap();
+        let expanded_only = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
 
         assert_eq!(tiered.metadata.font_size, base_only.metadata.font_size);
         assert!(expanded_only.metadata.font_size > tiered.metadata.font_size);
 
+        descriptor.font_size_reference = Some(FontSizeReference::CrossLine(24.0));
         descriptor.text = "Moderately longer target".to_owned();
         descriptor.free_text_candidates = vec![base];
-        let emergency_base_only = renderer.render_descriptor(&descriptor, &fonts).unwrap();
-        assert!(
-            emergency_base_only.metadata.font_size
-                <= descriptor.minimum_font_size
-                    + quality_font_reduction(emergency_base_only.metadata.font_size)
-                    + f32::EPSILON
-        );
+        let emergency_base_only = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
+        assert!(emergency_base_only.metadata.font_size < 24.0);
         descriptor.free_text_candidates.push(expanded);
-        let emergency_expanded = renderer.render_descriptor(&descriptor, &fonts).unwrap();
+        let emergency_expanded = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
         assert!(emergency_expanded.metadata.font_size > emergency_base_only.metadata.font_size);
 
         descriptor.text = "This target cannot fit inside the tiny source footprint.".to_owned();
@@ -1579,9 +1657,13 @@ mod tests {
             ),
             expanded,
         ];
-        let fallback = renderer.render_descriptor(&descriptor, &fonts).unwrap();
+        let fallback = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
         descriptor.free_text_candidates = vec![expanded];
-        let expanded_only = renderer.render_descriptor(&descriptor, &fonts).unwrap();
+        let expanded_only = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
 
         assert_eq!(
             fallback.metadata.font_size,
@@ -1592,6 +1674,41 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| matches!(diagnostic, RenderDiagnostic::TextOverflow { .. }))
+        );
+
+        let font = FontSystem::new().query_family(descriptor.preferred_font.as_deref().unwrap());
+        let font = font.expect("prepared test font is available");
+        descriptor.text = "Hi".to_owned();
+        let layout = TextLayout::new(&font)
+            .with_font_size(24.0)
+            .run(&descriptor.text)
+            .unwrap();
+        let wide = candidate(
+            LayoutBox {
+                x: -60.0,
+                y: -20.0,
+                width: 120.0,
+                height: 40.0,
+            },
+            4800.0,
+            1.0,
+        );
+        let tall = candidate(
+            LayoutBox {
+                x: -30.0,
+                y: -40.0,
+                width: 60.0,
+                height: 80.0,
+            },
+            4800.0,
+            1.0,
+        );
+        assert!(free_text_layout_fits(&descriptor, &wide, &layout));
+        assert!(free_text_layout_fits(&descriptor, &tall, &layout));
+        assert_eq!(
+            free_text_composition_quality(&descriptor, &wide, &layout, 24.0, None).cost,
+            free_text_composition_quality(&descriptor, &tall, &layout, 24.0, None).cost,
+            "identical painted text must not be penalized for the unused rectangle aspect ratio"
         );
     }
 

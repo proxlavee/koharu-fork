@@ -24,6 +24,7 @@ use crate::{
 
 const HYPHENATION_MIN_WORD_LEN: usize = 5;
 const COMPACT_HYPHENATION_FRAGMENT_LEN: usize = 3;
+const LINE_BREAK_RAGGEDNESS_PENALTY: f32 = 1_000.0;
 const LINE_BREAK_HYPHEN_PENALTY: f32 = 2_000.0;
 const LINE_BREAK_OVERFLOW_MULTIPLIER: f32 = 10_000.0;
 const COMIC_LINE_OVERFLOW_PENALTY: f32 = 1_000_000.0;
@@ -35,16 +36,7 @@ const COMIC_CENTER_ERROR_TOLERANCE_EM: f32 = 0.5;
 const COMIC_CENTER_CONTAINER_TOLERANCE_RATIO: f32 = 0.02;
 const COMIC_CENTER_RASTER_TOLERANCE: f32 = 1.0;
 const COMIC_LINE_RASTER_TOLERANCE: f32 = 0.5;
-const COMIC_CENTER_FONT_REDUCTION_COST: f32 = 1.0;
-const COMIC_ORDINARY_HYPHEN_FONT_REDUCTION_MAX: f32 = 1.0;
 const COMIC_INLINE_WALL_CLEARANCE_GLYPHS: f32 = 0.5;
-const COMIC_QUALITY_FONT_REDUCTION_RATIO: f32 = 0.2;
-const COMIC_QUALITY_FONT_REDUCTION_MIN: f32 = 2.0;
-const COMIC_QUALITY_FONT_REDUCTION_MAX: f32 = 4.0;
-const COMIC_FRAGMENTATION_FONT_REDUCTION_RATIO: f32 = 0.25;
-const COMIC_HIGH_FRAGMENTATION_FONT_REDUCTION_RATIO: f32 = 1.0 / 3.0;
-const COMIC_SINGLE_WORD_FONT_REDUCTION_RATIO: f32 = 0.5;
-const COMIC_HIGH_FRAGMENTATION_WORDS_PER_HYPHEN: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HyphenationPolicy {
@@ -81,6 +73,8 @@ pub struct LayoutLine<'a> {
     pub glyphs: Vec<PositionedGlyph<'a>>,
     /// Range in the original text that this line covers.
     pub range: Range<usize>,
+    /// Suffix actually shaped at this discretionary break, outside the source range.
+    pub break_suffix: Option<LineBreakSuffix>,
     /// Total advance (width for horizontal, height for vertical) of this line.
     pub advance: f32,
     /// Baseline position for this line (x, y).
@@ -99,7 +93,6 @@ pub struct LayoutRun<'a> {
     /// Font size used to generate this layout.
     pub font_size: f32,
     overflowed: bool,
-    emergency_terminal_punctuation: bool,
     placement_offset_x: f32,
     placement_offset_y: f32,
 }
@@ -118,25 +111,178 @@ impl LayoutRun<'_> {
         self.placement_offset_y
     }
 
-    pub(crate) fn discretionary_hyphen_count(&self, text: &str) -> usize {
-        discretionary_hyphen_count(text, &self.lines)
-    }
-
-    pub(crate) fn natural_pause_break_count(&self, text: &str) -> usize {
+    pub(crate) fn discretionary_hyphen_count(&self) -> usize {
         self.lines
             .iter()
-            .take(self.lines.len().saturating_sub(1))
-            .filter(|line| natural_pause_at(text, line.range.end))
+            .filter(|line| line.break_suffix == Some(LineBreakSuffix::Hyphen))
             .count()
     }
 
-    pub(crate) fn weak_line_break_count(&self, text: &str) -> usize {
-        self.lines
-            .len()
-            .saturating_sub(1)
-            .saturating_sub(self.discretionary_hyphen_count(text))
-            .saturating_sub(self.natural_pause_break_count(text))
+    pub(crate) fn composition_cost(&self, text: &str, reference_size: f32) -> f32 {
+        let words = alphanumeric_word_count(text).max(1) as f32;
+        let hyphens = comic_hyphen_quality(text, self);
+        let mut consecutive_hyphens = 0;
+        let mut stranded_punctuation = 0;
+        let mut adjacent_shape = 0.0;
+        let mut automatic_breaks = 0;
+        let mut weak_breaks = 0;
+        let mut terminal_runt = 0.0;
+        for (index, pair) in self.lines.windows(2).enumerate() {
+            if explicit_line_break_between(text, pair) {
+                continue;
+            }
+            automatic_breaks += 1;
+            let continuation = text[pair[1].range.clone()].trim();
+            if !continuation.is_empty()
+                && continuation.chars().all(|character| {
+                    GeneralCategoryGroup::Punctuation
+                        .contains(CodePointMapData::<GeneralCategory>::new().get(character))
+                })
+            {
+                stranded_punctuation += 1;
+            }
+            if pair[0].break_suffix != Some(LineBreakSuffix::Hyphen)
+                && !natural_pause_at(text, pair[0].range.end)
+            {
+                weak_breaks += 1;
+            }
+            let longest = pair[0].advance.max(pair[1].advance);
+            if longest > 0.0 {
+                adjacent_shape += ((pair[0].advance - pair[1].advance) / longest).powi(2);
+            }
+            let paragraph_end = index + 2 == self.lines.len()
+                || explicit_line_break_between(text, &self.lines[index + 1..index + 3]);
+            if paragraph_end && pair[0].advance > 0.0 {
+                let fullness = pair[1].advance / pair[0].advance;
+                terminal_runt += ((0.5 - fullness).max(0.0) / 0.5).powi(2);
+            }
+            if index > 0
+                && pair[0].break_suffix == Some(LineBreakSuffix::Hyphen)
+                && self.lines[index - 1].break_suffix == Some(LineBreakSuffix::Hyphen)
+            {
+                consecutive_hyphens += 1;
+            }
+        }
+        let breaks = automatic_breaks.max(1) as f32;
+        let pause_cost = if has_internal_natural_pause(text) {
+            weak_breaks as f32 / breaks
+        } else {
+            0.0
+        };
+        // An occasional split is a paragraph-level tradeoff. Tiny fragments
+        // and runs of broken words are local reading defects: adding intact
+        // words elsewhere must not make those defects cheaper.
+        font_scale_cost(self.font_size, reference_size)
+            + hyphens.total as f32 / words
+            + (hyphens.compact + consecutive_hyphens + stranded_punctuation) as f32
+            + (adjacent_shape * 0.25 + terminal_runt * 0.5) / breaks
+            + pause_cost * 0.25
     }
+}
+
+fn explicit_line_break_between(text: &str, pair: &[LayoutLine<'_>]) -> bool {
+    text.get(pair[0].range.start..pair[1].range.start)
+        .is_some_and(|span| {
+            span.chars()
+                .any(|ch| matches!(ch, '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'))
+        })
+}
+
+/// Explicit review shape and assigned flow ownership precede aesthetic cost.
+/// Every cost term is nonnegative and dimensionless, including font scale.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompositionQuality {
+    pub(crate) requested_lines_error: usize,
+    pub(crate) outside_owned_center: bool,
+    pub(crate) cost: f32,
+}
+
+impl CompositionQuality {
+    pub(crate) fn compare(self, other: Self) -> std::cmp::Ordering {
+        self.requested_lines_error
+            .cmp(&other.requested_lines_error)
+            .then_with(|| self.outside_owned_center.cmp(&other.outside_owned_center))
+            .then_with(|| self.cost.total_cmp(&other.cost))
+    }
+}
+
+fn font_scale_cost(size: f32, reference: f32) -> f32 {
+    // A scale change is a soft contextual prior, not an exact CJK-to-Latin em
+    // conversion. A twofold change must cost much more than one word split.
+    (16.0 * (f64::from(size) / f64::from(reference)).ln().powi(2)) as f32
+}
+
+fn composition_font_sizes(minimum: f32, maximum: f32, reference: f32) -> Vec<f32> {
+    // Relative samples keep the same composition frontier after image resizing.
+    // Endpoints and the exact contextual scale are never rounded to font pixels.
+    const SAMPLES_PER_OCTAVE: f64 = 64.0;
+    let first =
+        ((f64::from(minimum) / f64::from(reference)).log2() * SAMPLES_PER_OCTAVE).ceil() as i32;
+    let last =
+        ((f64::from(maximum) / f64::from(reference)).log2() * SAMPLES_PER_OCTAVE).floor() as i32;
+    let mut sizes = vec![minimum, maximum, reference.clamp(minimum, maximum)];
+    sizes.extend(
+        (first..=last).map(|step| {
+            (f64::from(reference) * (f64::from(step) / SAMPLES_PER_OCTAVE).exp2()) as f32
+        }),
+    );
+    sizes.retain(|size| *size >= minimum && *size <= maximum);
+    sizes.sort_by(|left, right| {
+        font_scale_cost(*left, reference)
+            .total_cmp(&font_scale_cost(*right, reference))
+            .then_with(|| right.total_cmp(left))
+    });
+    sizes.dedup_by(|left, right| {
+        (*left - *right).abs() <= f32::EPSILON * left.abs().max(right.abs())
+    });
+    sizes
+}
+
+fn search_compositions<'a>(
+    minimum: f32,
+    maximum: f32,
+    reference: f32,
+    mut layout_at: impl FnMut(f32) -> Result<LayoutRun<'a>>,
+    fits: impl Fn(&LayoutRun<'a>) -> bool,
+    quality_at: impl Fn(&LayoutRun<'a>) -> CompositionQuality,
+) -> Result<Option<LayoutRun<'a>>> {
+    anyhow::ensure!(
+        minimum.is_finite()
+            && maximum.is_finite()
+            && reference.is_finite()
+            && minimum > 0.0
+            && maximum >= minimum
+            && reference > 0.0,
+        "invalid composition font-size interval"
+    );
+    let mut selected: Option<(LayoutRun<'a>, CompositionQuality)> = None;
+    for size in composition_font_sizes(minimum, maximum, reference) {
+        if selected.as_ref().is_some_and(|(_, quality)| {
+            quality.requested_lines_error == 0
+                && !quality.outside_owned_center
+                && font_scale_cost(size, reference) > quality.cost
+        }) {
+            // Samples are ordered by the scale lower bound. No unmeasured
+            // candidate can beat this complete score; reflow need not be monotonic.
+            break;
+        }
+        let candidate = layout_at(size)?;
+        if !fits(&candidate) {
+            continue;
+        }
+        let quality = quality_at(&candidate);
+        anyhow::ensure!(
+            quality.cost.is_finite() && quality.cost >= 0.0,
+            "invalid composition quality"
+        );
+        if selected
+            .as_ref()
+            .is_none_or(|(_, current)| quality.compare(*current).is_lt())
+        {
+            selected = Some((candidate, quality));
+        }
+    }
+    Ok(selected.map(|(layout, _)| layout))
 }
 
 #[derive(Clone)]
@@ -146,31 +292,42 @@ struct LineRun<'a> {
 }
 
 #[derive(Clone)]
-struct ShapedBreakSuffix<'a> {
-    runs: Vec<LineRun<'a>>,
-    advance: f32,
-}
-
-#[derive(Clone)]
 struct ShapedSegment<'a> {
     range: Range<usize>,
     visible_end: usize,
     next_offset: usize,
     is_mandatory: bool,
     runs: Vec<LineRun<'a>>,
-    advance: f32,
-    trailing_advance: f32,
     break_penalty: f32,
-    break_suffix: Option<ShapedBreakSuffix<'a>>,
+    break_suffix: Option<LineBreakSuffix>,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LineBreakMeasure {
-    advance: f32,
-    trailing_advance: f32,
-    break_suffix_advance: f32,
+struct BreakPoint {
+    hyphenated: bool,
     break_penalty: f32,
     is_mandatory: bool,
+}
+
+/// Widths belong to complete candidate lines, not additive word fragments.
+/// Rows start at a break opportunity and stop at the next mandatory break.
+struct LineMeasurements {
+    segments: Vec<BreakPoint>,
+    advances: Vec<Vec<f32>>,
+}
+
+impl std::ops::Deref for LineMeasurements {
+    type Target = [BreakPoint];
+
+    fn deref(&self) -> &Self::Target {
+        &self.segments
+    }
+}
+
+impl LineMeasurements {
+    fn advance(&self, start: usize, end: usize) -> f32 {
+        self.advances[start][end - start - 1]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,6 +366,7 @@ struct ComicBalloon {
     contours: Vec<ContourConstraint>,
     minimum_air: f32,
     preferred_center: Option<(f32, f32)>,
+    preferred_line_count: Option<usize>,
     strict_centering: bool,
 }
 
@@ -228,6 +386,7 @@ struct ContourConstraint {
 pub struct TextLayout<'a> {
     writing_mode: WritingMode,
     center_vertical_punctuation: bool,
+    language: Option<harfrust::Language>,
     hyphenation_lang: Option<Lang>,
     hyphenation_policy: HyphenationPolicy,
     comic_balloon: Option<ComicBalloon>,
@@ -245,6 +404,7 @@ pub struct TextLayout<'a> {
     cjk_punctuation_layout: bool,
     natural_line_breaks: bool,
     preferred_font_size: Option<f32>,
+    ink_outset: f32,
 }
 
 fn largest_fitting_font_size<T>(
@@ -325,12 +485,110 @@ fn largest_monotonic_fitting_font_size<T>(
     Ok(Some(best))
 }
 
+/// One paragraph's immutable shaping context is shared by measurement and paint.
+/// Discretionary break opportunities never become shaping boundaries by themselves.
+struct ParagraphShaper<'t, 'a> {
+    layout: &'t TextLayout<'a>,
+    bidi: BidiInfo<'t>,
+    options: ShapingOptions<'t>,
+    fonts: Vec<&'a Font>,
+}
+
+impl<'a> ParagraphShaper<'_, 'a> {
+    fn shape(
+        &self,
+        range: Range<usize>,
+        suffix: Option<LineBreakSuffix>,
+    ) -> Result<Vec<LineRun<'a>>> {
+        let text = self.bidi.text;
+        let bidi_info = &self.bidi;
+        let options = &self.options;
+        let source = &text[range.clone()];
+        let line_text = match suffix {
+            Some(suffix) => std::borrow::Cow::Owned(format!("{source}{}", suffix.as_str())),
+            None => std::borrow::Cow::Borrowed(source),
+        };
+        // Synthetic punctuation participates in the same shaping context as the
+        // final word, but its cluster still points to the source break boundary.
+        let level_at = |offset: usize| {
+            bidi_info
+                .levels
+                .get(range.start + offset.min(source.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or_else(unicode_bidi::Level::ltr)
+        };
+        let shaper = TextShaper::new();
+        let mut runs = Vec::new();
+        let mut characters = line_text
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .peekable();
+        while let Some(start) = characters.next() {
+            let level = level_at(start);
+            let mut end = line_text.len();
+            while let Some(&next) = characters.peek() {
+                if level_at(next) != level {
+                    end = next;
+                    break;
+                }
+                characters.next();
+            }
+            let run_text = &line_text[start..end];
+            let mut run_options = options.clone();
+            run_options.direction = if self.layout.writing_mode.is_vertical() {
+                harfrust::Direction::TopToBottom
+            } else if level.is_rtl() {
+                harfrust::Direction::RightToLeft
+            } else {
+                harfrust::Direction::LeftToRight
+            };
+            let normalized = self
+                .layout
+                .cjk_punctuation_layout
+                .then(|| normalize_cjk_emphasis_punctuation(run_text))
+                .flatten();
+            let shaping_text = normalized
+                .as_ref()
+                .map_or(run_text, |(text, _)| text.as_str());
+            for mut shaped in shape_script_runs(&shaper, shaping_text, &self.fonts, &run_options)? {
+                self.layout.apply_spacing(shaping_text, &mut shaped);
+                if self.layout.writing_mode.is_vertical() && self.layout.center_vertical_punctuation
+                {
+                    self.layout.center_vertical_punctuation(
+                        options.font_size,
+                        shaping_text,
+                        &mut shaped.glyphs,
+                    );
+                }
+                if self.layout.cjk_punctuation_layout {
+                    self.layout.layout_cjk_emphasis_runs(
+                        options.font_size,
+                        shaping_text,
+                        &mut shaped,
+                    );
+                }
+                for glyph in &mut shaped.glyphs {
+                    if let Some((_, map)) = &normalized
+                        && let Some(&cluster) = map.get(glyph.cluster as usize)
+                    {
+                        glyph.cluster = cluster;
+                    }
+                    glyph.cluster += (range.start + start) as u32;
+                }
+                runs.push(LineRun { shaped, level });
+            }
+        }
+        Ok(runs)
+    }
+}
+
 impl<'a> TextLayout<'a> {
     #[must_use]
     pub fn new(font: &'a Font) -> Self {
         Self {
             writing_mode: WritingMode::Horizontal,
             center_vertical_punctuation: true,
+            language: None,
             hyphenation_lang: Some(Lang::English),
             hyphenation_policy: HyphenationPolicy::Normal,
             comic_balloon: None,
@@ -348,6 +606,7 @@ impl<'a> TextLayout<'a> {
             cjk_punctuation_layout: false,
             natural_line_breaks: false,
             preferred_font_size: None,
+            ink_outset: 0.0,
         }
     }
 
@@ -387,7 +646,8 @@ impl<'a> TextLayout<'a> {
     }
 
     #[must_use]
-    pub fn with_hyphenation_language_tag(mut self, tag: &str) -> Self {
+    pub fn with_language_tag(mut self, tag: &str) -> Self {
+        self.language = harfrust::Language::new(tag);
         self.hyphenation_lang = hyphenation_lang_from_tag(tag);
         self
     }
@@ -415,6 +675,7 @@ impl<'a> TextLayout<'a> {
             }],
             minimum_air: minimum_air.max(0.0),
             preferred_center,
+            preferred_line_count: None,
             strict_centering: false,
         });
         self
@@ -444,6 +705,7 @@ impl<'a> TextLayout<'a> {
                 .collect(),
             minimum_air: minimum_air.max(0.0),
             preferred_center,
+            preferred_line_count: None,
             strict_centering: false,
         });
         self
@@ -458,6 +720,13 @@ impl<'a> TextLayout<'a> {
             balloon.preferred_center =
                 (center.0.is_finite() && center.1.is_finite()).then_some(center);
             balloon.strict_centering = strict_centering;
+        }
+        self
+    }
+
+    pub(crate) fn with_comic_preferred_line_count(mut self, line_count: usize) -> Self {
+        if let Some(balloon) = &mut self.comic_balloon {
+            balloon.preferred_line_count = (line_count > 0).then_some(line_count);
         }
         self
     }
@@ -514,20 +783,42 @@ impl<'a> TextLayout<'a> {
             return self.run_with_size(text, font_size);
         }
 
-        self.run_auto(text)
+        self.run_auto(text, |size| self.run_with_size(text, size))
     }
 
-    /// Fits a rectangular layout, honoring a preferred font scale when available.
-    /// The caller supplies the usable content box
-    /// at each size so font-relative paint such as an outline can be reserved
-    /// before wrapping rather than diagnosed after layout.
+    /// The paint owner resolves dilation at each candidate's actual font size.
+    /// Keep it out of stored typography and reserve it before choosing line breaks.
+    pub(crate) fn run_with_ink_outset(
+        &self,
+        text: &str,
+        outset_at: impl Fn(f32) -> f32,
+    ) -> Result<LayoutRun<'a>> {
+        let layout_at = |size| {
+            let mut candidate = self.clone();
+            candidate.ink_outset = outset_at(size);
+            anyhow::ensure!(
+                candidate.ink_outset.is_finite() && candidate.ink_outset >= 0.0,
+                "text ink outset must be finite and nonnegative"
+            );
+            candidate.run_with_size(text, size)
+        };
+        if let Some(size) = self.font_size {
+            layout_at(size)
+        } else {
+            self.run_auto(text, layout_at)
+        }
+    }
+
+    /// Fits against the caller's painted bounds and composition criteria.
+    /// Outline dilation is reserved before wrapping, not diagnosed afterward.
     pub(crate) fn run_fitting_with_bounds(
         &self,
         text: &str,
         minimum: f32,
         maximum: f32,
         bounds_at: impl Fn(f32) -> (f32, f32),
-        fits: impl Fn(&LayoutRun<'_>) -> bool,
+        fits: impl Fn(&LayoutRun<'a>) -> bool,
+        quality_at: impl Fn(&LayoutRun<'a>, f32) -> CompositionQuality,
     ) -> Result<Option<LayoutRun<'a>>> {
         let layout_at = |size| {
             let (width, height) = bounds_at(size);
@@ -537,80 +828,27 @@ impl<'a> TextLayout<'a> {
                 .with_max_height(height.max(0.5))
                 .run(text)
         };
-        let largest = largest_monotonic_fitting_font_size(minimum, maximum, layout_at, &fits)?;
-        self.prefer_font_scale(minimum, largest, layout_at, fits)
+        let reference = match self.preferred_font_size {
+            Some(reference) => reference,
+            None => {
+                let Some(capacity) =
+                    largest_monotonic_fitting_font_size(minimum, maximum, layout_at, &fits)?
+                else {
+                    return Ok(None);
+                };
+                capacity.font_size
+            }
+        };
+        search_compositions(minimum, maximum, reference, layout_at, fits, |layout| {
+            quality_at(layout, reference)
+        })
     }
 
-    fn preferred_size_loss(&self, layout: &LayoutRun<'a>) -> Option<f32> {
-        // Detected typography supplies a contextual scale, not a target ink area.
-        // Matching CJK ink thickness would enlarge a Latin font's shorter capitals;
-        // the target font must retain its own glyph proportions.
-        let preferred = self.preferred_font_size?;
-        let loss = (layout.font_size / preferred).ln().powi(2);
-        loss.is_finite().then_some(loss)
-    }
-
-    fn prefer_font_scale(
+    fn run_auto(
         &self,
-        minimum: f32,
-        largest: Option<LayoutRun<'a>>,
-        mut layout_at: impl FnMut(f32) -> Result<LayoutRun<'a>>,
-        fits: impl Fn(&LayoutRun<'a>) -> bool,
-    ) -> Result<Option<LayoutRun<'a>>> {
-        let Some(mut selected) = largest else {
-            return Ok(None);
-        };
-        let Some(mut selected_loss) = self.preferred_size_loss(&selected) else {
-            return Ok(Some(selected));
-        };
-        if !fits(&selected) {
-            selected_loss = f32::INFINITY;
-        }
-        let preferred = self
-            .preferred_font_size
-            .expect("the preference has a finite loss");
-        let upper = selected.font_size;
-        let exact = layout_at(preferred.clamp(minimum, upper))?;
-        if fits(&exact)
-            && let Some(loss) = self.preferred_size_loss(&exact)
-            && loss < selected_loss
-        {
-            selected = exact;
-            selected_loss = loss;
-        }
-        if selected_loss == 0.0 {
-            return Ok(Some(selected));
-        }
-        // Reflow is non-monotonic: neither the previous line breaks nor a narrow
-        // size neighborhood may exclude a better fit elsewhere in the interval.
-        let mut next = upper.ceil() - 1.0;
-        let mut last = upper;
-        while next >= minimum {
-            let candidate = layout_at(next)?;
-            if fits(&candidate)
-                && let Some(loss) = self.preferred_size_loss(&candidate)
-                && loss < selected_loss
-            {
-                selected = candidate;
-                selected_loss = loss;
-            }
-            last = next;
-            next -= 1.0;
-        }
-        if last > minimum + f32::EPSILON {
-            let candidate = layout_at(minimum)?;
-            if fits(&candidate)
-                && self
-                    .preferred_size_loss(&candidate)
-                    .is_some_and(|loss| loss < selected_loss)
-            {
-                selected = candidate;
-            }
-        }
-        Ok(Some(selected))
-    }
-
-    fn run_auto(&self, text: &str) -> Result<LayoutRun<'a>> {
+        text: &str,
+        layout_at: impl Fn(f32) -> Result<LayoutRun<'a>>,
+    ) -> Result<LayoutRun<'a>> {
         let max_height = self.max_height.unwrap_or(f32::INFINITY);
         let max_width = self.max_width.unwrap_or(f32::INFINITY);
         let maximum = self.max_font_size.unwrap_or(300.0).max(0.5);
@@ -624,622 +862,77 @@ impl<'a> TextLayout<'a> {
                 && layout.width <= max_width + f32::EPSILON
                 && layout.height <= max_height + f32::EPSILON
         };
-
-        if let Some(balloon) = &self.comic_balloon {
-            // A balloon's usable width changes when the text reflows to a different
-            // number of lines, so a smaller font can fail even though a larger one
-            // fits. Search every visible-pixel candidate without assuming that the
-            // contour result is monotonic.
-            let search_maximum = if matches!(
-                self.hyphenation_policy,
-                HyphenationPolicy::Disabled | HyphenationPolicy::LastResort
-            ) {
-                self.comic_rectangular_search_maximum(
-                    text,
-                    minimum,
-                    maximum,
-                    self.hyphenation_policy,
-                )?
-            } else {
-                maximum
-            };
-            let largest = largest_fitting_font_size(
-                minimum,
-                search_maximum,
-                |size| self.run_with_size(text, size),
-                fits,
-            )?;
-            #[cfg(debug_assertions)]
-            if largest.as_ref().is_none_or(|layout| {
-                layout.font_size
-                    <= minimum + quality_font_reduction(layout.font_size) + f32::EPSILON
-            }) && tracing::enabled!(
-                target: "koharu_typesetting_probe",
-                tracing::Level::TRACE
-            ) {
-                let contour_trace = balloon
-                    .contours
-                    .iter()
-                    .map(|contour| {
-                        let bounds = contour.points.iter().fold(
-                            None,
-                            |bounds: Option<(f32, f32, f32, f32)>, &(x, y)| {
-                                Some(bounds.map_or((x, y, x, y), |(left, top, right, bottom)| {
-                                    (left.min(x), top.min(y), right.max(x), bottom.max(y))
-                                }))
-                            },
-                        );
-                        (bounds, contour.air_scale)
-                    })
-                    .collect::<Vec<_>>();
-                let largest_trace = largest.as_ref().map(|layout| {
-                    (
-                        layout.font_size,
-                        layout.width,
-                        layout.height,
-                        layout.lines.len(),
-                        discretionary_hyphen_count(text, &layout.lines),
-                        self.comic_center_error(layout),
-                        layout.overflowed(),
-                        layout
-                            .lines
-                            .iter()
-                            .map(|line| text.get(line.range.clone()).unwrap_or("<invalid>"))
-                            .collect::<Vec<_>>(),
-                    )
-                });
-                tracing::trace!(
-                    target: "koharu_typesetting_probe",
-                    marker = "comic_search",
-                    text,
-                    minimum,
-                    requested_maximum = maximum,
-                    rectangular_search_maximum = search_maximum,
-                    max_width = ?self.max_width,
-                    max_height = ?self.max_height,
-                    balloon_width = balloon.width,
-                    balloon_height = balloon.height,
-                    minimum_air = balloon.minimum_air,
-                    preferred_center = ?balloon.preferred_center,
-                    strict_centering = balloon.strict_centering,
-                    ?contour_trace,
-                    ?largest_trace,
-                );
+        let reference = match self.preferred_font_size {
+            Some(reference) => reference,
+            None => {
+                // Only typography without a contextual source scale uses geometric
+                // capacity as its reference. Contour reflow is not monotonic.
+                let capacity = if self.comic_balloon.is_some() {
+                    let upper = self.comic_rectangular_search_maximum(
+                        text,
+                        minimum,
+                        maximum,
+                        self.hyphenation_policy,
+                    )?;
+                    largest_fitting_font_size(minimum, upper, &layout_at, fits)?
+                } else {
+                    largest_monotonic_fitting_font_size(minimum, maximum, &layout_at, fits)?
+                };
+                let Some(capacity) = capacity else {
+                    return layout_at(minimum);
+                };
+                capacity.font_size
             }
-            let source_selected = self.prefer_font_scale(
-                minimum,
-                largest,
-                |size| self.run_with_size(text, size),
-                |layout| {
-                    fits(layout)
-                        && (!balloon.strict_centering || self.comic_layout_is_centered(layout))
-                },
-            )?;
-            if let Some(best) =
-                self.prefer_centered_comic_layout(text, minimum, source_selected, fits)?
-            {
-                return Ok(best);
-            }
-            return self.run_with_size(text, minimum);
-        }
-
-        if self.preferred_font_size.is_some() {
-            return match self.run_fitting_with_bounds(
-                text,
-                minimum,
-                maximum,
-                |_| (max_width, max_height),
-                fits,
-            )? {
-                Some(layout) => Ok(layout),
-                None => self.run_with_size(text, minimum),
-            };
-        }
-
-        let maximum_layout = self.run_with_size(text, maximum)?;
-        if fits(&maximum_layout) {
-            return Ok(maximum_layout);
-        }
-
-        let mut best = self.run_with_size(text, minimum)?;
-        if !fits(&best) {
-            return Ok(best);
-        }
-
-        let mut low = minimum;
-        let mut high = maximum;
-        let mut iterations = 0u32;
-        while high - low > 0.01 && iterations < 16 {
-            iterations += 1;
-            let size = (low + high) * 0.5;
-            let layout = self.run_with_size(text, size)?;
-            if fits(&layout) {
-                best = layout;
-                low = size;
-            } else {
-                high = size;
-            }
-        }
-        Ok(best)
-    }
-
-    fn prefer_centered_comic_layout(
-        &self,
-        text: &str,
-        minimum: f32,
-        largest: Option<LayoutRun<'a>>,
-        fits: impl Fn(&LayoutRun<'_>) -> bool,
-    ) -> Result<Option<LayoutRun<'a>>> {
-        let Some(largest) = largest else {
-            return Ok(None);
         };
-        if self.comic_center_error(&largest) <= COMIC_CENTER_RASTER_TOLERANCE
-            && discretionary_hyphen_count(text, &largest.lines) == 0
-        {
-            let selected = largest;
-            #[cfg(debug_assertions)]
+        let selected =
+            search_compositions(minimum, maximum, reference, &layout_at, fits, |candidate| {
+                self.composition_quality(text, candidate, reference)
+            })?;
+        #[cfg(debug_assertions)]
+        if let Some(selected) = &selected {
             tracing::trace!(
                 target: "koharu_typesetting_probe",
-                marker = "comic_choice",
-                decision = "centered_clean",
-                text,
-                minimum,
-                largest_size = selected.font_size,
-                largest_lines = selected.lines.len(),
-                largest_hyphens = 0,
-                largest_center_error = self.comic_center_error(&selected),
+                marker = "composition_choice",
+                text, minimum, maximum, reference,
                 selected_size = selected.font_size,
                 selected_lines = selected.lines.len(),
-                selected_hyphens = discretionary_hyphen_count(text, &selected.lines),
-                selected_center_error = self.comic_center_error(&selected),
-                selected_centered = self.comic_layout_is_centered(&selected),
+                quality = ?self.composition_quality(text, selected, reference),
             );
-            #[cfg(debug_assertions)]
-            if tracing::enabled!(
-                target: "koharu_typesetting_probe",
-                tracing::Level::TRACE
-            ) {
-                tracing::trace!(
-                    target: "koharu_typesetting_probe",
-                    marker = "comic_quality",
-                    decision = "centered_clean",
-                    text,
-                    selected_size = selected.font_size,
-                    selected_lines = selected.lines.len(),
-                    selected_center_error = self.comic_center_error(&selected),
-                );
-            }
-            return Ok(Some(selected));
         }
+        match selected {
+            Some(layout) => Ok(layout),
+            None => layout_at(minimum),
+        }
+    }
 
-        // Font size, line breaks, contour capacity, and block position are coupled.
-        // Centering uses only the ordinary small size window. When discretionary
-        // splits dominate a sparse caption, inspect a proportional window as well,
-        // but accept its smaller candidates only when they actually remove a split.
-        // This preserves a large setting when a split is genuinely necessary while
-        // allowing short captions to use another clean line like a letterer would.
-        let largest_hyphens = discretionary_hyphen_count(text, &largest.lines);
-        let ordinary_quality_floor =
-            (largest.font_size - quality_font_reduction(largest.font_size)).max(minimum);
-        let quality_floor = (largest.font_size
-            - fragmentation_quality_font_reduction(text, largest.font_size, largest_hyphens))
-        .max(minimum);
-        let mut next_size = largest.font_size.floor() as i64;
-        if (next_size as f32 - largest.font_size).abs() <= f32::EPSILON {
-            next_size -= 1;
-        }
-        let quality_minimum_whole_size = quality_floor.ceil() as i64;
-        let mut quality_candidates = vec![largest.clone()];
-        let mut last_checked_size = largest.font_size;
-        while next_size >= quality_minimum_whole_size {
-            let candidate = self.run_with_size(text, next_size as f32)?;
-            last_checked_size = next_size as f32;
-            next_size -= 1;
-            if !fits(&candidate) {
-                continue;
-            }
-            quality_candidates.push(candidate);
-        }
-        if (quality_floor - last_checked_size).abs() > f32::EPSILON {
-            let candidate = self.run_with_size(text, quality_floor)?;
-            last_checked_size = quality_floor;
-            if fits(&candidate) {
-                quality_candidates.push(candidate);
-            }
-        }
-
-        let ordinary_candidates = quality_candidates
-            .iter()
-            .filter(|candidate| candidate.font_size + f32::EPSILON >= ordinary_quality_floor)
-            .cloned()
-            .collect::<Vec<_>>();
-        let ordinary_choice = self.preferred_comic_quality(text, minimum, &ordinary_candidates);
-        let extended_choice = self.preferred_comic_quality(text, minimum, &quality_candidates);
-        #[cfg(debug_assertions)]
-        let quality_trace = tracing::enabled!(
-            target: "koharu_typesetting_probe",
-            tracing::Level::TRACE
-        )
-        .then(|| {
-            let summarize = |candidate: &LayoutRun<'_>| {
-                (
-                    candidate.font_size,
-                    candidate.lines.len(),
-                    comic_hyphen_quality(text, candidate),
-                    comic_fragmentation_is_dense(
-                        text,
-                        discretionary_hyphen_count(text, &candidate.lines),
-                    ),
-                    self.comic_center_error(candidate),
-                    self.comic_layout_is_centered(candidate),
-                )
-            };
-            (summarize(&ordinary_choice), summarize(&extended_choice))
-        });
-        let mut quality_choice = if discretionary_hyphen_count(text, &extended_choice.lines)
-            < discretionary_hyphen_count(text, &ordinary_choice.lines)
-        {
-            extended_choice
-        } else {
-            ordinary_choice
+    fn composition_quality(
+        &self,
+        text: &str,
+        layout: &LayoutRun<'_>,
+        reference: f32,
+    ) -> CompositionQuality {
+        let mut quality = CompositionQuality {
+            cost: layout.composition_cost(text, reference),
+            ..CompositionQuality::default()
         };
-        let clean_choice =
-            self.preferred_clean_comic_layout(text, minimum, &largest, &quality_choice, &fits)?;
-        #[cfg(debug_assertions)]
-        let clean_trace = quality_trace.as_ref().map(|_| {
-            clean_choice.as_ref().map(|candidate| {
-                (
-                    candidate.font_size,
-                    candidate.lines.len(),
-                    comic_hyphen_quality(text, candidate),
-                    comic_fragmentation_is_dense(
-                        text,
-                        discretionary_hyphen_count(text, &candidate.lines),
-                    ),
-                    self.comic_center_error(candidate),
-                    self.comic_layout_is_centered(candidate),
-                    candidate
-                        .lines
-                        .iter()
-                        .map(|line| text.get(line.range.clone()).unwrap_or("<invalid>"))
-                        .collect::<Vec<_>>(),
-                )
-            })
-        });
-        if let Some(clean) = clean_choice {
-            quality_choice = clean;
-        }
-
-        #[cfg(debug_assertions)]
-        if let Some((ordinary_trace, extended_trace)) = quality_trace {
-            let clean_trace = clean_trace.flatten();
-            let candidate_trace = quality_candidates
-                .iter()
-                .map(|candidate| {
-                    (
-                        candidate.font_size,
-                        candidate.lines.len(),
-                        comic_hyphen_quality(text, candidate),
-                        comic_fragmentation_is_dense(
-                            text,
-                            discretionary_hyphen_count(text, &candidate.lines),
-                        ),
-                        self.comic_center_error(candidate),
-                        self.comic_layout_is_centered(candidate),
-                        candidate
-                            .lines
-                            .iter()
-                            .map(|line| text.get(line.range.clone()).unwrap_or("<invalid>"))
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let strict_centering = self.comic_balloon.as_ref().is_some_and(|balloon| {
-                balloon.preferred_center.is_some() && balloon.strict_centering
-            });
-            tracing::trace!(
-                target: "koharu_typesetting_probe",
-                marker = "comic_quality",
-                decision = "quality",
-                text,
-                minimum,
-                largest_size = largest.font_size,
-                largest_lines = largest.lines.len(),
-                largest_hyphens,
-                largest_center_error = self.comic_center_error(&largest),
-                ordinary_quality_floor,
-                quality_floor,
-                ?ordinary_trace,
-                ?extended_trace,
-                ?clean_trace,
-                selected_size = quality_choice.font_size,
-                selected_lines = quality_choice.lines.len(),
-                selected_hyphens = discretionary_hyphen_count(text, &quality_choice.lines),
-                selected_center_error = self.comic_center_error(&quality_choice),
-                strict_centering,
-                ?candidate_trace,
-            );
-        }
-
-        let centering_fallback_required = !self.comic_layout_is_centered(&quality_choice)
-            && self.comic_balloon.as_ref().is_some_and(|balloon| {
-                balloon.preferred_center.is_some() && balloon.strict_centering
-            });
-        if centering_fallback_required {
-            // The assigned flow's usable body owns its center. Search below the
-            // ordinary quality window if a larger setting is displaced within that
-            // cell; retain the readable choice if no centered fit exists.
-            let minimum_whole_size = minimum.ceil() as i64;
-            let mut found_centered = false;
-            while next_size >= minimum_whole_size {
-                let candidate = self.run_with_size(text, next_size as f32)?;
-                last_checked_size = next_size as f32;
-                next_size -= 1;
-                if fits(&candidate) && self.comic_layout_is_centered(&candidate) {
-                    quality_choice = candidate;
-                    found_centered = true;
-                    break;
-                }
-            }
-            if !found_centered && (minimum - last_checked_size).abs() > f32::EPSILON {
-                let candidate = self.run_with_size(text, minimum)?;
-                if fits(&candidate) && self.comic_layout_is_centered(&candidate) {
-                    quality_choice = candidate;
-                }
-            }
-        }
-
-        #[cfg(debug_assertions)]
-        let decision =
-            if centering_fallback_required && self.comic_layout_is_centered(&quality_choice) {
-                "flow_centering"
+        if let Some(balloon) = &self.comic_balloon {
+            quality.requested_lines_error = balloon
+                .preferred_line_count
+                .map_or(0, |requested| layout.lines.len().abs_diff(requested));
+            quality.outside_owned_center = balloon.strict_centering
+                && balloon.preferred_center.is_some()
+                && !self.comic_layout_is_centered(layout);
+            let block_extent = if self.writing_mode.is_vertical() {
+                balloon.width
             } else {
-                "quality"
+                balloon.height
             };
-        #[cfg(debug_assertions)]
-        tracing::trace!(
-            target: "koharu_typesetting_probe",
-            marker = "comic_choice",
-            decision,
-            text,
-            minimum,
-            largest_size = largest.font_size,
-            largest_lines = largest.lines.len(),
-            largest_hyphens,
-            largest_center_error = self.comic_center_error(&largest),
-            ordinary_quality_floor,
-            extended_quality_floor = quality_floor,
-            selected_size = quality_choice.font_size,
-            selected_lines = quality_choice.lines.len(),
-            selected_hyphens = discretionary_hyphen_count(text, &quality_choice.lines),
-            selected_center_error = self.comic_center_error(&quality_choice),
-            selected_centered = self.comic_layout_is_centered(&quality_choice),
-        );
-
-        Ok(Some(quality_choice))
-    }
-
-    fn preferred_clean_comic_layout(
-        &self,
-        text: &str,
-        minimum: f32,
-        largest: &LayoutRun<'a>,
-        hyphenated: &LayoutRun<'a>,
-        fits: &impl Fn(&LayoutRun<'_>) -> bool,
-    ) -> Result<Option<LayoutRun<'a>>> {
-        let discretionary_hyphens = discretionary_hyphen_count(text, &hyphenated.lines);
-        if discretionary_hyphens == 0 || !comic_fragmentation_is_dense(text, discretionary_hyphens)
-        {
-            return Ok(None);
+            let comfortable_error = block_extent * COMIC_CENTER_CONTAINER_TOLERANCE_RATIO;
+            quality.cost += ((self.comic_center_error(layout) - comfortable_error).max(0.0)
+                / layout.font_size)
+                .powi(2);
         }
-
-        let quality_trade_floor = minimum + COMIC_QUALITY_FONT_REDUCTION_MAX;
-        if hyphenated.font_size + f32::EPSILON < quality_trade_floor {
-            // The minimum is an emergency feasibility boundary. Once the fitted
-            // composition is already in that band, do not make it still smaller
-            // merely to remove a discretionary split.
-            return Ok(None);
-        }
-
-        // A fixed-size LastResort layout already exhausts every legal whole-word
-        // line count before it introduces a discretionary split. The missing
-        // frontier is therefore cross-size: search the complete visually acceptable
-        // range with hyphenation disabled, rather than assuming the first large fit
-        // is the only candidate worth composing.
-        // Measure the clean-word trade against the composition that would
-        // actually be painted. The largest geometric fit can already have been
-        // rejected for centering, locality, or fragmentation; using it as the
-        // quality reference double-counts that rejection and can exclude a clean
-        // candidate that is only modestly smaller than the selected layout.
-        // Candidate search advances in visible whole-pixel steps, so round the
-        // proportional boundary down rather than rejecting the next pixel by a
-        // fractional remainder.
-        let quality_reference = hyphenated.font_size;
-        let quality_floor = (quality_reference
-            - whole_word_quality_font_reduction(text, quality_reference, hyphenated))
-        .max(minimum)
-        .max(quality_trade_floor)
-        .floor()
-        .max(minimum);
-        if quality_floor + f32::EPSILON >= largest.font_size {
-            return Ok(None);
-        }
-
-        let mut clean_layout = self.clone();
-        clean_layout.hyphenation_policy = HyphenationPolicy::Disabled;
-        let accepted_center_error = self
-            .comic_center_error_em(hyphenated)
-            .max(COMIC_CENTER_ERROR_TOLERANCE_EM);
-        let preserve_centering = self
-            .comic_balloon
-            .as_ref()
-            .is_some_and(|balloon| balloon.preferred_center.is_some())
-            && self.comic_layout_is_centered(hyphenated);
-        let ordinary_quality_floor =
-            (hyphenated.font_size - quality_font_reduction(hyphenated.font_size)).max(minimum);
-
-        largest_fitting_font_size(
-            quality_floor,
-            largest.font_size,
-            |size| clean_layout.run_with_size(text, size),
-            |candidate| {
-                fits(candidate)
-                    && discretionary_hyphen_count(text, &candidate.lines) == 0
-                    // The hard minimum is a last-resort fit boundary, not an
-                    // aesthetic budget for eliminating a discretionary split.
-                    // At that boundary, prefer the larger readable composition
-                    // unless the clean layout remains within the ordinary quality
-                    // window as well.
-                    && (candidate.font_size > minimum + f32::EPSILON
-                        || candidate.font_size + f32::EPSILON >= ordinary_quality_floor)
-                    && self.comic_center_error_em(candidate) <= accepted_center_error + f32::EPSILON
-                    && (!preserve_centering || self.comic_layout_is_centered(candidate))
-            },
-        )
-    }
-
-    fn preferred_comic_quality(
-        &self,
-        text: &str,
-        minimum: f32,
-        candidates: &[LayoutRun<'a>],
-    ) -> LayoutRun<'a> {
-        let largest = candidates
-            .iter()
-            .max_by(|left, right| left.font_size.total_cmp(&right.font_size))
-            .expect("comic quality selection requires a fitted candidate");
-        let quality_trade_floor = minimum + COMIC_QUALITY_FONT_REDUCTION_MAX;
-        // Centering can narrow the comfortable-size frontier. When every fit is
-        // already in the emergency band, however, anchor tolerance to the largest
-        // candidate so a soft position hint cannot force another aesthetic shrink.
-        let accepted_error = candidates
-            .iter()
-            .filter(|candidate| candidate.font_size + f32::EPSILON >= quality_trade_floor)
-            .map(|candidate| self.comic_center_error_em(candidate))
-            .min_by(f32::total_cmp)
-            .unwrap_or_else(|| self.comic_center_error_em(largest))
-            .max(COMIC_CENTER_ERROR_TOLERANCE_EM);
-        let requires_centering = self
-            .comic_balloon
-            .as_ref()
-            .is_some_and(|balloon| balloon.preferred_center.is_some() && balloon.strict_centering);
-        let has_centered = requires_centering
-            && candidates
-                .iter()
-                .any(|candidate| self.comic_layout_is_centered(candidate));
-        let mut eligible = candidates
-            .iter()
-            .filter(|candidate| {
-                (!has_centered || self.comic_layout_is_centered(candidate))
-                    && self.comic_center_error_em(candidate) <= accepted_error + f32::EPSILON
-            })
-            .collect::<Vec<_>>();
-        if eligible
-            .iter()
-            .any(|candidate| candidate.font_size + f32::EPSILON >= quality_trade_floor)
-        {
-            // Keep aesthetic line-break and centering trades out of the emergency
-            // feasibility band whenever a comfortably readable fit exists.
-            eligible.retain(|candidate| candidate.font_size + f32::EPSILON >= quality_trade_floor);
-        } else {
-            // If geometry itself permits only an emergency-size composition, keep
-            // the largest fit instead of shrinking it further for cleaner breaks.
-            let largest_emergency_size = eligible
-                .iter()
-                .map(|candidate| candidate.font_size)
-                .max_by(f32::total_cmp)
-                .expect("eligible comic candidates are non-empty");
-            eligible.retain(|candidate| {
-                (candidate.font_size - largest_emergency_size).abs() <= f32::EPSILON
-            });
-        }
-        if !eligible
-            .iter()
-            .any(|candidate| discretionary_hyphen_count(text, &candidate.lines) == 0)
-            && eligible
-                .iter()
-                .max_by(|left, right| left.font_size.total_cmp(&right.font_size))
-                .is_some_and(|candidate| candidate.emergency_terminal_punctuation)
-        {
-            // Moving a mixed terminal-punctuation run (for example, `...!!`) onto
-            // its own line is already an emergency feasibility concession. Do not
-            // then compound it with a large font reduction merely to remove one of
-            // several remaining discretionary word splits.
-            let largest_partial_size = eligible
-                .iter()
-                .map(|candidate| candidate.font_size)
-                .max_by(f32::total_cmp)
-                .expect("eligible comic candidates are non-empty");
-            eligible.retain(|candidate| {
-                candidate.font_size + COMIC_ORDINARY_HYPHEN_FONT_REDUCTION_MAX + f32::EPSILON
-                    >= largest_partial_size
-            });
-        }
-        eligible.sort_by(|left, right| right.font_size.total_cmp(&left.font_size));
-
-        // Walk the Pareto frontier from largest to cleanest. An ordinary
-        // discretionary split may buy one visible font pixel, with the ordinary
-        // quality window acting as a total cap. Dense fragmentation or multiple
-        // compact fragments keep the proportional partial-cleanup budget. A single
-        // compact improvement while other splits remain does not justify a
-        // multi-pixel reduction; a fully clean candidate is evaluated separately
-        // by the whole-word frontier below.
-        let mut preferred = eligible[0];
-        for candidate in eligible.iter().copied().skip(1) {
-            let current_quality = comic_hyphen_quality(text, preferred);
-            let candidate_quality = comic_hyphen_quality(text, candidate);
-            if candidate_quality >= current_quality {
-                continue;
-            }
-            let size_reduction = preferred.font_size - candidate.font_size;
-            let reduction_budget = if current_quality.compact >= 2
-                || comic_fragmentation_is_dense(text, current_quality.total)
-            {
-                whole_word_quality_font_reduction(text, preferred.font_size, preferred)
-            } else {
-                quality_font_reduction(preferred.font_size).min(
-                    current_quality
-                        .total
-                        .saturating_sub(candidate_quality.total) as f32
-                        * COMIC_ORDINARY_HYPHEN_FONT_REDUCTION_MAX,
-                )
-            };
-            if size_reduction <= reduction_budget + f32::EPSILON {
-                preferred = candidate;
-            }
-        }
-
-        let preferred_quality = comic_hyphen_quality(text, preferred);
-        let equally_readable = eligible
-            .iter()
-            .copied()
-            .filter(|candidate| comic_hyphen_quality(text, candidate) == preferred_quality)
-            .filter(|candidate| candidate.font_size <= preferred.font_size + f32::EPSILON)
-            .collect::<Vec<_>>();
-        let largest_equally_readable = equally_readable[0];
-        if self.comic_center_error_is_comfortable(largest_equally_readable) {
-            return largest_equally_readable.clone();
-        }
-        let best_centered = equally_readable
-            .iter()
-            .copied()
-            .min_by(|left, right| {
-                self.comic_center_quality(left, largest_equally_readable.font_size)
-                    .total_cmp(
-                        &self.comic_center_quality(right, largest_equally_readable.font_size),
-                    )
-                    .then_with(|| right.font_size.total_cmp(&left.font_size))
-            })
-            .expect("eligible comic candidates are non-empty");
-        if self.comic_center_quality(best_centered, largest_equally_readable.font_size)
-            + COMIC_CENTER_RASTER_TOLERANCE
-            <= self
-                .comic_center_quality(largest_equally_readable, largest_equally_readable.font_size)
-        {
-            best_centered.clone()
-        } else {
-            largest_equally_readable.clone()
-        }
+        quality
     }
 
     fn comic_layout_is_centered(&self, layout: &LayoutRun<'_>) -> bool {
@@ -1253,20 +946,6 @@ impl<'a> TextLayout<'a> {
         self.comic_center_error(layout) / layout.font_size.max(0.5)
     }
 
-    fn comic_center_error_is_comfortable(&self, layout: &LayoutRun<'_>) -> bool {
-        let balloon = self
-            .comic_balloon
-            .as_ref()
-            .expect("comic centeredness requires a balloon");
-        let block_extent = if self.writing_mode.is_vertical() {
-            balloon.width
-        } else {
-            balloon.height
-        };
-        self.comic_center_error(layout)
-            <= block_extent * COMIC_CENTER_CONTAINER_TOLERANCE_RATIO + COMIC_CENTER_RASTER_TOLERANCE
-    }
-
     fn comic_center_error(&self, layout: &LayoutRun<'_>) -> f32 {
         let balloon = self
             .comic_balloon
@@ -1278,11 +957,6 @@ impl<'a> TextLayout<'a> {
         );
         let preferred = balloon.center();
         (actual.0 - preferred.0).hypot(actual.1 - preferred.1)
-    }
-
-    fn comic_center_quality(&self, layout: &LayoutRun<'_>, largest_font_size: f32) -> f32 {
-        self.comic_center_error(layout)
-            + (largest_font_size - layout.font_size).max(0.0) * COMIC_CENTER_FONT_REDUCTION_COST
     }
 
     fn comic_rectangular_search_maximum(
@@ -1350,6 +1024,7 @@ impl<'a> TextLayout<'a> {
             // This is only a capacity upper bound. Using the irregular body's
             // off-center axis here would understate the rectangle's usable width.
             preferred_center: None,
+            preferred_line_count: balloon.preferred_line_count,
             strict_centering: false,
         });
         let max_width = self.max_width.unwrap_or(f32::INFINITY);
@@ -1367,7 +1042,7 @@ impl<'a> TextLayout<'a> {
         )?
         .map_or(minimum, |layout| layout.font_size.ceil());
         #[cfg(debug_assertions)]
-        if upper <= minimum + quality_font_reduction(upper) + f32::EPSILON
+        if upper <= minimum + f32::EPSILON
             && tracing::enabled!(
                 target: "koharu_typesetting_probe",
                 tracing::Level::TRACE
@@ -1383,9 +1058,7 @@ impl<'a> TextLayout<'a> {
                         layout.as_ref().map(|layout| layout.width),
                         layout.as_ref().map(|layout| layout.height),
                         layout.as_ref().map(|layout| layout.lines.len()),
-                        layout
-                            .as_ref()
-                            .map(|layout| discretionary_hyphen_count(text, &layout.lines)),
+                        layout.as_ref().map(LayoutRun::discretionary_hyphen_count),
                         layout.as_ref().map(LayoutRun::overflowed),
                         layout.as_ref().map(|layout| {
                             layout
@@ -1416,11 +1089,9 @@ impl<'a> TextLayout<'a> {
 
     fn run_with_size(&self, text: &str, font_size: f32) -> Result<LayoutRun<'a>> {
         if self.hyphenation_policy == HyphenationPolicy::LastResort {
-            // Hyphenation changes segmentation before shaping. Merely forbidding
-            // discretionary break suffixes afterward can still lose cross-fragment
-            // shaping and make LastResort fit worse than Disabled. Shape the clean
-            // text first, then introduce hyphenation only when that exact layout
-            // overflows.
+            // LastResort keeps intact words whenever that layout fits. Starting
+            // with the smaller, word-only frontier also avoids measuring unused
+            // discretionary candidates for ordinary dialogue.
             let mut clean = self.clone();
             clean.hyphenation_policy = HyphenationPolicy::Disabled;
             let clean = clean.run_with_size(text, font_size)?;
@@ -1453,7 +1124,6 @@ impl<'a> TextLayout<'a> {
         font_size: f32,
         emergency_terminal_punctuation: bool,
     ) -> Result<LayoutRun<'a>> {
-        let shaper = TextShaper::new();
         let mut line_breaker = LineBreaker::new();
         if !self.writing_mode.is_vertical()
             && self.hyphenation_policy != HyphenationPolicy::Disabled
@@ -1490,6 +1160,7 @@ impl<'a> TextLayout<'a> {
         let options = ShapingOptions {
             direction,
             script,
+            language: self.language.as_ref(),
             font_size,
             features: if self.writing_mode.is_vertical() {
                 &[
@@ -1510,148 +1181,29 @@ impl<'a> TextLayout<'a> {
         let mut fonts: Vec<&Font> = Vec::with_capacity(1 + self.fallback_fonts.len());
         fonts.push(self.font);
         fonts.extend(self.fallback_fonts.iter());
-
-        let shape_break_suffix = |suffix: LineBreakSuffix,
-                                  level: unicode_bidi::Level,
-                                  cluster: usize|
-         -> Result<ShapedBreakSuffix<'a>> {
-            let mut suffix_options = options.clone();
-            suffix_options.direction = if level.is_rtl() {
-                harfrust::Direction::RightToLeft
-            } else {
-                harfrust::Direction::LeftToRight
-            };
-
-            let mut runs = Vec::new();
-            let mut advance = 0.0f32;
-            for mut shaped in shape_script_runs(&shaper, suffix.as_str(), &fonts, &suffix_options)?
-            {
-                for glyph in &mut shaped.glyphs {
-                    glyph.cluster += cluster as u32;
-                }
-                advance += shaped.x_advance.abs();
-                runs.push(LineRun { shaped, level });
-            }
-
-            Ok(ShapedBreakSuffix { runs, advance })
+        let shaper = ParagraphShaper {
+            layout: self,
+            bidi: bidi_info,
+            options,
+            fonts,
         };
 
         let mut shaped_segments = Vec::new();
         for segment in line_breaker.line_segments(text) {
-            let segment_text = &text[segment.range.clone()];
-            let visible_end = segment.range.start + segment_text.trim_end().len();
-
-            let mut segment_runs = Vec::new();
-            let mut segment_advance = 0.0f32;
-
-            if !segment_text.is_empty() {
-                // Subdivide segment into constant BiDi level runs.
-                let mut char_indices = segment_text
-                    .char_indices()
-                    .map(|(id, _)| segment.range.start + id)
-                    .peekable();
-
-                while let Some(run_start) = char_indices.next() {
-                    let level = bidi_info.levels[run_start];
-                    let mut run_end = segment.range.end;
-
-                    while let Some(&next_char_start) = char_indices.peek() {
-                        if bidi_info.levels[next_char_start] != level {
-                            run_end = next_char_start;
-                            break;
-                        }
-                        char_indices.next();
-                    }
-
-                    let run_text = &text[run_start..run_end];
-                    let mut run_options = options.clone();
-                    run_options.direction = if self.writing_mode.is_vertical() {
-                        harfrust::Direction::TopToBottom
-                    } else if level.is_rtl() {
-                        harfrust::Direction::RightToLeft
-                    } else {
-                        harfrust::Direction::LeftToRight
-                    };
-
-                    let normalized_punctuation = self
-                        .cjk_punctuation_layout
-                        .then(|| normalize_cjk_emphasis_punctuation(run_text))
-                        .flatten();
-                    let shaping_text = normalized_punctuation
-                        .as_ref()
-                        .map_or(run_text, |(text, _)| text.as_str());
-                    let script_runs =
-                        shape_script_runs(&shaper, shaping_text, &fonts, &run_options)?;
-                    for mut shaped in script_runs {
-                        self.apply_spacing(shaping_text, &mut shaped);
-                        if self.writing_mode.is_vertical() && self.center_vertical_punctuation {
-                            self.center_vertical_punctuation(
-                                font_size,
-                                shaping_text,
-                                &mut shaped.glyphs,
-                            );
-                        }
-                        if self.cjk_punctuation_layout {
-                            self.layout_cjk_emphasis_runs(font_size, shaping_text, &mut shaped);
-                        }
-                        if let Some((_, cluster_map)) = &normalized_punctuation {
-                            for glyph in &mut shaped.glyphs {
-                                if let Some(&source_cluster) =
-                                    cluster_map.get(glyph.cluster as usize)
-                                {
-                                    glyph.cluster = source_cluster;
-                                }
-                            }
-                        }
-
-                        for glyph in &mut shaped.glyphs {
-                            glyph.cluster += run_start as u32;
-                        }
-
-                        segment_advance += if self.writing_mode.is_vertical() {
-                            shaped.y_advance.abs()
-                        } else {
-                            shaped.x_advance.abs()
-                        };
-
-                        segment_runs.push(LineRun { shaped, level });
-                    }
-                }
-            }
-            let segment_break_suffix = if let (Some(suffix), Some(level)) =
-                (segment.break_suffix, segment_runs.last().map(|r| r.level))
-            {
-                Some(shape_break_suffix(suffix, level, segment.range.end)?)
-            } else {
-                None
-            };
-
-            let trailing_advance = segment_runs
-                .iter()
-                .flat_map(|run| &run.shaped.glyphs)
-                .filter(|glyph| glyph.cluster as usize >= visible_end)
-                .map(|glyph| {
-                    if self.writing_mode.is_vertical() {
-                        glyph.y_advance.abs()
-                    } else {
-                        glyph.x_advance.abs()
-                    }
-                })
-                .sum();
+            let visible_end = segment.range.start + text[segment.range.clone()].trim_end().len();
+            let runs = shaper.shape(segment.range.clone(), None)?;
             shaped_segments.push(ShapedSegment {
                 range: segment.range,
                 visible_end,
                 next_offset: segment.next_offset,
                 is_mandatory: segment.is_mandatory,
-                runs: segment_runs,
-                advance: segment_advance,
-                trailing_advance,
+                runs,
                 break_penalty: if self.comic_balloon.is_some() || self.natural_line_breaks {
                     natural_break_penalty(text, segment.next_offset)
                 } else {
                     0.0
                 },
-                break_suffix: segment_break_suffix,
+                break_suffix: segment.break_suffix,
             });
         }
 
@@ -1687,6 +1239,13 @@ impl<'a> TextLayout<'a> {
                 }
             });
 
+        // Scan curved walls over the whole painted band, not only the fill.
+        // The outline is physical ink, separate from aesthetic wall clearance.
+        let line_ink = InkBand {
+            before: line_ink.before + self.ink_outset,
+            after: line_ink.after + self.ink_outset,
+        };
+
         let mut lines: Vec<LayoutLine<'a>> = Vec::new();
         let mut line_profiles = Vec::new();
         let mut contour_overflowed = false;
@@ -1694,6 +1253,7 @@ impl<'a> TextLayout<'a> {
         let mut line_offset = 0usize;
         if self.comic_balloon.is_some() {
             (contour_overflowed, contour_profiled) = self.append_balanced_segment_lines(
+                &shaper,
                 &shaped_segments,
                 &mut line_offset,
                 text.len(),
@@ -1703,10 +1263,9 @@ impl<'a> TextLayout<'a> {
                 line_ink,
                 balloon_air_x,
                 balloon_air_y,
-                &bidi_info,
                 &mut lines,
                 &mut line_profiles,
-            );
+            )?;
         } else {
             let mut paragraph_start = 0usize;
             for (index, segment) in shaped_segments.iter().enumerate() {
@@ -1715,6 +1274,7 @@ impl<'a> TextLayout<'a> {
                 }
                 contour_overflowed |= self
                     .append_balanced_segment_lines(
+                        &shaper,
                         &shaped_segments[paragraph_start..=index],
                         &mut line_offset,
                         segment.next_offset,
@@ -1724,16 +1284,16 @@ impl<'a> TextLayout<'a> {
                         line_ink,
                         balloon_air_x,
                         balloon_air_y,
-                        &bidi_info,
                         &mut lines,
                         &mut line_profiles,
-                    )
+                    )?
                     .0;
                 paragraph_start = index + 1;
             }
             if paragraph_start < shaped_segments.len() {
                 contour_overflowed |= self
                     .append_balanced_segment_lines(
+                        &shaper,
                         &shaped_segments[paragraph_start..],
                         &mut line_offset,
                         text.len(),
@@ -1743,10 +1303,9 @@ impl<'a> TextLayout<'a> {
                         line_ink,
                         balloon_air_x,
                         balloon_air_y,
-                        &bidi_info,
                         &mut lines,
                         &mut line_profiles,
-                    )
+                    )?
                     .0;
             }
         }
@@ -1783,7 +1342,13 @@ impl<'a> TextLayout<'a> {
         }
 
         if effective_alignment == TextAlign::Justify && !self.writing_mode.is_vertical() {
-            justify_lines(text, &mut lines, max_extent, &line_profiles);
+            justify_lines(
+                text,
+                &mut lines,
+                max_extent,
+                &line_profiles,
+                self.ink_outset,
+            );
         }
 
         // Alignment is an inline-axis operation inside one intrinsic text block. Balloon
@@ -1828,17 +1393,18 @@ impl<'a> TextLayout<'a> {
             }
         }
 
-        if contour_overflowed
-            && contour_profiled
-            && let Some((_, _, inline_center, _)) = inline_box
-            && self.painted_lines_fit_profiles(font_size, &lines, &line_profiles, inline_center)
-        {
-            contour_overflowed = false;
+        if contour_profiled && let Some((_, _, inline_center, _)) = inline_box {
+            // Advances guide line breaking; aligned glyph ink owns the final
+            // fit decision, including outlines and overhanging font shapes.
+            let painted_overflowed =
+                !self.painted_lines_fit_profiles(font_size, &lines, &line_profiles, inline_center);
             #[cfg(debug_assertions)]
-            if tracing::enabled!(
-                target: "koharu_typesetting_probe",
-                tracing::Level::TRACE
-            ) {
+            if painted_overflowed != contour_overflowed
+                && tracing::enabled!(
+                    target: "koharu_typesetting_probe",
+                    tracing::Level::TRACE
+                )
+            {
                 let painted_profile_trace = lines
                     .iter()
                     .zip(&line_profiles)
@@ -1852,12 +1418,15 @@ impl<'a> TextLayout<'a> {
                     .collect::<Vec<_>>();
                 tracing::trace!(
                     target: "koharu_typesetting_probe",
-                    marker = "comic_painted_profile_recovery",
+                    marker = "comic_painted_profile_fit",
                     text,
                     font_size,
+                    advances_overflowed = contour_overflowed,
+                    painted_overflowed,
                     ?painted_profile_trace,
                 );
             }
+            contour_overflowed = painted_overflowed;
         }
 
         // Compute a tight ink bounding box using per-glyph bounds from the font tables (via skrifa),
@@ -1919,10 +1488,10 @@ impl<'a> TextLayout<'a> {
         let overflowed = contour_overflowed
             || self
                 .max_width
-                .is_some_and(|maximum| width > maximum + f32::EPSILON)
+                .is_some_and(|maximum| width + self.ink_outset * 2.0 > maximum + f32::EPSILON)
             || self
                 .max_height
-                .is_some_and(|maximum| height > maximum + f32::EPSILON);
+                .is_some_and(|maximum| height + self.ink_outset * 2.0 > maximum + f32::EPSILON);
 
         Ok(LayoutRun {
             lines,
@@ -1930,7 +1499,6 @@ impl<'a> TextLayout<'a> {
             height,
             font_size,
             overflowed,
-            emergency_terminal_punctuation,
             placement_offset_x,
             placement_offset_y,
         })
@@ -1946,11 +1514,7 @@ impl<'a> TextLayout<'a> {
         let mut maximum = f32::NEG_INFINITY;
 
         for segment in segments {
-            let suffix_runs = segment
-                .break_suffix
-                .iter()
-                .flat_map(|suffix| suffix.runs.iter());
-            for run in segment.runs.iter().chain(suffix_runs) {
+            for run in &segment.runs {
                 for glyph in &run.shaped.glyphs {
                     let key = font_key(glyph.font);
                     let glyph_metrics = match metrics_cache.entry(key) {
@@ -2035,6 +1599,7 @@ impl<'a> TextLayout<'a> {
     #[allow(clippy::too_many_arguments)]
     fn append_balanced_segment_lines(
         &self,
+        shaper: &ParagraphShaper<'_, 'a>,
         segments: &[ShapedSegment<'a>],
         line_offset: &mut usize,
         final_next_offset: usize,
@@ -2044,20 +1609,17 @@ impl<'a> TextLayout<'a> {
         line_ink: InkBand,
         balloon_air_x: f32,
         balloon_air_y: f32,
-        bidi_info: &BidiInfo<'_>,
         lines: &mut Vec<LayoutLine<'a>>,
         line_profiles: &mut Vec<LineProfile>,
-    ) -> (bool, bool) {
+    ) -> Result<(bool, bool)> {
         if segments.is_empty() {
             if force_final_line {
                 *line_offset = self.push_layout_line(
                     Vec::new(),
-                    *line_offset,
-                    *line_offset,
+                    *line_offset..*line_offset,
                     final_next_offset,
                     None,
                     true,
-                    bidi_info,
                     lines,
                 );
                 line_profiles.push(LineProfile {
@@ -2066,22 +1628,48 @@ impl<'a> TextLayout<'a> {
                     block_baseline: 0.0,
                 });
             }
-            return (false, false);
+            return Ok((false, false));
         }
 
-        let measures = segments
-            .iter()
-            .map(|segment| LineBreakMeasure {
-                advance: segment.advance,
-                trailing_advance: segment.trailing_advance,
-                break_suffix_advance: segment
-                    .break_suffix
-                    .as_ref()
-                    .map_or(0.0, |suffix| suffix.advance),
-                break_penalty: segment.break_penalty,
-                is_mandatory: segment.is_mandatory,
-            })
-            .collect::<Vec<_>>();
+        let mut measures = LineMeasurements {
+            segments: segments
+                .iter()
+                .map(|segment| BreakPoint {
+                    hyphenated: segment.break_suffix.is_some() && !segment.is_mandatory,
+                    break_penalty: segment.break_penalty,
+                    is_mandatory: segment.is_mandatory,
+                })
+                .collect(),
+            advances: Vec::with_capacity(segments.len()),
+        };
+        for start in 0..segments.len() {
+            let mut advances = Vec::with_capacity(segments.len() - start);
+            for end in start + 1..=segments.len() {
+                let last = &segments[end - 1];
+                let suffix = if end < segments.len() && !last.is_mandatory {
+                    last.break_suffix
+                } else {
+                    None
+                };
+                let runs = shaper.shape(segments[start].range.start..last.visible_end, suffix)?;
+                let advance = runs
+                    .iter()
+                    .flat_map(|run| &run.shaped.glyphs)
+                    .map(|glyph| {
+                        if self.writing_mode.is_vertical() {
+                            glyph.y_advance.abs()
+                        } else {
+                            glyph.x_advance
+                        }
+                    })
+                    .sum::<f32>();
+                advances.push(advance + self.ink_outset * 2.0);
+                if last.is_mandatory {
+                    break;
+                }
+            }
+            measures.advances.push(advances);
+        }
         let result = if let Some(balloon) = self.comic_balloon.as_ref() {
             comic_line_breaks(
                 &measures,
@@ -2098,7 +1686,7 @@ impl<'a> TextLayout<'a> {
             LineBreakResult {
                 breaks: vec![segments.len()],
                 profiles: vec![LineProfile {
-                    width: measures.iter().map(|measure| measure.advance).sum(),
+                    width: measures.advance(0, segments.len()),
                     center_offset: 0.0,
                     block_baseline: 0.0,
                 }],
@@ -2123,30 +1711,18 @@ impl<'a> TextLayout<'a> {
             } else {
                 segments[end].range.start
             };
-            let break_suffix = if final_line || mandatory_line {
+            let suffix = if final_line || mandatory_line {
                 None
             } else {
-                segments[end - 1].break_suffix.clone()
+                segments[end - 1].break_suffix
             };
-            let mut runs = segments[start..end - 1]
-                .iter()
-                .flat_map(|segment| segment.runs.iter().cloned())
-                .collect::<Vec<_>>();
-            let mut final_runs = segments[end - 1].runs.clone();
-            for run in &mut final_runs {
-                run.shaped
-                    .glyphs
-                    .retain(|glyph| (glyph.cluster as usize) < visible_end);
-            }
-            runs.extend(final_runs);
+            let runs = shaper.shape(segments[start].range.start..visible_end, suffix)?;
             *line_offset = self.push_layout_line(
                 runs,
-                *line_offset,
-                visible_end,
+                *line_offset..visible_end,
                 next_offset,
-                break_suffix,
+                suffix,
                 mandatory_line || (force_final_line && final_line),
-                bidi_info,
                 lines,
             );
             line_profiles.push(
@@ -2162,7 +1738,7 @@ impl<'a> TextLayout<'a> {
             );
             start = end;
         }
-        (result.overflowed, result.contour_profiled)
+        Ok((result.overflowed, result.contour_profiled))
     }
 
     fn painted_lines_fit_profiles(
@@ -2177,8 +1753,10 @@ impl<'a> TextLayout<'a> {
                 self.inline_ink_bounds(font_size, line)
                     .is_none_or(|(minimum, maximum)| {
                         let half_width = profile.width * 0.5;
-                        minimum >= inline_center - half_width - COMIC_LINE_RASTER_TOLERANCE
-                            && maximum <= inline_center + half_width + COMIC_LINE_RASTER_TOLERANCE
+                        minimum - self.ink_outset
+                            >= inline_center - half_width - COMIC_LINE_RASTER_TOLERANCE
+                            && maximum + self.ink_outset
+                                <= inline_center + half_width + COMIC_LINE_RASTER_TOLERANCE
                     })
             })
     }
@@ -2195,60 +1773,56 @@ impl<'a> TextLayout<'a> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn push_layout_line(
         &self,
         mut runs: Vec<LineRun<'a>>,
-        offset: usize,
-        visible_end: usize,
+        range: Range<usize>,
         next_offset: usize,
-        break_suffix: Option<ShapedBreakSuffix<'a>>,
+        break_suffix: Option<LineBreakSuffix>,
         force_push: bool,
-        _bidi_info: &BidiInfo<'_>,
         lines: &mut Vec<LayoutLine<'a>>,
     ) -> usize {
         if runs.is_empty() && !force_push {
             return next_offset;
         }
 
-        if let Some(mut suffix) = break_suffix {
-            runs.append(&mut suffix.runs);
-        }
-
         let levels: Vec<unicode_bidi::Level> = runs.iter().map(|r| r.level).collect();
         let visual_indices = reorder_visual(&levels);
 
         let mut line = LayoutLine {
-            range: offset..visible_end,
+            range,
+            break_suffix,
             ..Default::default()
         };
-
-        let mut pen_x = 0.0f32;
-        let mut pen_y = 0.0f32;
 
         for idx in visual_indices {
             let run = &mut runs[idx];
             for glyph in std::mem::take(&mut run.shaped.glyphs) {
                 line.glyphs.push(glyph);
             }
-            if self.writing_mode.is_vertical() {
-                pen_y -= run.shaped.y_advance;
-            } else {
-                pen_x += run.shaped.x_advance;
-            }
         }
 
+        // Use the exact glyph sequence measured for this line, including a
+        // discretionary suffix and excluding invisible trailing whitespace.
         line.advance = if self.writing_mode.is_vertical() {
-            pen_y.abs()
+            line.glyphs
+                .iter()
+                .map(|glyph| glyph.y_advance)
+                .sum::<f32>()
+                .abs()
         } else {
-            pen_x
+            line.glyphs.iter().map(|glyph| glyph.x_advance).sum()
         };
 
         lines.push(line);
         next_offset
     }
 
-    fn ink_bounds(&self, font_size: f32, lines: &[LayoutLine<'a>]) -> Option<(f32, f32, f32, f32)> {
+    pub(crate) fn ink_bounds(
+        &self,
+        font_size: f32,
+        lines: &[LayoutLine<'a>],
+    ) -> Option<(f32, f32, f32, f32)> {
         let mut metrics_cache = HashMap::new();
 
         let mut min_x = f32::INFINITY;
@@ -2463,115 +2037,34 @@ impl<'a> TextLayout<'a> {
     }
 }
 
-pub(crate) fn quality_font_reduction(font_size: f32) -> f32 {
-    (font_size * COMIC_QUALITY_FONT_REDUCTION_RATIO).clamp(
-        COMIC_QUALITY_FONT_REDUCTION_MIN,
-        COMIC_QUALITY_FONT_REDUCTION_MAX,
-    )
-}
-
-pub(crate) fn fragmentation_quality_font_reduction(
-    text: &str,
-    font_size: f32,
-    discretionary_hyphens: usize,
-) -> f32 {
-    let ordinary_reduction = quality_font_reduction(font_size);
-    if discretionary_hyphens == 0 {
-        return ordinary_reduction;
-    }
-    if comic_fragmentation_is_dense(text, discretionary_hyphens) {
-        ordinary_reduction.max(font_size * COMIC_HIGH_FRAGMENTATION_FONT_REDUCTION_RATIO)
-    } else {
-        ordinary_reduction
-    }
-}
-
-pub(crate) fn whole_word_quality_font_reduction(
-    text: &str,
-    reference_font_size: f32,
-    layout: &LayoutRun<'_>,
-) -> f32 {
-    let discretionary_hyphens = discretionary_hyphen_count(text, &layout.lines);
-    if discretionary_hyphens == 0 {
-        return quality_font_reduction(reference_font_size);
-    }
-    let word_count = alphanumeric_word_count(text);
-    let high_fragmentation = comic_fragmentation_is_dense(text, discretionary_hyphens);
-    let compact_fragment = layout.lines.windows(2).any(|pair| {
-        let boundary = pair[0].range.end;
-        is_discretionary_hyphen_boundary(text, pair)
-            && discretionary_fragment_lengths(text, boundary).is_some_and(|(before, after)| {
-                before.min(after) <= COMPACT_HYPHENATION_FRAGMENT_LEN
-            })
-    });
-    let ratio = if word_count == 1 {
-        COMIC_SINGLE_WORD_FONT_REDUCTION_RATIO
-    } else if high_fragmentation || compact_fragment {
-        COMIC_HIGH_FRAGMENTATION_FONT_REDUCTION_RATIO
-    } else {
-        COMIC_FRAGMENTATION_FONT_REDUCTION_RATIO
-    };
-    quality_font_reduction(reference_font_size).max(reference_font_size * ratio)
-}
-
 fn alphanumeric_word_count(text: &str) -> usize {
     text.split_whitespace()
         .filter(|word| word.chars().any(char::is_alphanumeric))
         .count()
 }
 
-fn comic_fragmentation_is_dense(text: &str, discretionary_hyphens: usize) -> bool {
-    let word_count = alphanumeric_word_count(text);
-    word_count > 0
-        && word_count
-            <= discretionary_hyphens.saturating_mul(COMIC_HIGH_FRAGMENTATION_WORDS_PER_HYPHEN)
-}
-
 fn comic_hyphen_quality(text: &str, layout: &LayoutRun<'_>) -> ComicHyphenQuality {
-    let total = discretionary_hyphen_count(text, &layout.lines);
+    let total = layout.discretionary_hyphen_count();
     let compact = layout
         .lines
         .windows(2)
         .filter(|pair| {
-            let boundary = pair[0].range.end;
-            is_discretionary_hyphen_boundary(text, pair)
-                && discretionary_fragment_lengths(text, boundary).is_some_and(|(before, after)| {
-                    before.min(after) <= COMPACT_HYPHENATION_FRAGMENT_LEN
-                })
+            if pair[0].break_suffix != Some(LineBreakSuffix::Hyphen) {
+                return false;
+            }
+            let before = text[pair[0].range.clone()]
+                .chars()
+                .rev()
+                .take_while(|character| character.is_alphabetic())
+                .count();
+            let after = text[pair[1].range.clone()]
+                .chars()
+                .take_while(|character| character.is_alphabetic())
+                .count();
+            before.min(after) <= COMPACT_HYPHENATION_FRAGMENT_LEN
         })
         .count();
     ComicHyphenQuality { compact, total }
-}
-
-fn discretionary_fragment_lengths(text: &str, boundary: usize) -> Option<(usize, usize)> {
-    if boundary == 0 || boundary >= text.len() || !text.is_char_boundary(boundary) {
-        return None;
-    }
-    let before = text[..boundary]
-        .chars()
-        .rev()
-        .take_while(|character| character.is_alphabetic())
-        .count();
-    let after = text[boundary..]
-        .chars()
-        .take_while(|character| character.is_alphabetic())
-        .count();
-    (before > 0 && after > 0).then_some((before, after))
-}
-
-fn is_discretionary_hyphen_boundary(text: &str, pair: &[LayoutLine<'_>]) -> bool {
-    let [before, after] = pair else {
-        return false;
-    };
-    let boundary = before.range.end;
-    boundary == after.range.start && discretionary_fragment_lengths(text, boundary).is_some()
-}
-
-fn discretionary_hyphen_count(text: &str, lines: &[LayoutLine<'_>]) -> usize {
-    lines
-        .windows(2)
-        .filter(|pair| is_discretionary_hyphen_boundary(text, pair))
-        .count()
 }
 
 fn extend_advance(advance: f32, extra: f32) -> f32 {
@@ -2587,6 +2080,7 @@ fn justify_lines(
     lines: &mut [LayoutLine<'_>],
     max_width: f32,
     profiles: &[LineProfile],
+    ink_outset: f32,
 ) {
     if profiles.is_empty() && (!max_width.is_finite() || max_width <= 0.0) {
         return;
@@ -2608,7 +2102,8 @@ fn justify_lines(
         }
         let target_width = profiles
             .get(index)
-            .map_or(max_width, |profile| profile.width);
+            .map_or(max_width, |profile| profile.width)
+            - ink_outset * 2.0;
         if !target_width.is_finite() || target_width <= 0.0 {
             continue;
         }
@@ -2632,7 +2127,7 @@ fn justify_lines(
 }
 
 fn line_breaks_with_policy(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     max_extent: f32,
     policy: HyphenationPolicy,
 ) -> LineBreakResult {
@@ -2645,13 +2140,8 @@ fn line_breaks_with_policy(
     optimal_uniform_line_breaks(segments, max_extent, policy != HyphenationPolicy::Disabled)
 }
 
-#[cfg(test)]
-fn optimal_line_breaks(segments: &[LineBreakMeasure], max_extent: f32) -> Vec<usize> {
-    optimal_uniform_line_breaks(segments, max_extent, true).breaks
-}
-
 fn optimal_uniform_line_breaks(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     max_extent: f32,
     allow_hyphenation: bool,
 ) -> LineBreakResult {
@@ -2697,53 +2187,107 @@ fn optimal_uniform_line_breaks(
         })
 }
 
+const LINE_BREAK_FITNESS_CLASSES: usize = 4;
+const LINE_BREAK_ROOT_FITNESS: usize = LINE_BREAK_FITNESS_CLASSES;
+const LINE_BREAK_FITNESS_PENALTY: f32 = 300.0;
+const LINE_BREAK_RUNT_PENALTY: f32 = 500.0;
+const LINE_BREAK_REPEATED_HYPHEN_PENALTY: f32 = 1_000.0;
+
+#[derive(Clone, Copy)]
+struct BreakState {
+    cost: f32,
+    previous: Option<(usize, usize)>,
+}
+
+impl BreakState {
+    const EMPTY: Self = Self {
+        cost: f32::INFINITY,
+        previous: None,
+    };
+}
+
+fn line_fitness(advance: f32, width: f32) -> usize {
+    ((advance / width).clamp(0.0, 1.0) * LINE_BREAK_FITNESS_CLASSES as f32)
+        .floor()
+        .min((LINE_BREAK_FITNESS_CLASSES - 1) as f32) as usize
+}
+
+fn paragraph_transition_cost(
+    segments: &LineMeasurements,
+    range: Range<usize>,
+    ratio: f32,
+    previous_fitness: usize,
+    fitness: usize,
+    hyphenated: bool,
+) -> f32 {
+    let follows_mandatory = range.start > 0 && segments[range.start - 1].is_mandatory;
+    let mut cost = 0.0;
+    if previous_fitness != LINE_BREAK_ROOT_FITNESS && !follows_mandatory {
+        let jump = previous_fitness.abs_diff(fitness).saturating_sub(1) as f32;
+        cost += jump * jump * LINE_BREAK_FITNESS_PENALTY;
+        if range.end == segments.len() {
+            let shortfall = ((0.5 - ratio) / 0.5).max(0.0);
+            cost += shortfall * shortfall * LINE_BREAK_RUNT_PENALTY;
+        }
+        if hyphenated && segments[range.start - 1].hyphenated {
+            cost += LINE_BREAK_REPEATED_HYPHEN_PENALTY;
+        }
+    }
+    cost
+}
+
 fn uniform_line_breaks_pass(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     max_extent: f32,
     allow_hyphenation: bool,
     allow_overflow: bool,
 ) -> Option<LineBreakResult> {
     let len = segments.len();
-    let mut dp = vec![f32::INFINITY; len + 1];
-    let mut prev = vec![None; len + 1];
-    dp[0] = 0.0;
+    // Keep a frontier for the previous line's fullness: the cheapest prefix is
+    // not necessarily the best predecessor for the next line's shape.
+    let mut states = vec![[BreakState::EMPTY; LINE_BREAK_FITNESS_CLASSES + 1]; len + 1];
+    states[0][LINE_BREAK_ROOT_FITNESS].cost = 0.0;
 
     for start in 0..len {
-        if !dp[start].is_finite() {
+        let predecessors = states[start];
+        if !predecessors.iter().any(|state| state.cost.is_finite()) {
             continue;
         }
-        let mut advance = 0.0f32;
         for end in start + 1..=len {
-            advance += segments[end - 1].advance;
-            let suffix_advance = if end < len {
-                segments[end - 1].break_suffix_advance
-            } else {
-                0.0
-            };
-            let line_advance = advance - segments[end - 1].trailing_advance + suffix_advance;
-            let hyphenated_break = end < len && suffix_advance > 0.0;
-            if hyphenated_break && !allow_hyphenation {
-                continue;
-            }
+            let line_advance = segments.advance(start, end);
+            let hyphenated = end < len && segments[end - 1].hyphenated;
+            let stop = segments[end - 1].is_mandatory;
             let overflowed = line_advance > max_extent + f32::EPSILON;
-            let stop = segments[end - 1].is_mandatory || advance > max_extent;
-            if overflowed && !allow_overflow {
-                if stop {
-                    break;
+            if (!hyphenated || allow_hyphenation) && (!overflowed || allow_overflow) {
+                let fitness = line_fitness(line_advance, max_extent);
+                let mut line_cost = line_break_badness(line_advance, max_extent);
+                if hyphenated {
+                    line_cost += LINE_BREAK_HYPHEN_PENALTY;
                 }
-                continue;
-            }
-            let mut cost = dp[start] + line_break_badness(line_advance, max_extent);
-            if hyphenated_break {
-                cost += LINE_BREAK_HYPHEN_PENALTY;
-            }
-            if end < len {
-                cost += segments[end - 1].break_penalty;
-            }
-
-            if cost < dp[end] {
-                dp[end] = cost;
-                prev[end] = Some(start);
+                if end < len {
+                    line_cost += segments[end - 1].break_penalty;
+                }
+                for (previous_fitness, previous) in predecessors.iter().enumerate() {
+                    if !previous.cost.is_finite() {
+                        continue;
+                    }
+                    let cost = previous.cost
+                        + line_cost
+                        + paragraph_transition_cost(
+                            segments,
+                            start..end,
+                            line_advance / max_extent,
+                            previous_fitness,
+                            fitness,
+                            hyphenated,
+                        );
+                    if cost < states[end][fitness].cost {
+                        states[end][fitness] = BreakState {
+                            cost,
+                            previous: Some((start, previous_fitness)),
+                        };
+                    }
+                }
             }
             if stop {
                 break;
@@ -2751,16 +2295,21 @@ fn uniform_line_breaks_pass(
         }
     }
 
-    if !dp[len].is_finite() {
-        return None;
-    }
-
+    let (mut fitness, selected) = states[len]
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.cost.is_finite())
+        .min_by(|(_, left), (_, right)| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.previous.cmp(&right.previous))
+        })?;
+    let cost = selected.cost;
     let mut breaks = Vec::new();
-    let mut index = len;
-    while index > 0 {
-        breaks.push(index);
-        let previous = prev[index]?;
-        index = previous;
+    let mut end = len;
+    while end > 0 {
+        breaks.push(end);
+        (end, fitness) = states[end][fitness].previous?;
     }
     breaks.reverse();
     let overflowed = breaks_overflow(segments, &breaks, &[max_extent; 1], f32::EPSILON);
@@ -2778,12 +2327,12 @@ fn uniform_line_breaks_pass(
         profiles,
         overflowed,
         contour_profiled: false,
-        cost: dp[len],
+        cost,
     })
 }
 
 fn comic_line_breaks(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     balloon: &ComicBalloon,
     writing_mode: WritingMode,
     line_height: f32,
@@ -2839,6 +2388,16 @@ fn comic_line_breaks(
             .collect::<Vec<_>>();
         if candidates.iter().any(|candidate| !candidate.overflowed) {
             candidates.retain(|candidate| !candidate.overflowed);
+        }
+        if let Some(preferred) = balloon.preferred_line_count
+            && let Some(minimum_penalty) = candidates
+                .iter()
+                .map(|candidate| candidate.profiles.len().abs_diff(preferred))
+                .min()
+        {
+            candidates.retain(|candidate| {
+                candidate.profiles.len().abs_diff(preferred) == minimum_penalty
+            });
         }
         let best_center_distance = candidates
             .iter()
@@ -2940,9 +2499,8 @@ fn comic_line_breaks(
             .iter()
             .map(|segment| {
                 (
-                    segment.advance,
-                    segment.trailing_advance,
-                    segment.break_suffix_advance,
+                    segment.hyphenated,
+                    segment.break_penalty,
                     segment.is_mandatory,
                 )
             })
@@ -2968,7 +2526,7 @@ fn comic_line_breaks(
 
 #[allow(clippy::too_many_arguments)]
 fn profiled_comic_line_break_candidates(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     balloon: &ComicBalloon,
     writing_mode: WritingMode,
     line_count: usize,
@@ -3084,7 +2642,7 @@ fn profiled_comic_line_break_candidates(
 }
 
 fn exact_profiled_line_breaks(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     profiles: Vec<LineProfile>,
     allow_hyphenation: bool,
 ) -> Option<LineBreakResult> {
@@ -3095,7 +2653,7 @@ fn exact_profiled_line_breaks(
 }
 
 fn exact_profiled_line_breaks_pass(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     profiles: &[LineProfile],
     allow_hyphenation: bool,
     allow_overflow: bool,
@@ -3105,54 +2663,57 @@ fn exact_profiled_line_breaks_pass(
     if line_count == 0 || line_count > len {
         return None;
     }
-    let mut dp = vec![vec![f32::INFINITY; len + 1]; line_count + 1];
-    let mut previous = vec![vec![None; len + 1]; line_count + 1];
-    dp[0][0] = 0.0;
+    let mut states =
+        vec![vec![[BreakState::EMPTY; LINE_BREAK_FITNESS_CLASSES + 1]; len + 1]; line_count + 1];
+    states[0][0][LINE_BREAK_ROOT_FITNESS].cost = 0.0;
 
     for line in 0..line_count {
         let remaining_lines = line_count - line - 1;
         for start in line..len {
-            if !dp[line][start].is_finite() {
+            let predecessors = states[line][start];
+            if !predecessors.iter().any(|state| state.cost.is_finite()) {
                 continue;
             }
-            let mut advance = 0.0f32;
             let last_end = len - remaining_lines;
             for end in start + 1..=last_end {
-                advance += segments[end - 1].advance;
-                let suffix = if end < len {
-                    segments[end - 1].break_suffix_advance
-                } else {
-                    0.0
-                };
-                let hyphenated_break = end < len && suffix > 0.0;
-                if hyphenated_break && !allow_hyphenation {
-                    continue;
-                }
-                let line_advance = advance - segments[end - 1].trailing_advance + suffix;
+                let hyphenated = end < len && segments[end - 1].hyphenated;
+                let line_advance = segments.advance(start, end);
                 let width = profiles[line].width.max(1.0);
-                let overfull = line_advance > width + COMIC_LINE_RASTER_TOLERANCE;
-                let overflow = (line_advance - width).max(0.0) / width;
-                let stop =
-                    segments[end - 1].is_mandatory || advance > width + COMIC_LINE_RASTER_TOLERANCE;
-                if overfull && !allow_overflow {
-                    if stop {
-                        break;
+                let overflowed = line_advance > width + COMIC_LINE_RASTER_TOLERANCE;
+                let stop = segments[end - 1].is_mandatory;
+                if (!hyphenated || allow_hyphenation) && (!overflowed || allow_overflow) {
+                    let slack = (width - line_advance).max(0.0) / width;
+                    let overflow = (line_advance - width).max(0.0) / width;
+                    let fitness = line_fitness(line_advance, width);
+                    let mut line_cost = slack * slack * LINE_BREAK_RAGGEDNESS_PENALTY
+                        + overflow * overflow * COMIC_LINE_OVERFLOW_PENALTY;
+                    if hyphenated {
+                        line_cost += LINE_BREAK_HYPHEN_PENALTY;
                     }
-                    continue;
-                }
-                let slack = (width - line_advance).max(0.0) / width;
-                let mut cost = dp[line][start]
-                    + slack * slack * 1_000.0
-                    + overflow * overflow * COMIC_LINE_OVERFLOW_PENALTY;
-                if hyphenated_break {
-                    cost += LINE_BREAK_HYPHEN_PENALTY;
-                }
-                if end < len {
-                    cost += segments[end - 1].break_penalty;
-                }
-                if cost < dp[line + 1][end] {
-                    dp[line + 1][end] = cost;
-                    previous[line + 1][end] = Some(start);
+                    if end < len {
+                        line_cost += segments[end - 1].break_penalty;
+                    }
+                    for (previous_fitness, previous) in predecessors.iter().enumerate() {
+                        if !previous.cost.is_finite() {
+                            continue;
+                        }
+                        let cost = previous.cost
+                            + line_cost
+                            + paragraph_transition_cost(
+                                segments,
+                                start..end,
+                                line_advance / width,
+                                previous_fitness,
+                                fitness,
+                                hyphenated,
+                            );
+                        if cost < states[line + 1][end][fitness].cost {
+                            states[line + 1][end][fitness] = BreakState {
+                                cost,
+                                previous: Some((start, previous_fitness)),
+                            };
+                        }
+                    }
                 }
                 if stop {
                     break;
@@ -3161,16 +2722,21 @@ fn exact_profiled_line_breaks_pass(
         }
     }
 
-    let mut cost = dp[line_count][len];
-    if !cost.is_finite() {
-        return None;
-    }
-    cost = cost / line_count as f32 + line_count as f32 * 8.0;
+    let (mut fitness, selected) = states[line_count][len]
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.cost.is_finite())
+        .min_by(|(_, left), (_, right)| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.previous.cmp(&right.previous))
+        })?;
+    let cost = selected.cost / line_count as f32 + line_count as f32 * 8.0;
     let mut breaks = Vec::with_capacity(line_count);
     let mut end = len;
     for line in (1..=line_count).rev() {
         breaks.push(end);
-        end = previous[line][end]?;
+        (end, fitness) = states[line][end][fitness].previous?;
     }
     if end != 0 {
         return None;
@@ -3192,21 +2758,14 @@ fn exact_profiled_line_breaks_pass(
 }
 
 fn breaks_overflow(
-    segments: &[LineBreakMeasure],
+    segments: &LineMeasurements,
     breaks: &[usize],
     widths: &[f32],
     tolerance: f32,
 ) -> bool {
     let mut start = 0usize;
     for (line, end) in breaks.iter().copied().enumerate() {
-        let mut advance = segments[start..end]
-            .iter()
-            .map(|segment| segment.advance)
-            .sum::<f32>();
-        advance -= segments[end - 1].trailing_advance;
-        if end < segments.len() {
-            advance += segments[end - 1].break_suffix_advance;
-        }
+        let advance = segments.advance(start, end);
         let Some(width) = widths
             .get(line)
             .copied()
@@ -3222,21 +2781,14 @@ fn breaks_overflow(
     false
 }
 
-fn minimum_line_clearance(segments: &[LineBreakMeasure], result: &LineBreakResult) -> f32 {
+fn minimum_line_clearance(segments: &LineMeasurements, result: &LineBreakResult) -> f32 {
     let mut start = 0usize;
     let mut clearance = f32::INFINITY;
     for (line, end) in result.breaks.iter().copied().enumerate() {
         if end <= start || end > segments.len() {
             return f32::NEG_INFINITY;
         }
-        let mut advance = segments[start..end]
-            .iter()
-            .map(|segment| segment.advance)
-            .sum::<f32>();
-        advance -= segments[end - 1].trailing_advance;
-        if end < segments.len() {
-            advance += segments[end - 1].break_suffix_advance;
-        }
+        let advance = segments.advance(start, end);
         let Some(width) = result.profiles.get(line).map(|profile| profile.width) else {
             return f32::NEG_INFINITY;
         };
@@ -3695,10 +3247,13 @@ fn natural_break_penalty(text: &str, boundary: usize) -> f32 {
 }
 
 fn line_break_badness(line_advance: f32, max_extent: f32) -> f32 {
+    // Break penalties are dimensionless. Pixel-space slack changes their relative
+    // weight when the same text and container are rendered at another resolution.
+    let difference = (max_extent - line_advance) / max_extent;
     if line_advance <= max_extent {
-        (max_extent - line_advance).powi(3)
+        difference.powi(3) * LINE_BREAK_RAGGEDNESS_PENALTY
     } else {
-        (line_advance - max_extent).powi(3) * LINE_BREAK_OVERFLOW_MULTIPLIER
+        (-difference).powi(3) * LINE_BREAK_RAGGEDNESS_PENALTY * LINE_BREAK_OVERFLOW_MULTIPLIER
     }
 }
 
@@ -3783,6 +3338,53 @@ mod tests {
     use crate::fonts::{Font, FontSystem};
     use skrifa::{MetadataProvider, instance::Size};
 
+    #[derive(Clone, Copy, Debug)]
+    struct LineBreakMeasure {
+        advance: f32,
+        trailing_advance: f32,
+        break_suffix_advance: f32,
+        break_penalty: f32,
+        is_mandatory: bool,
+    }
+
+    impl LineMeasurements {
+        fn additive(segments: &[LineBreakMeasure]) -> Self {
+            let advances = (0..segments.len())
+                .map(|start| {
+                    let mut sum = 0.0;
+                    segments[start..]
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, segment)| {
+                            sum += segment.advance;
+                            sum - segment.trailing_advance
+                                + if start + offset + 1 < segments.len() && !segment.is_mandatory {
+                                    segment.break_suffix_advance
+                                } else {
+                                    0.0
+                                }
+                        })
+                        .collect()
+                })
+                .collect();
+            Self {
+                segments: segments
+                    .iter()
+                    .map(|segment| BreakPoint {
+                        hyphenated: segment.break_suffix_advance > 0.0 && !segment.is_mandatory,
+                        break_penalty: segment.break_penalty,
+                        is_mandatory: segment.is_mandatory,
+                    })
+                    .collect(),
+                advances,
+            }
+        }
+    }
+
+    fn optimal_line_breaks(segments: &[LineBreakMeasure], max_extent: f32) -> Vec<usize> {
+        optimal_uniform_line_breaks(&LineMeasurements::additive(segments), max_extent, true).breaks
+    }
+
     fn any_system_font() -> Font {
         let mut fonts = FontSystem::new();
 
@@ -3820,6 +3422,19 @@ mod tests {
             (actual - expected).abs() <= eps,
             "expected {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn target_language_reaches_shaping_and_hyphenation() {
+        let font = any_system_font();
+        for tag in ["tr-TR", "en-US", "ja-JP", "sr-Latn"] {
+            let layout = TextLayout::new(&font).with_language_tag(tag);
+            assert_eq!(
+                layout.language.as_ref().map(harfrust::Language::as_str),
+                Some(tag.to_ascii_lowercase().as_str()),
+            );
+            assert_eq!(layout.hyphenation_lang, hyphenation_lang_from_tag(tag));
+        }
     }
 
     #[test]
@@ -3871,8 +3486,8 @@ mod tests {
                     guided.font_size
                 );
                 assert!(
-                    guided_builder.preferred_size_loss(&guided).unwrap()
-                        < guided_builder.preferred_size_loss(&largest).unwrap()
+                    font_scale_cost(guided.font_size, 24.0)
+                        < font_scale_cost(largest.font_size, 24.0)
                 );
                 if mode == WritingMode::Horizontal {
                     assert!(largest.font_size - guided.font_size > 4.0);
@@ -3888,18 +3503,69 @@ mod tests {
         let font = any_system_font();
         let builder = TextLayout::new(&font).with_preferred_font_size(24.5);
         let layout_at = |size| TextLayout::new(&font).with_font_size(size).run("A phrase");
-        let selected = builder
-            .prefer_font_scale(12.0, Some(layout_at(50.0)?), layout_at, |layout| {
-                layout.font_size == 24.0 || layout.font_size >= 26.0
-            })?
+        let selected = search_compositions(
+            12.0,
+            50.0,
+            24.5,
+            layout_at,
+            |layout| (23.9..24.2).contains(&layout.font_size) || layout.font_size >= 26.0,
+            |layout| builder.composition_quality("A phrase", layout, 24.5),
+        )?
+        .unwrap();
+        assert!((23.9..24.2).contains(&selected.font_size));
+        let selected_above = search_compositions(
+            12.0,
+            50.0,
+            24.5,
+            layout_at,
+            |layout| layout.font_size >= 26.0,
+            |layout| builder.composition_quality("A phrase", layout, 24.5),
+        )?
+        .unwrap();
+        assert!((26.0..26.3).contains(&selected_above.font_size));
+        Ok(())
+    }
+
+    #[test]
+    fn composition_search_does_not_stop_at_the_source_size() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "prosperity";
+        for scale in [0.5, 1.0, 2.0, 4.0] {
+            let builder = TextLayout::new(&font).with_preferred_font_size(24.0 * scale);
+            let layout_at = |size: f32| {
+                let mut layout = TextLayout::new(&font).with_font_size(size).run(text)?;
+                if size > 20.0 * scale && size < 27.0 * scale {
+                    layout.lines = vec![
+                        LayoutLine {
+                            range: 0..5,
+                            break_suffix: Some(LineBreakSuffix::Hyphen),
+                            advance: 3.0 * size,
+                            ..LayoutLine::default()
+                        },
+                        LayoutLine {
+                            range: 5..text.len(),
+                            advance: 3.0 * size,
+                            ..LayoutLine::default()
+                        },
+                    ];
+                }
+                Ok(layout)
+            };
+            let selected = search_compositions(
+                12.0 * scale,
+                40.0 * scale,
+                24.0 * scale,
+                layout_at,
+                |_| true,
+                |layout| builder.composition_quality(text, layout, 24.0 * scale),
+            )?
             .unwrap();
-        assert_eq!(selected.font_size, 24.0);
-        let selected_above = builder
-            .prefer_font_scale(12.0, Some(layout_at(50.0)?), layout_at, |layout| {
-                layout.font_size >= 26.0
-            })?
-            .unwrap();
-        assert_eq!(selected_above.font_size, 26.0);
+            assert!(
+                (27.0..27.5).contains(&(selected.font_size / scale)),
+                "the closer whole-word composition above the source size was discarded: {} at scale {scale}",
+                selected.font_size / scale,
+            );
+        }
         Ok(())
     }
 
@@ -3918,6 +3584,7 @@ mod tests {
             }],
             minimum_air,
             preferred_center: None,
+            preferred_line_count: None,
             strict_centering: false,
         }
     }
@@ -3981,6 +3648,10 @@ mod tests {
                     let dilation = layout.font_size * 0.1;
                     (layout.width + dilation * 2.0) * (layout.height + dilation * 2.0)
                         <= maximum_area
+                },
+                |layout, reference| CompositionQuality {
+                    cost: layout.composition_cost("Şup♡", reference),
+                    ..CompositionQuality::default()
                 },
             )?
             .expect("the minimum setting fits the painted footprint");
@@ -4152,6 +3823,224 @@ mod tests {
     }
 
     #[test]
+    fn uniform_line_breaks_keep_same_decisions_when_scaled() {
+        let reference = [1, 3];
+        for scale in [0.5, 1.0, 2.0, 4.0] {
+            let segments = [
+                LineBreakMeasure {
+                    advance: 4.0 * scale,
+                    trailing_advance: scale,
+                    break_suffix_advance: 0.0,
+                    break_penalty: 0.0,
+                    is_mandatory: false,
+                },
+                LineBreakMeasure {
+                    advance: 4.0 * scale,
+                    trailing_advance: 0.0,
+                    break_suffix_advance: scale,
+                    break_penalty: 0.0,
+                    is_mandatory: false,
+                },
+                LineBreakMeasure {
+                    advance: 4.0 * scale,
+                    trailing_advance: 0.0,
+                    break_suffix_advance: 0.0,
+                    break_penalty: 0.0,
+                    is_mandatory: false,
+                },
+            ];
+            let result = optimal_uniform_line_breaks(
+                &LineMeasurements::additive(&segments),
+                10.0 * scale,
+                true,
+            );
+            assert!(!result.overflowed, "scale={scale}");
+            assert_eq!(result.breaks, reference, "scale={scale}");
+        }
+    }
+
+    #[test]
+    fn paragraph_breaks_retain_alternative_prefix_shapes() {
+        let segments = [6.0, 6.0, 6.0, 20.0, 6.0, 6.0, 6.0].map(|advance| LineBreakMeasure {
+            advance,
+            trailing_advance: 0.0,
+            break_suffix_advance: 0.0,
+            break_penalty: 0.0,
+            is_mandatory: false,
+        });
+        let result =
+            optimal_uniform_line_breaks(&LineMeasurements::additive(&segments), 40.0, false);
+        assert!(!result.overflowed);
+        assert_eq!(result.breaks, [3, 4, 7]);
+        assert!((result.cost - 462.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn paragraph_breaks_match_exhaustive_short_paragraphs() {
+        fn cost_for(
+            segments: &[LineBreakMeasure],
+            breaks: &[usize],
+            widths: &[f32],
+            profiled: bool,
+            allow_hyphenation: bool,
+        ) -> Option<f32> {
+            let mut start = 0;
+            let mut previous_fitness = LINE_BREAK_ROOT_FITNESS;
+            let mut cost = 0.0;
+            for (line, &end) in breaks.iter().enumerate() {
+                if segments[start..end - 1]
+                    .iter()
+                    .any(|segment| segment.is_mandatory)
+                {
+                    return None;
+                }
+                let last = segments[end - 1];
+                let suffix = if end == segments.len() {
+                    0.0
+                } else {
+                    last.break_suffix_advance
+                };
+                let hyphenated = suffix > 0.0;
+                if hyphenated && !allow_hyphenation {
+                    return None;
+                }
+                let width = widths[line.min(widths.len() - 1)];
+                let advance = segments[start..end]
+                    .iter()
+                    .map(|segment| segment.advance)
+                    .sum::<f32>()
+                    - last.trailing_advance
+                    + suffix;
+                if advance > width {
+                    return None;
+                }
+                let ratio = advance / width;
+                let fitness = line_fitness(advance, width);
+                cost += if profiled {
+                    (1.0 - ratio).powi(2) * LINE_BREAK_RAGGEDNESS_PENALTY
+                } else {
+                    (1.0 - ratio).powi(3) * LINE_BREAK_RAGGEDNESS_PENALTY
+                };
+                if hyphenated {
+                    cost += LINE_BREAK_HYPHEN_PENALTY;
+                }
+                if end != segments.len() {
+                    cost += last.break_penalty;
+                }
+                cost += paragraph_transition_cost(
+                    &LineMeasurements::additive(segments),
+                    start..end,
+                    ratio,
+                    previous_fitness,
+                    fitness,
+                    hyphenated,
+                );
+                previous_fitness = fitness;
+                start = end;
+            }
+            Some(if profiled {
+                cost / breaks.len() as f32 + breaks.len() as f32 * 8.0
+            } else {
+                cost
+            })
+        }
+
+        for case in 0..3_usize.pow(5) {
+            let mut code = case;
+            let segments = std::array::from_fn::<_, 5, _>(|index| {
+                let advance = [6.0, 12.0, 20.0][code % 3];
+                code /= 3;
+                LineBreakMeasure {
+                    advance,
+                    trailing_advance: if index % 2 == 0 { 1.0 } else { 0.0 },
+                    break_suffix_advance: if index % 2 == 1 { 1.0 } else { 0.0 },
+                    break_penalty: if index == 2 { 100.0 } else { 0.0 },
+                    is_mandatory: case % 7 == 0 && index == 2,
+                }
+            });
+            for allow_hyphenation in [false, true] {
+                for (profiled, widths) in [(false, &[40.0][..]), (true, &[24.0, 40.0, 28.0][..])] {
+                    let minimum = (0..1_usize << (segments.len() - 1))
+                        .filter_map(|mask| {
+                            let mut breaks = (1..segments.len())
+                                .filter(|end| mask & (1 << (end - 1)) != 0)
+                                .collect::<Vec<_>>();
+                            breaks.push(segments.len());
+                            if profiled && breaks.len() != widths.len() {
+                                return None;
+                            }
+                            cost_for(&segments, &breaks, widths, profiled, allow_hyphenation)
+                        })
+                        .min_by(f32::total_cmp);
+                    let actual = if profiled {
+                        let profiles = widths
+                            .iter()
+                            .map(|&width| LineProfile {
+                                width,
+                                center_offset: 0.0,
+                                block_baseline: 0.0,
+                            })
+                            .collect::<Vec<_>>();
+                        exact_profiled_line_breaks_pass(
+                            &LineMeasurements::additive(&segments),
+                            &profiles,
+                            allow_hyphenation,
+                            false,
+                        )
+                    } else {
+                        uniform_line_breaks_pass(
+                            &LineMeasurements::additive(&segments),
+                            widths[0],
+                            allow_hyphenation,
+                            false,
+                        )
+                    };
+                    match (actual, minimum) {
+                        (Some(actual), Some(expected)) => {
+                            assert!(!actual.overflowed);
+                            assert!(
+                                (actual.cost - expected).abs() < 0.01,
+                                "case={case} profiled={profiled} hyphenation={allow_hyphenation} actual={} expected={expected}",
+                                actual.cost
+                            );
+                        }
+                        (None, None) => {}
+                        _ => panic!(
+                            "feasibility mismatch for case={case} profiled={profiled} hyphenation={allow_hyphenation}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_advance_counts_only_drawn_glyphs() -> anyhow::Result<()> {
+        let font = any_system_font();
+        for mode in [WritingMode::Horizontal, WritingMode::VerticalRl] {
+            let layout = TextLayout::new(&font)
+                .with_font_size(24.0)
+                .with_writing_mode(mode)
+                .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                .run("ONE  \nTWO  ")?;
+            assert_eq!(layout.lines.len(), 2);
+            for line in &layout.lines {
+                let drawn_advance = if mode.is_vertical() {
+                    line.glyphs
+                        .iter()
+                        .map(|glyph| glyph.y_advance)
+                        .sum::<f32>()
+                        .abs()
+                } else {
+                    line.glyphs.iter().map(|glyph| glyph.x_advance).sum()
+                };
+                assert_approx_eq(line.advance, drawn_advance);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn line_fit_excludes_invisible_trailing_break_space() {
         let segments = [
             LineBreakMeasure {
@@ -4170,7 +4059,11 @@ mod tests {
             },
         ];
 
-        let result = line_breaks_with_policy(&segments, 50.0, HyphenationPolicy::Disabled);
+        let result = line_breaks_with_policy(
+            &LineMeasurements::additive(&segments),
+            50.0,
+            HyphenationPolicy::Disabled,
+        );
 
         assert_eq!(result.breaks, [1, 2]);
         assert!(!result.overflowed);
@@ -4195,7 +4088,8 @@ mod tests {
             },
         ];
 
-        let result = optimal_uniform_line_breaks(&segments, 100.0, false);
+        let result =
+            optimal_uniform_line_breaks(&LineMeasurements::additive(&segments), 100.0, false);
 
         assert_eq!(result.breaks, [1, 2]);
         assert!(!result.overflowed);
@@ -4239,7 +4133,9 @@ mod tests {
             },
         ];
 
-        let result = exact_profiled_line_breaks(&segments, profiles, false).unwrap();
+        let result =
+            exact_profiled_line_breaks(&LineMeasurements::additive(&segments), profiles, false)
+                .unwrap();
 
         assert_eq!(result.breaks, [1, 3]);
         assert!(!result.overflowed);
@@ -4264,9 +4160,18 @@ mod tests {
             }]
         };
 
-        let raster_fit = exact_profiled_line_breaks(&segment(100.5), profile(), false).unwrap();
-        let visible_overflow =
-            exact_profiled_line_breaks(&segment(100.51), profile(), false).unwrap();
+        let raster_fit = exact_profiled_line_breaks(
+            &LineMeasurements::additive(&segment(100.5)),
+            profile(),
+            false,
+        )
+        .unwrap();
+        let visible_overflow = exact_profiled_line_breaks(
+            &LineMeasurements::additive(&segment(100.51)),
+            profile(),
+            false,
+        )
+        .unwrap();
 
         assert!(!raster_fit.overflowed);
         assert!(visible_overflow.overflowed);
@@ -4569,7 +4474,7 @@ mod tests {
         balloon.preferred_center = Some((50.0, 70.0));
 
         let result = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::Horizontal,
             20.0,
@@ -4611,7 +4516,7 @@ mod tests {
         );
 
         let result = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::Horizontal,
             20.0,
@@ -4654,7 +4559,7 @@ mod tests {
         );
 
         let result = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::Horizontal,
             20.0,
@@ -4688,7 +4593,7 @@ mod tests {
         );
 
         let result = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::Horizontal,
             20.0,
@@ -4743,7 +4648,7 @@ mod tests {
         );
 
         let result = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::Horizontal,
             20.0,
@@ -4786,7 +4691,7 @@ mod tests {
         );
 
         let result = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::VerticalRl,
             20.0,
@@ -4821,6 +4726,7 @@ mod tests {
             ],
             minimum_air: 0.0,
             preferred_center: None,
+            preferred_line_count: None,
             strict_centering: false,
         };
 
@@ -4859,6 +4765,7 @@ mod tests {
             ],
             minimum_air: 0.0,
             preferred_center: None,
+            preferred_line_count: None,
             strict_centering: false,
         };
         let line_ink = InkBand {
@@ -4903,6 +4810,7 @@ mod tests {
             ],
             minimum_air: 0.0,
             preferred_center: None,
+            preferred_line_count: None,
             strict_centering: false,
         };
 
@@ -4929,6 +4837,7 @@ mod tests {
             ],
             minimum_air: 0.0,
             preferred_center: None,
+            preferred_line_count: None,
             strict_centering: false,
         };
 
@@ -4980,7 +4889,7 @@ mod tests {
             TextLayout::new(&font)
                 .with_min_font_size(9.0)
                 .with_max_font_size(24.0)
-                .with_hyphenation_language_tag("en")
+                .with_language_tag("en")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
                 .with_max_width(80.0)
@@ -4995,7 +4904,7 @@ mod tests {
         };
         let clean = layout(HyphenationPolicy::Disabled)?;
         let last_resort = layout(HyphenationPolicy::LastResort)?;
-        let discretionary_hyphens = last_resort.discretionary_hyphen_count(text);
+        let discretionary_hyphens = last_resort.discretionary_hyphen_count();
 
         assert!(!last_resort.overflowed());
         assert!(
@@ -5013,191 +4922,416 @@ mod tests {
         Ok(())
     }
 
+    fn best_test_composition<'a>(
+        builder: &TextLayout<'a>,
+        text: &str,
+        candidates: &[LayoutRun<'a>],
+    ) -> LayoutRun<'a> {
+        let reference = candidates
+            .iter()
+            .map(|candidate| candidate.font_size)
+            .max_by(f32::total_cmp)
+            .unwrap();
+        candidates
+            .iter()
+            .min_by(|left, right| {
+                builder
+                    .composition_quality(text, left, reference)
+                    .compare(builder.composition_quality(text, right, reference))
+            })
+            .unwrap()
+            .clone()
+    }
+
     #[test]
-    fn comic_quality_balances_clean_words_against_readable_size() {
+    fn painted_lines_stay_inside_the_balloon_after_alignment() -> anyhow::Result<()> {
         let font = any_system_font();
+        let width = 220.0;
+        let height = 150.0;
+        let contour = vec![(110.0, 0.0), (220.0, 75.0), (110.0, 150.0), (0.0, 75.0)];
+        for alignment in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            for outset in [0.0, 6.0] {
+                let template = TextLayout::new(&font)
+                    .with_comic_balloon(width, height, contour.clone(), 0.0)
+                    .with_max_width(width)
+                    .with_max_height(height)
+                    .with_min_font_size(12.0)
+                    .with_max_font_size(32.0)
+                    .with_preferred_font_size(32.0)
+                    .with_alignment(alignment)
+                    .with_line_height(1.2);
+                let result = template.run_with_ink_outset("Ink\nOutline\nSill", |_| outset)?;
+                assert!(!result.overflowed(), "{alignment:?} outset={outset}");
+                let x = (width - result.width) * 0.5 + result.placement_offset_x();
+                let y = (height - result.height) * 0.5 + result.placement_offset_y();
+                for line in &result.lines {
+                    let (left, top, right, bottom) = template
+                        .ink_bounds(result.font_size, std::slice::from_ref(line))
+                        .unwrap();
+                    for px in [left + x - outset, right + x + outset] {
+                        for py in [top + y - outset, bottom + y + outset] {
+                            assert!(
+                                (px - width * 0.5).abs() / (width * 0.5)
+                                    + (py - height * 0.5).abs() / (height * 0.5)
+                                    <= 1.0,
+                                "{alignment:?} outset={outset}: ({px}, {py}) escaped the wall"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn painted_outsets_leave_room_in_justified_paragraphs() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "Painted outlines need room around every justified line.";
+        let template = TextLayout::new(&font)
+            .with_font_size(28.0)
+            .with_alignment(TextAlign::Justify)
+            .with_max_width(260.0)
+            .with_max_height(500.0);
+        let plain = template.run(text)?;
+        assert!(plain.lines.len() > 1 && !plain.overflowed());
+        let outset = 10.0;
+        let outlined = template.run_with_ink_outset(text, |_| outset)?;
+        assert!(!outlined.overflowed(), "outlined width: {}", outlined.width);
+        assert!(outlined.width + outset * 2.0 <= 260.0);
+        assert_eq!(outlined.font_size, 28.0);
+        Ok(())
+    }
+
+    #[test]
+    fn painted_outsets_respect_curved_walls_and_flow_partitions() -> anyhow::Result<()> {
+        let font = any_system_font();
+        for mode in [WritingMode::Horizontal, WritingMode::VerticalRl] {
+            for partition in [false, true] {
+                let width = 220.0;
+                let height = 280.0;
+                let contour = vec![(110.0, 0.0), (220.0, 140.0), (110.0, 280.0), (0.0, 140.0)];
+                let mut contours = vec![contour];
+                if partition {
+                    contours.push(vec![
+                        (30.0, 0.0),
+                        (140.0, 0.0),
+                        (140.0, height),
+                        (30.0, height),
+                    ]);
+                }
+                let template = TextLayout::new(&font)
+                    .with_writing_mode(mode)
+                    .with_comic_balloon_constraints(width, height, contours, 0.0)
+                    .with_max_width(width)
+                    .with_max_height(height)
+                    .with_min_font_size(12.0)
+                    .with_max_font_size(40.0)
+                    .with_preferred_font_size(32.0)
+                    .with_alignment(TextAlign::Center)
+                    .with_line_height(1.2);
+                let outset = 6.0;
+                let result = template.run_with_ink_outset("Ink\nOutline", |_| outset)?;
+                assert!(!result.overflowed(), "{mode:?} partition={partition}");
+                let x = (width - result.width) * 0.5 + result.placement_offset_x();
+                let y = (height - result.height) * 0.5 + result.placement_offset_y();
+                for line in &result.lines {
+                    let (left, top, right, bottom) = template
+                        .ink_bounds(result.font_size, std::slice::from_ref(line))
+                        .unwrap();
+                    for px in [left + x - outset, right + x + outset] {
+                        for py in [top + y - outset, bottom + y + outset] {
+                            assert!(
+                                (px - width * 0.5).abs() / (width * 0.5)
+                                    + (py - height * 0.5).abs() / (height * 0.5)
+                                    <= 1.0,
+                                "painted corner ({px}, {py}) escaped the curved wall"
+                            );
+                            if partition {
+                                assert!(
+                                    (30.0..=140.0).contains(&px),
+                                    "outline escaped the flow cell: {px}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn composition_cost_trades_fragmentation_against_relative_scale() {
         let text = "prosperity";
         let candidate = |font_size, ranges: &[std::ops::Range<usize>]| LayoutRun {
             lines: ranges
                 .iter()
                 .cloned()
-                .map(|range| LayoutLine {
+                .enumerate()
+                .map(|(index, range)| LayoutLine {
+                    advance: (range.len() as f32) * font_size * 0.5,
+                    break_suffix: (index + 1 < ranges.len()).then_some(LineBreakSuffix::Hyphen),
                     range,
                     ..LayoutLine::default()
                 })
                 .collect(),
-            width: 60.0,
-            height: 60.0,
+            width: font_size * 4.0,
+            height: font_size * 2.0,
             font_size,
             overflowed: false,
-            emergency_terminal_punctuation: false,
             placement_offset_x: 0.0,
             placement_offset_y: 0.0,
         };
-        let larger = candidate(20.0, &[0..4, 4..7, 7..text.len()]);
-        let clean = candidate(18.0, &[0..text.len()]);
-        let layout = TextLayout::new(&font).with_comic_balloon(
-            80.0,
-            80.0,
-            vec![(0.0, 0.0), (80.0, 0.0), (80.0, 80.0), (0.0, 80.0)],
-            0.0,
-        );
-        let selected = layout.preferred_comic_quality(text, 12.0, &[larger, clean]);
+        for scale in [0.5, 1.0, 2.0, 4.0] {
+            let reference = 32.0 * scale;
+            let fragmented = candidate(reference, &[0..3, 3..6, 6..text.len()]);
+            let clean = candidate(26.0 * scale, std::slice::from_ref(&(0..text.len())));
+            let tiny = candidate(16.0 * scale, std::slice::from_ref(&(0..text.len())));
+            assert!(
+                clean.composition_cost(text, reference)
+                    < fragmented.composition_cost(text, reference)
+            );
+            assert!(
+                tiny.composition_cost(text, reference)
+                    > fragmented.composition_cost(text, reference)
+            );
+        }
 
-        assert_eq!(selected.font_size, 18.0);
-        assert_eq!(discretionary_hyphen_count(text, &selected.lines), 0);
-        assert_eq!(quality_font_reduction(20.0), 4.0);
-        assert_eq!(quality_font_reduction(40.0), 4.0);
-        assert_approx_eq(
-            fragmentation_quality_font_reduction("one split", 40.0, 1),
-            40.0 / 3.0,
-        );
-        assert_eq!(
-            fragmentation_quality_font_reduction("one split inside a longer caption", 40.0, 1),
-            4.0
-        );
-        assert_approx_eq(
-            fragmentation_quality_font_reduction("several fragmented words", 40.0, 3),
-            40.0 / 3.0,
-        );
+        let sparse = "one two three four five six lettering";
+        let split = sparse.find("lettering").unwrap() + 4;
+        let readable = candidate(32.0, &[0..split, split..sparse.len()]);
+        let smaller = candidate(26.0, std::slice::from_ref(&(0..sparse.len())));
+        assert!(readable.composition_cost(sparse, 32.0) < smaller.composition_cost(sparse, 32.0));
+    }
 
-        let readable_split = candidate(15.0, &[0..5, 5..text.len()]);
-        let emergency_clean = candidate(12.0, &[0..text.len()]);
-        let selected =
-            layout.preferred_comic_quality(text, 12.0, &[readable_split, emergency_clean]);
-        assert_eq!(selected.font_size, 15.0);
-        assert_eq!(discretionary_hyphen_count(text, &selected.lines), 1);
+    #[test]
+    fn composition_cost_does_not_penalize_authored_line_breaks() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let text = "A deliberate long line.\nI";
+        let authored = TextLayout::new(&font).with_font_size(24.0).run(text)?;
+        assert_eq!(authored.lines.len(), 2);
+        assert_eq!(authored.composition_cost(text, 24.0), 0.0);
+        Ok(())
+    }
 
-        let comfortable_split = candidate(18.0, &[0..5, 5..text.len()]);
-        let emergency_clean = candidate(14.0, &[0..text.len()]);
-        let selected =
-            layout.preferred_comic_quality(text, 12.0, &[comfortable_split, emergency_clean]);
-        assert_eq!(selected.font_size, 18.0);
-        assert_eq!(discretionary_hyphen_count(text, &selected.lines), 1);
-
-        let fragmented = candidate(20.0, &[0..3, 3..6, 6..text.len()]);
-        let still_split = candidate(16.0, &[0..5, 5..text.len()]);
-        let selected = layout.preferred_comic_quality(text, 12.0, &[fragmented, still_split]);
-        assert_eq!(selected.font_size, 16.0);
-        assert_eq!(discretionary_hyphen_count(text, &selected.lines), 1);
-
-        let mut punctuation_continuation = candidate(20.0, &[0..3, 3..6, 6..text.len()]);
-        punctuation_continuation.emergency_terminal_punctuation = true;
-        let still_split = candidate(16.0, &[0..5, 5..text.len()]);
-        let selected =
-            layout.preferred_comic_quality(text, 12.0, &[punctuation_continuation, still_split]);
-        assert_eq!(selected.font_size, 20.0);
-        assert_eq!(discretionary_hyphen_count(text, &selected.lines), 2);
-
-        let sparse_text = "one two three four five six lettering";
-        let sparse_boundary = sparse_text.find("lettering").unwrap() + 4;
-        let sparse_split = candidate(
-            18.0,
-            &[0..sparse_boundary, sparse_boundary..sparse_text.len()],
-        );
-        let sparse_clean = candidate(16.0, &[0..sparse_text.len()]);
-        let selected =
-            layout.preferred_comic_quality(sparse_text, 12.0, &[sparse_split, sparse_clean]);
-        assert_eq!(selected.font_size, 18.0);
-        assert_eq!(discretionary_hyphen_count(sparse_text, &selected.lines), 1);
-
-        let staged_text = "alpha bravo charlie delta lettering prosperity echo hotel";
-        let compact_boundaries = [
-            staged_text.find("alpha").unwrap() + 2,
-            staged_text.find("bravo").unwrap() + 2,
-            staged_text.find("charlie").unwrap() + 2,
-            staged_text.find("delta").unwrap() + 2,
-        ];
-        let first_ordinary = staged_text.find("lettering").unwrap() + 4;
-        let second_ordinary = staged_text.find("prosperity").unwrap() + 5;
-        let partition = |text_len: usize, boundaries: &[usize]| {
-            let mut start = 0;
-            let mut ranges = boundaries
-                .iter()
-                .copied()
-                .map(|end| {
-                    let range = start..end;
-                    start = end;
-                    range
-                })
-                .collect::<Vec<_>>();
-            ranges.push(start..text_len);
-            ranges
-        };
-        let fragmented = candidate(22.0, &partition(staged_text.len(), &compact_boundaries));
-        let readable = candidate(
-            21.0,
-            &partition(staged_text.len(), &[first_ordinary, second_ordinary]),
-        );
-        let one_split = candidate(18.0, &partition(staged_text.len(), &[first_ordinary]));
-        let clean = candidate(17.0, &[0..staged_text.len()]);
-        let selected = layout.preferred_comic_quality(
-            staged_text,
-            12.0,
-            &[fragmented, readable, one_split, clean],
-        );
-        assert_eq!(selected.font_size, 21.0);
-        assert_eq!(discretionary_hyphen_count(staged_text, &selected.lines), 2);
-
-        let partial_text = "alpha bravo stimulating prosperity echo hotel";
-        let compact_boundary = partial_text.find("stimulating").unwrap() + 8;
-        let ordinary_boundary = partial_text.find("prosperity").unwrap() + 5;
-        let partially_fragmented = candidate(
-            19.0,
-            &partition(partial_text.len(), &[compact_boundary, ordinary_boundary]),
-        );
-        let smaller_partial = candidate(17.0, &partition(partial_text.len(), &[ordinary_boundary]));
-        assert_eq!(
-            comic_hyphen_quality(partial_text, &partially_fragmented),
-            ComicHyphenQuality {
-                compact: 1,
-                total: 2
+    #[test]
+    fn natural_script_breaks_are_not_discretionary_hyphens() -> anyhow::Result<()> {
+        let font = any_system_font();
+        for (language, text) in [
+            ("ja-JP", "今日は良い天気です。新しい本を読みます。"),
+            ("zh-CN", "今天天气很好，我们一起阅读新的故事。"),
+        ] {
+            for mode in [WritingMode::Horizontal, WritingMode::VerticalRl] {
+                let layout = TextLayout::new(&font)
+                    .with_font_size(24.0)
+                    .with_language_tag(language)
+                    .with_writing_mode(mode)
+                    .with_max_width(150.0)
+                    .with_max_height(150.0)
+                    .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                    .run(text)?;
+                assert!(layout.lines.len() > 1, "{language} {mode:?}");
+                assert!(!layout.overflowed(), "{language} {mode:?}");
+                assert_eq!(
+                    layout.discretionary_hyphen_count(),
+                    0,
+                    "{language} {mode:?}: natural line breaks do not draw hyphens"
+                );
             }
-        );
-        assert!(!comic_fragmentation_is_dense(partial_text, 2));
-        let selected = layout.preferred_comic_quality(
-            partial_text,
-            12.0,
-            &[partially_fragmented, smaller_partial],
-        );
-        assert_eq!(selected.font_size, 19.0);
+        }
+        Ok(())
+    }
 
-        let ordinary_text = "A longer caption contains prosperity inside";
-        let ordinary_boundary = ordinary_text.find("prosperity").unwrap() + 5;
-        let ordinary_split = candidate(
-            44.0,
-            &[0..ordinary_boundary, ordinary_boundary..ordinary_text.len()],
-        );
-        assert_eq!(
-            discretionary_hyphen_count(ordinary_text, &ordinary_split.lines),
-            1
-        );
-        assert_approx_eq(
-            whole_word_quality_font_reduction(ordinary_text, 48.0, &ordinary_split),
-            12.0,
-        );
+    #[test]
+    fn discretionary_hyphen_metadata_matches_the_drawn_suffix() -> anyhow::Result<()> {
+        let font = any_system_font();
+        for (language, text) in [
+            ("en-US", "characteristically"),
+            ("tr-TR", "tasarruflarımız"),
+        ] {
+            let base = TextLayout::new(&font)
+                .with_font_size(24.0)
+                .with_language_tag(language);
+            let unbroken = base
+                .clone()
+                .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                .run(text)?;
+            let wrapped = base
+                .clone()
+                .with_max_width(unbroken.width * 0.55)
+                .with_max_height(600.0)
+                .with_hyphenation_policy(HyphenationPolicy::Normal)
+                .run(text)?;
+            assert!(!wrapped.overflowed(), "{language}");
+            assert!(wrapped.discretionary_hyphen_count() > 0, "{language}");
+            for line in &wrapped.lines {
+                let mut displayed = text[line.range.clone()].to_owned();
+                if let Some(suffix) = line.break_suffix {
+                    displayed.push_str(suffix.as_str());
+                }
+                let expected = base
+                    .clone()
+                    .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                    .run(&displayed)?;
+                assert_eq!(
+                    line.glyphs
+                        .iter()
+                        .map(|glyph| glyph.glyph_id)
+                        .collect::<Vec<_>>(),
+                    expected.lines[0]
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.glyph_id)
+                        .collect::<Vec<_>>(),
+                    "{language}: {displayed}"
+                );
+                assert_approx_eq(line.advance, expected.lines[0].advance);
+            }
+        }
+        let authored = TextLayout::new(&font)
+            .with_font_size(24.0)
+            .run("ready-made\nword-")?;
+        assert_eq!(authored.discretionary_hyphen_count(), 0);
+        Ok(())
+    }
 
-        let compact_text = "A longer caption keeps stimulating words intact";
-        let compact_boundary = compact_text.find("stimulating").unwrap() + 8;
-        let compact_split = candidate(
-            44.0,
-            &[0..compact_boundary, compact_boundary..compact_text.len()],
-        );
-        assert_eq!(
-            discretionary_hyphen_count(compact_text, &compact_split.lines),
-            1
-        );
-        assert_approx_eq(
-            whole_word_quality_font_reduction(compact_text, 48.0, &compact_split),
-            16.0,
-        );
+    #[test]
+    fn composition_cost_keeps_local_fragmentation_visible_in_long_dialogue() {
+        for prefix_words in [8, 32] {
+            let prefix = "calm ".repeat(prefix_words);
+            let text = format!("{prefix}prosperity");
+            let split = prefix.len();
+            for scale in [0.5, 1.0, 2.0] {
+                let candidate = |size: f32, ranges: &[Range<usize>]| LayoutRun {
+                    lines: ranges
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, range)| LayoutLine {
+                            advance: range.len() as f32 * size * 0.5,
+                            break_suffix: (index + 1 < ranges.len())
+                                .then_some(LineBreakSuffix::Hyphen),
+                            range,
+                            ..LayoutLine::default()
+                        })
+                        .collect(),
+                    width: size * 4.0,
+                    height: size * 3.0,
+                    font_size: size,
+                    overflowed: false,
+                    placement_offset_x: 0.0,
+                    placement_offset_y: 0.0,
+                };
+                let reference = 32.0 * scale;
+                let broken = candidate(
+                    reference,
+                    &[0..split + 3, split + 3..split + 6, split + 6..text.len()],
+                );
+                let clean = candidate(26.0 * scale, std::slice::from_ref(&(0..text.len())));
+                assert!(
+                    clean.composition_cost(&text, reference)
+                        < broken.composition_cost(&text, reference),
+                    "{prefix_words} intact words diluted a twice-broken word at scale {scale}"
+                );
+            }
+        }
+    }
 
-        let single_word = "Harikaaa";
-        let single_word_split = candidate(36.0, &[0..4, 4..single_word.len()]);
+    #[test]
+    fn compact_hyphens_measure_the_fragments_actually_drawn() {
+        let text = "characteristically";
+        let layout = LayoutRun {
+            lines: [0..9, 9..11, 11..text.len()]
+                .into_iter()
+                .enumerate()
+                .map(|(index, range)| LayoutLine {
+                    break_suffix: (index < 2).then_some(LineBreakSuffix::Hyphen),
+                    range,
+                    ..LayoutLine::default()
+                })
+                .collect(),
+            width: 100.0,
+            height: 100.0,
+            font_size: 24.0,
+            overflowed: false,
+            placement_offset_x: 0.0,
+            placement_offset_y: 0.0,
+        };
+        let quality = comic_hyphen_quality(text, &layout);
+        assert_eq!(quality.total, 2);
         assert_eq!(
-            whole_word_quality_font_reduction(single_word, 36.0, &single_word_split),
-            18.0,
+            quality.compact, 2,
+            "the two-letter middle fragment was missed"
         );
+    }
+
+    #[test]
+    fn composition_cost_keeps_automatic_terminal_punctuation_attached() -> anyhow::Result<()> {
+        let font = any_system_font();
+        for punctuation in ["...!", "？！", "…"] {
+            let text = format!("Begin now{punctuation}");
+            let authored_text = format!("Begin now\n{punctuation}");
+            let authored = TextLayout::new(&font)
+                .with_font_size(32.0)
+                .run(&authored_text)?;
+            let mut separated = authored.clone();
+            // Reuse the measured lines without the explicit newline to model
+            // a punctuation-only continuation created by the line breaker.
+            separated.lines[1].range.start -= 1;
+            separated.lines[1].range.end -= 1;
+            let clean = TextLayout::new(&font).with_font_size(26.0).run(&text)?;
+            assert!(
+                clean.composition_cost(&text, 32.0) < separated.composition_cost(&text, 32.0),
+                "an automatic punctuation-only line was preferred: {punctuation}"
+            );
+            assert_eq!(authored.composition_cost(&authored_text, 32.0), 0.0);
+            let symbol = TextLayout::new(&font)
+                .with_font_size(32.0)
+                .run(punctuation)?;
+            assert_eq!(symbol.composition_cost(punctuation, 32.0), 0.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn composition_search_pruning_matches_the_complete_frontier() -> anyhow::Result<()> {
+        use std::cell::Cell;
+        let font = any_system_font();
+        let reference = 24.0;
+        let samples = composition_font_sizes(6.0, 96.0, reference);
+        for requested in [None, Some(2)] {
+            let count = Cell::new(0);
+            let layout_at = |size: f32| {
+                count.set(count.get() + 1);
+                let text = if size < 18.0 { "One\nTwo" } else { "One Two" };
+                TextLayout::new(&font).with_font_size(size).run(text)
+            };
+            let quality_at = |layout: &LayoutRun<'_>| CompositionQuality {
+                requested_lines_error: requested
+                    .map_or(0, |lines| layout.lines.len().abs_diff(lines)),
+                cost: font_scale_cost(layout.font_size, reference)
+                    + (layout.font_size / 9.0).sin().powi(2),
+                ..CompositionQuality::default()
+            };
+            let selected =
+                search_compositions(6.0, 96.0, reference, layout_at, |_| true, quality_at)?
+                    .unwrap();
+            let visited = count.get();
+            let exhaustive = samples
+                .iter()
+                .map(|size| layout_at(*size))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min_by(|left, right| quality_at(left).compare(quality_at(right)))
+                .unwrap();
+            assert_eq!(selected.font_size, exhaustive.font_size);
+            assert!(
+                visited < samples.len(),
+                "the lower bound did not prune any candidates"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -5212,7 +5346,6 @@ mod tests {
             height: 20.0,
             font_size,
             overflowed: false,
-            emergency_terminal_punctuation: false,
             placement_offset_x: 0.0,
             placement_offset_y,
         };
@@ -5228,7 +5361,7 @@ mod tests {
             )
             .with_comic_preferred_center((40.0, 50.0), false);
 
-        let selected = layout.preferred_comic_quality("text", 12.0, &[larger, centered, too_small]);
+        let selected = best_test_composition(&layout, "text", &[larger, centered, too_small]);
 
         assert_eq!(selected.font_size, 19.0);
         assert_eq!(layout.comic_center_error(&selected), 1.0);
@@ -5246,7 +5379,6 @@ mod tests {
             height: 20.0,
             font_size,
             overflowed: false,
-            emergency_terminal_punctuation: false,
             placement_offset_x: 0.0,
             placement_offset_y,
         };
@@ -5261,7 +5393,7 @@ mod tests {
             )
             .with_comic_preferred_center((40.0, 104.0), false);
 
-        let selected = layout.preferred_comic_quality("text", 12.0, &[larger, exactly_centered]);
+        let selected = best_test_composition(&layout, "text", &[larger, exactly_centered]);
 
         assert_eq!(selected.font_size, 19.0);
         assert_eq!(layout.comic_center_error(&selected), 4.0);
@@ -5277,7 +5409,9 @@ mod tests {
                 lines: ranges
                     .iter()
                     .cloned()
-                    .map(|range| LayoutLine {
+                    .enumerate()
+                    .map(|(index, range)| LayoutLine {
+                        break_suffix: (index + 1 < ranges.len()).then_some(LineBreakSuffix::Hyphen),
                         range,
                         ..LayoutLine::default()
                     })
@@ -5286,13 +5420,12 @@ mod tests {
                 height: 20.0,
                 font_size,
                 overflowed: false,
-                emergency_terminal_punctuation: false,
                 placement_offset_x: 0.0,
                 placement_offset_y,
             };
         let displaced_largest = candidate(22.0, &[0..boundary, boundary..text.len()], 25.0);
         let centered_readable = candidate(21.0, &[0..boundary, boundary..text.len()], 0.0);
-        let displaced_clean = candidate(16.0, &[0..text.len()], 17.0);
+        let displaced_clean = candidate(16.0, std::slice::from_ref(&(0..text.len())), 17.0);
         let layout = TextLayout::new(&font)
             .with_comic_balloon(
                 80.0,
@@ -5302,9 +5435,9 @@ mod tests {
             )
             .with_comic_preferred_center((40.0, 40.0), false);
 
-        let selected = layout.preferred_comic_quality(
+        let selected = best_test_composition(
+            &layout,
             text,
-            12.0,
             &[displaced_largest, centered_readable, displaced_clean],
         );
 
@@ -5313,7 +5446,7 @@ mod tests {
     }
 
     #[test]
-    fn only_owned_flows_require_centering_below_the_quality_window() {
+    fn composition_search_keeps_owned_flow_centering_authoritative() {
         let font = any_system_font();
         let candidate = |font_size, placement_offset_y| LayoutRun {
             lines: vec![LayoutLine {
@@ -5324,7 +5457,6 @@ mod tests {
             height: 20.0,
             font_size,
             overflowed: false,
-            emergency_terminal_punctuation: false,
             placement_offset_x: 0.0,
             placement_offset_y,
         };
@@ -5340,16 +5472,15 @@ mod tests {
         let soft_anchor = base
             .clone()
             .with_comic_preferred_center((40.0, 50.0), false);
-        let selected = soft_anchor.preferred_comic_quality(
+        let selected = best_test_composition(
+            &soft_anchor,
             "text",
-            12.0,
             &[readable.clone(), emergency_local.clone()],
         );
         assert_eq!(selected.font_size, 15.0);
 
         let owned_flow = base.with_comic_preferred_center((40.0, 50.0), true);
-        let selected =
-            owned_flow.preferred_comic_quality("text", 12.0, &[readable, emergency_local]);
+        let selected = best_test_composition(&owned_flow, "text", &[readable, emergency_local]);
         assert_eq!(selected.font_size, 12.0);
         assert!(owned_flow.comic_layout_is_centered(&selected));
     }
@@ -5376,7 +5507,7 @@ mod tests {
                 .with_min_font_size(12.0)
                 .with_max_font_size(27.0)
                 .with_line_height(1.2)
-                .with_hyphenation_language_tag("tr-TR")
+                .with_language_tag("tr-TR")
                 .with_hyphenation_policy(HyphenationPolicy::LastResort)
                 .with_alignment(TextAlign::Center)
                 .with_max_width(width)
@@ -5500,7 +5631,7 @@ mod tests {
         );
 
         let horizontal = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &balloon,
             WritingMode::Horizontal,
             24.0,
@@ -5518,7 +5649,7 @@ mod tests {
             0.0,
         );
         let vertical = comic_line_breaks(
-            &segments,
+            &LineMeasurements::additive(&segments),
             &vertical_balloon,
             WritingMode::VerticalRl,
             24.0,
@@ -5552,8 +5683,11 @@ mod tests {
                 is_mandatory: false,
             },
         ];
-        let unbroken =
-            line_breaks_with_policy(&fits_without_hyphen, 70.0, HyphenationPolicy::LastResort);
+        let unbroken = line_breaks_with_policy(
+            &LineMeasurements::additive(&fits_without_hyphen),
+            70.0,
+            HyphenationPolicy::LastResort,
+        );
         assert_eq!(unbroken.breaks, [2]);
         assert!(!unbroken.overflowed);
 
@@ -5573,8 +5707,11 @@ mod tests {
                 is_mandatory: false,
             },
         ];
-        let hyphenated =
-            line_breaks_with_policy(&needs_hyphen, 70.0, HyphenationPolicy::LastResort);
+        let hyphenated = line_breaks_with_policy(
+            &LineMeasurements::additive(&needs_hyphen),
+            70.0,
+            HyphenationPolicy::LastResort,
+        );
         assert_eq!(hyphenated.breaks, [1, 2]);
         assert!(!hyphenated.overflowed);
     }
@@ -5588,7 +5725,7 @@ mod tests {
                 .with_max_font_size(36.0)
                 .with_min_font_size(8.0)
                 .with_line_height(1.2)
-                .with_hyphenation_language_tag("en")
+                .with_language_tag("en")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
                 .with_max_width(125.0)
@@ -5738,7 +5875,7 @@ mod tests {
                 .with_max_font_size(80.0)
                 .with_min_font_size(minimum)
                 .with_line_height(1.2)
-                .with_hyphenation_language_tag("en")
+                .with_language_tag("en")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
                 .with_max_width(60.0)
@@ -5755,8 +5892,7 @@ mod tests {
         let last_resort = layout(HyphenationPolicy::LastResort)?;
 
         assert!(
-            clean.overflowed()
-                || clean.font_size <= minimum + quality_font_reduction(minimum) + f32::EPSILON,
+            clean.overflowed() || clean.font_size <= minimum * 1.25 + f32::EPSILON,
             "the clean layout no longer exercises the readability boundary: minimum {minimum}, clean size {}",
             clean.font_size
         );
@@ -5786,7 +5922,7 @@ mod tests {
                 .with_max_font_size(80.0)
                 .with_min_font_size(9.0)
                 .with_line_height(1.2)
-                .with_hyphenation_language_tag("tr-TR")
+                .with_language_tag("tr-TR")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
                 .with_max_width(68.0)
@@ -5801,7 +5937,7 @@ mod tests {
         };
         let clean = layout(HyphenationPolicy::Disabled)?;
         let last_resort = layout(HyphenationPolicy::LastResort)?;
-        let discretionary_hyphens = last_resort.discretionary_hyphen_count(text);
+        let discretionary_hyphens = last_resort.discretionary_hyphen_count();
 
         assert!(!last_resort.overflowed());
         assert!(
@@ -5827,7 +5963,7 @@ mod tests {
             TextLayout::new(&font)
                 .with_max_font_size(24.0)
                 .with_min_font_size(8.0)
-                .with_hyphenation_language_tag("en")
+                .with_language_tag("en")
                 .with_hyphenation_policy(policy)
                 .with_alignment(TextAlign::Center)
                 .with_max_width(220.0)
@@ -5901,7 +6037,9 @@ mod tests {
             },
         ];
 
-        let result = exact_profiled_line_breaks(&segments, profiles, true).unwrap();
+        let result =
+            exact_profiled_line_breaks(&LineMeasurements::additive(&segments), profiles, true)
+                .unwrap();
 
         assert_eq!(result.breaks, [1, 3]);
     }
@@ -5932,7 +6070,11 @@ mod tests {
             },
         ];
 
-        let result = line_breaks_with_policy(&segments, 65.0, HyphenationPolicy::Normal);
+        let result = line_breaks_with_policy(
+            &LineMeasurements::additive(&segments),
+            65.0,
+            HyphenationPolicy::Normal,
+        );
 
         assert_eq!(result.breaks, [3]);
         assert!(!result.overflowed);
@@ -6288,6 +6430,126 @@ mod tests {
             "expected line centres to match, got c0={c0} c1={c1}",
         );
         Ok(())
+    }
+
+    #[test]
+    fn unused_discretionary_breaks_preserve_whole_line_shaping() -> anyhow::Result<()> {
+        let mut fonts = FontSystem::new();
+        let font = fonts
+            .query_family("DejaVu Serif")
+            .or_else(|_| fonts.query_family("Times New Roman"))?;
+        for text in ["office affinity", "AVATAR typography", "efficiently"] {
+            let builder = TextLayout::new(&font)
+                .with_font_size(32.0)
+                .with_language_tag("en-US");
+            let plain = builder
+                .clone()
+                .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                .run(text)?;
+            let discretionary = builder
+                .with_hyphenation_policy(HyphenationPolicy::Normal)
+                .run(text)?;
+            let glyphs = |layout: &LayoutRun<'_>| {
+                layout.lines[0]
+                    .glyphs
+                    .iter()
+                    .map(|glyph| {
+                        (
+                            glyph.glyph_id,
+                            glyph.cluster,
+                            glyph.x_advance,
+                            glyph.x_offset,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(glyphs(&plain), glyphs(&discretionary), "text={text}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_line_widths_include_whole_words_and_break_suffixes() -> anyhow::Result<()> {
+        let mut fonts = FontSystem::new();
+        let font = fonts
+            .query_family("DejaVu Serif")
+            .or_else(|_| fonts.query_family("Times New Roman"))?;
+        let text = "office affinity efficiently typography";
+        let base = TextLayout::new(&font)
+            .with_font_size(32.0)
+            .with_language_tag("en-US");
+        let full = base
+            .clone()
+            .with_hyphenation_policy(HyphenationPolicy::Disabled)
+            .run(text)?;
+        for ratio in [0.22, 0.45, 0.7] {
+            let width = full.lines[0].advance * ratio;
+            let layout = base.clone().with_max_width(width).run(text)?;
+            for line in &layout.lines {
+                let mut displayed = text[line.range.clone()].to_owned();
+                if let Some(suffix) = line.break_suffix {
+                    displayed.push_str(suffix.as_str());
+                }
+                let expected = base
+                    .clone()
+                    .with_hyphenation_policy(HyphenationPolicy::Disabled)
+                    .run(&displayed)?;
+                assert_eq!(
+                    line.glyphs
+                        .iter()
+                        .map(|g| (g.glyph_id, g.cluster as usize - line.range.start))
+                        .collect::<Vec<_>>(),
+                    expected.lines[0]
+                        .glyphs
+                        .iter()
+                        .map(|g| (g.glyph_id, g.cluster as usize))
+                        .collect::<Vec<_>>(),
+                    "{displayed}"
+                );
+                assert_approx_eq(line.advance, expected.lines[0].advance);
+                assert!(
+                    line.advance <= width + 0.001,
+                    "{displayed}: {} > {width}",
+                    line.advance
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_line_widths_need_not_grow_at_discretionary_boundaries() {
+        let measures = LineMeasurements {
+            segments: vec![
+                BreakPoint {
+                    hyphenated: true,
+                    break_penalty: 0.0,
+                    is_mandatory: false,
+                },
+                BreakPoint {
+                    hyphenated: false,
+                    break_penalty: 0.0,
+                    is_mandatory: false,
+                },
+            ],
+            // The shorter candidate includes a suffix; the complete word does not.
+            advances: vec![vec![70.0, 60.0], vec![20.0]],
+        };
+        let uniform = optimal_uniform_line_breaks(&measures, 64.0, true);
+        let profiled = exact_profiled_line_breaks(
+            &measures,
+            vec![LineProfile {
+                width: 64.0,
+                center_offset: 0.0,
+                block_baseline: 0.0,
+            }],
+            true,
+        )
+        .unwrap();
+        for result in [uniform, profiled] {
+            assert!(!result.overflowed);
+            assert_eq!(result.breaks, [2]);
+        }
     }
 
     #[test]

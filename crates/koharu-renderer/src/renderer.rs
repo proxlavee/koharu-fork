@@ -8,14 +8,18 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use icu_properties::{
+    CodePointMapData,
+    props::{GeneralCategory, GeneralCategoryGroup},
+};
 use koharu_rasterizer::{RasterOptions, Rasterizer};
 use koharu_scene::{
     Asset, AssetRole, BlobId, BubbleRegion, Change, Component, ComponentOwner, EntityChange,
     EntityId, FitsTo, FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, PanelRegion, Presents,
     RasterLayer, RasterLayerKind, RecognizedFrom, Region, RegionSpec, RelationChange, RelationId,
     RelationSpec, Revision, Snapshot, SourceText, TextAlignment, TextDirection,
-    TextLayout as SceneTextLayout, TextLayoutKind, TextRegion, TextRole, Translation, Typography,
-    Visibility,
+    TextLayout as SceneTextLayout, TextLayoutKind, TextRegion, TextRole, Translation,
+    TypesettingReview, Typography, Visibility,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -34,6 +38,7 @@ use crate::{
     Error, FontFamily, FontStyle, Frame, ImageKind, ImageMetadata, Layer, LayerKind, Presentation,
     RasterImage, RenderBounds, RenderDependency, RenderDiagnostic, Result, RetentionStats,
     TextAlign, TextMetadata, TypesettingConfig, WritingMode,
+    artwork::{ArtworkContext, ArtworkLayer},
     bubble::{
         GeometryFrame, LayoutBox, clip_half_plane, contour, flow_cells, geometry_bounds,
         geometry_frame, intersected_centroid, point_in_frame, polygon_centroid, polygons_overlap,
@@ -46,7 +51,9 @@ use crate::{
     free_text::{FreeTextRequest, FreeTextSite, FreeTextSpace, SpatialRegion},
     images::{DecodedImage, ImageCache, decode},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
-    text_renderer::{StrokeOptions, StrokeWidth, TextNodeDescriptor, TextRenderer},
+    text_renderer::{
+        FontSizeReference, StrokeOptions, StrokeWidth, TextNodeDescriptor, TextRenderer,
+    },
 };
 
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
@@ -62,6 +69,14 @@ const STROKE_LUMA_MIDPOINT: u32 = 128_000;
 const MIN_STROKE_FOREGROUND_LUMA_CONTRAST: u32 = 64_000;
 const DETECTED_WRITING_MODE_ASPECT_RATIO: f32 = 1.15;
 const MAX_TRANSLATION_VISUAL_AREA_SCALE: f32 = 6.0;
+// A reviewed free-text size is an explicit request to search beyond the current
+// translation-derived footprint when that exact size cannot fit there. The
+// extra area tier lets the controller test a materially different block shape;
+// it is still clipped against measured panel, text-site, and artwork obstacles,
+// and the visual QA hard validators decide whether the realized state is safe.
+const REVIEWED_FREE_TEXT_VISUAL_AREA_MULTIPLIER: f32 = 1.5;
+const MAX_REVIEWED_FREE_TEXT_VISUAL_AREA_SCALE: f32 =
+    MAX_TRANSLATION_VISUAL_AREA_SCALE * REVIEWED_FREE_TEXT_VISUAL_AREA_MULTIPLIER;
 
 fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
@@ -191,6 +206,11 @@ impl Renderer {
             .families()
             .await
             .map_err(Error::FontResource)
+    }
+
+    #[must_use]
+    pub fn preferred_font_families(&self) -> Vec<String> {
+        self.inner.typesetting.load().font_families.clone()
     }
 
     pub async fn font_preview(
@@ -330,13 +350,19 @@ impl Renderer {
             .await
             .map_err(Error::FontResource)?;
         let fonts_us = elapsed_micros(fonts_started);
-        let image_ids = pending
-            .iter()
-            .filter_map(|(_, descriptor)| match descriptor {
-                NodeDescriptor::Image(image) => Some(image.blob),
-                NodeDescriptor::Text(_) => None,
-            })
-            .collect::<BTreeSet<_>>();
+        let mut image_ids = BTreeSet::new();
+        for (_, descriptor) in &pending {
+            match descriptor {
+                NodeDescriptor::Image(image) => {
+                    image_ids.insert(image.blob);
+                }
+                NodeDescriptor::Text(text) => {
+                    if let Some(artwork) = &text.artwork {
+                        image_ids.extend(artwork.layers.iter().map(|layer| layer.blob));
+                    }
+                }
+            }
+        }
         let image_count = image_ids.len();
         let images_started = Instant::now();
         let images = Arc::new(self.load_images(snapshot, image_ids).await?);
@@ -668,6 +694,57 @@ impl Renderer {
             },
             &[],
         )?;
+        let artwork_layers = traversal
+            .layers
+            .iter()
+            .filter_map(|layer| {
+                let NodeDescriptor::Image(image) = &layer.descriptor else {
+                    return None;
+                };
+                (layer.presentation.visible && layer.presentation.opacity > 0.0).then_some(
+                    ArtworkLayer {
+                        blob: image.blob,
+                        bounds: layer.frame.bounds,
+                        opacity: layer.presentation.opacity,
+                    },
+                )
+            })
+            .collect::<Arc<[_]>>();
+        let artwork_dependencies = traversal
+            .layers
+            .iter()
+            .filter(|layer| matches!(&layer.descriptor, NodeDescriptor::Image(_)))
+            .flat_map(|layer| layer.dependencies.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for layer in &mut traversal.layers {
+            let NodeDescriptor::Text(text) = &mut layer.descriptor else {
+                continue;
+            };
+            if !artwork_layers.is_empty()
+                && text.automatic_free_text
+                && text.auto_fit
+                && !text.free_text_candidates.is_empty()
+                && text.font_size.is_none()
+                && text.reviewed_font_size.is_none()
+                && text.preferred_line_count.is_none()
+                && text.placement_offset == (0.0, 0.0)
+                && text.source_font_size.is_some()
+                && matches!(&text.typography_origin, Some(Origin::Generated(_)))
+            {
+                text.artwork = Some(ArtworkContext {
+                    layers: artwork_layers.clone(),
+                    text_frame: layer.frame,
+                });
+                layer.dependencies = layer
+                    .dependencies
+                    .iter()
+                    .cloned()
+                    .chain(artwork_dependencies.iter().cloned())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            }
+        }
         Ok(CompiledPage {
             revision: snapshot.revision(),
             page,
@@ -842,6 +919,7 @@ impl Traversal<'_> {
         dependencies.insert(component_dependency::<Translation>(content));
         dependencies.insert(component_dependency::<SourceText>(content));
         dependencies.insert(component_dependency::<TextRole>(content));
+        dependencies.insert(component_dependency::<TypesettingReview>(entity));
         dependencies.insert(RenderDependency::RelationQuery {
             source: content,
             kind: RecognizedFrom::KIND.to_owned(),
@@ -865,6 +943,7 @@ impl Traversal<'_> {
             self.fit(entity, dependencies)?
         };
         let typography = self.snapshot.component::<Typography>(entity)?;
+        let review = self.snapshot.component::<TypesettingReview>(entity)?;
         let (analysis, source_frame) =
             if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
                 dependencies.insert(RenderDependency::Relation(recognized.id()));
@@ -903,9 +982,10 @@ impl Traversal<'_> {
             typography.as_ref(),
             analysis.as_ref(),
         );
-        let foreground_color = typography
+        let foreground_color = review
             .as_ref()
             .and_then(|value| value.color)
+            .or_else(|| typography.as_ref().and_then(|value| value.color))
             .unwrap_or([0, 0, 0, 255]);
         let automatic_free_text = authored.is_none()
             && layout.kind == TextLayoutKind::Paragraph
@@ -922,13 +1002,19 @@ impl Traversal<'_> {
                 target_writing_mode: writing_mode,
                 // Changing axes needs alternate shapes, not a prescribed line
                 // count inferred from square source-language glyphs.
-                refine_orthogonal_shape: source_writing_mode != writing_mode,
-                translation_visual_area_scale: translation_visual_area_scale(
+                refine_orthogonal_shape: source_writing_mode != writing_mode
+                    || review
+                        .as_ref()
+                        .and_then(|value| value.preferred_line_count)
+                        .is_some(),
+                translation_visual_area_scale: reviewed_free_text_visual_area_scale(
                     source_text.as_ref(),
                     &text,
+                    review.as_ref().and_then(|value| value.font_size).is_some(),
                 ),
-                clearance: free_text_clearance(
+                clearance: reviewed_free_text_clearance(
                     typography.as_ref(),
+                    review.as_ref(),
                     text_role.as_ref(),
                     foreground_color,
                 ),
@@ -972,13 +1058,21 @@ impl Traversal<'_> {
         };
         let (direction, _) = shaping_direction_for_text(&text, writing_mode);
         let alignment = resolve_alignment(
-            typography.as_ref().and_then(|value| value.alignment),
+            review
+                .as_ref()
+                .and_then(|value| value.alignment)
+                .or_else(|| typography.as_ref().and_then(|value| value.alignment)),
             writing_mode,
             direction == harfrust::Direction::RightToLeft,
         );
-        let preferred_font = typography
+        let preferred_font = review
             .as_ref()
-            .and_then(|value| value.preferred_font.clone());
+            .and_then(|value| value.preferred_font.clone())
+            .or_else(|| {
+                typography
+                    .as_ref()
+                    .and_then(|value| value.preferred_font.clone())
+            });
         let font_families = self.font_families.to_vec();
         for family in preferred_font.iter().chain(font_families.iter()) {
             dependencies.insert(RenderDependency::Font(family.clone()));
@@ -993,6 +1087,24 @@ impl Traversal<'_> {
             Some(typography) => (typography.size, None),
             None => (None, None),
         };
+        let font_size_reference = source_font_size
+            .map(|size| {
+                if symbol_only_text(&text)
+                    && source_text
+                        .as_ref()
+                        .is_some_and(|source| symbol_only_text(&source.text.value))
+                    && let Some(frame) = source_frame
+                {
+                    FontSizeReference::InkArea(frame.bounds.width * frame.bounds.height)
+                } else {
+                    FontSizeReference::CrossLine(size)
+                }
+            })
+            .filter(|_| {
+                review
+                    .as_ref()
+                    .is_none_or(|value| value.preferred_line_count.is_none())
+            });
         let descriptor = TextNodeDescriptor {
             entity,
             text: text.clone(),
@@ -1005,23 +1117,44 @@ impl Traversal<'_> {
             flow_contours,
             preferred_center,
             free_text_candidates,
+            artwork: None,
+            preferred_line_count: review
+                .as_ref()
+                .and_then(|value| value.preferred_line_count)
+                .map(usize::from),
             automatic_free_text,
             preferred_font,
             font_families,
-            font_weight: typography.as_ref().and_then(|value| value.font_weight),
-            font_style: typography
+            font_weight: review
+                .as_ref()
+                .and_then(|value| value.font_weight)
+                .or_else(|| typography.as_ref().and_then(|value| value.font_weight)),
+            font_style: review
                 .as_ref()
                 .and_then(|value| value.font_style)
+                .or_else(|| typography.as_ref().and_then(|value| value.font_style))
                 .map(Into::into),
             font_size,
+            reviewed_font_size: review.as_ref().and_then(|value| value.font_size),
             source_font_size,
-            preferred_font_size: source_font_size,
+            font_size_reference,
             minimum_font_size: crate::MINIMUM_READABLE_FONT_SIZE,
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
             writing_mode,
             foreground_color,
-            stroke: resolve_stroke(typography.as_ref(), text_role.as_ref(), foreground_color),
+            stroke: resolve_reviewed_stroke(
+                typography.as_ref(),
+                review.as_ref(),
+                text_role.as_ref(),
+                foreground_color,
+            ),
+            allow_discretionary_hyphenation: review
+                .as_ref()
+                .and_then(|value| value.allow_discretionary_hyphenation),
+            placement_offset: review
+                .as_ref()
+                .map_or((0.0, 0.0), |value| (value.offset_x, value.offset_y)),
             line_height: GENERATED_TEXT_LINE_HEIGHT,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -1847,7 +1980,7 @@ fn build_node(
             })
         }
         NodeDescriptor::Text(text) => {
-            let rendered = TextRenderer::new().render_descriptor(text, fonts)?;
+            let rendered = TextRenderer::new().render_descriptor(text, fonts, images)?;
             Ok(RetainedNode {
                 descriptor,
                 scene: rendered.scene,
@@ -1860,6 +1993,10 @@ fn build_node(
                     post_script_fonts: rendered.metadata.post_script_fonts,
                     font_size: rendered.metadata.font_size,
                     color: rendered.metadata.color,
+                    stroke_color: rendered.metadata.stroke_color,
+                    stroke_width: rendered.metadata.stroke_width,
+                    line_ranges: rendered.metadata.line_ranges,
+                    discretionary_hyphens: rendered.metadata.discretionary_hyphens,
                 }),
                 diagnostics: rendered.diagnostics.into(),
             })
@@ -1890,14 +2027,26 @@ fn assemble_frame(
                     .text
                     .as_ref()
                     .expect("text descriptor must build text metadata");
+                let NodeDescriptor::Text(descriptor) = &node.descriptor else {
+                    unreachable!("text metadata must have a text descriptor");
+                };
+                let flow_center = descriptor.preferred_center.map(|(x, y)| {
+                    let point = placement * vello::kurbo::Point::new(f64::from(x), f64::from(y));
+                    (point.x as f32, point.y as f32)
+                });
                 LayerKind::Text(TextMetadata {
                     text,
                     language,
                     rendered_bounds: transform_bounds(metadata.rendered_bounds, placement),
                     layout_bounds: transform_bounds(metadata.layout_bounds, placement),
+                    flow_center,
                     post_script_fonts: metadata.post_script_fonts.clone(),
                     font_size: metadata.font_size,
                     color: metadata.color,
+                    stroke_color: metadata.stroke_color,
+                    stroke_width: metadata.stroke_width,
+                    line_ranges: metadata.line_ranges.clone(),
+                    discretionary_hyphens: metadata.discretionary_hyphens,
                     alignment,
                     writing_mode,
                     angle_degrees,
@@ -1963,17 +2112,7 @@ fn placement(draft: &LayerDraft, node: &RetainedNode) -> Affine {
             f64::from(draft.frame.bounds.x),
             f64::from(draft.frame.bounds.y),
         )),
-        NodeDescriptor::Text(_) => {
-            let frame = draft.frame.bounds;
-            Affine::translate((
-                f64::from(frame.x + frame.width * 0.5),
-                f64::from(frame.y + frame.height * 0.5),
-            )) * Affine::rotate(f64::from(draft.frame.angle_degrees).to_radians())
-                * Affine::translate((
-                    -f64::from(frame.width * 0.5),
-                    -f64::from(frame.height * 0.5),
-                ))
-        }
+        NodeDescriptor::Text(_) => draft.frame.transform(),
     }
 }
 
@@ -2143,6 +2282,16 @@ fn resolve_detected_writing_mode(
     }
 }
 
+fn symbol_only_text(text: &str) -> bool {
+    let categories = CodePointMapData::<GeneralCategory>::new();
+    !text.chars().any(char::is_alphanumeric)
+        && text.chars().any(|ch| {
+            let category = categories.get(ch);
+            GeneralCategoryGroup::Punctuation.contains(category)
+                || GeneralCategoryGroup::Symbol.contains(category)
+        })
+}
+
 fn translation_visual_area_scale(source: Option<&SourceText>, target: &str) -> f32 {
     let Some(source) = source else {
         return 1.0;
@@ -2153,6 +2302,20 @@ fn translation_visual_area_scale(source: Option<&SourceText>, target: &str) -> f
         return 1.0;
     }
     (target_units as f32 / source_units as f32).min(MAX_TRANSLATION_VISUAL_AREA_SCALE)
+}
+
+fn reviewed_free_text_visual_area_scale(
+    source: Option<&SourceText>,
+    target: &str,
+    has_reviewed_font_size: bool,
+) -> f32 {
+    let translation_scale = translation_visual_area_scale(source, target);
+    if has_reviewed_font_size {
+        (translation_scale * REVIEWED_FREE_TEXT_VISUAL_AREA_MULTIPLIER)
+            .min(MAX_REVIEWED_FREE_TEXT_VISUAL_AREA_SCALE)
+    } else {
+        translation_scale
+    }
 }
 
 fn layout_character_count(text: &str) -> usize {
@@ -2192,6 +2355,31 @@ fn free_text_clearance(
             .unwrap_or(crate::MINIMUM_READABLE_FONT_SIZE)
             * GENERATED_TEXT_HALO_EM
     })
+}
+
+fn reviewed_free_text_clearance(
+    typography: Option<&Typography>,
+    review: Option<&TypesettingReview>,
+    role: Option<&TextRole>,
+    foreground: [u8; 4],
+) -> f32 {
+    let Some(review) = review else {
+        return free_text_clearance(typography, role, foreground);
+    };
+    if !is_generated_free_text(role) {
+        return 0.0;
+    }
+    if review.font_size.is_none() && review.stroke_color.is_none() && review.stroke_width.is_none()
+    {
+        return free_text_clearance(typography, role, foreground);
+    }
+    let reference_font_size = review
+        .font_size
+        .or_else(|| typography.and_then(|value| value.size))
+        .unwrap_or(crate::MINIMUM_READABLE_FONT_SIZE);
+    resolve_reviewed_stroke(typography, Some(review), role, foreground)
+        .map(|stroke| stroke.for_font_size(reference_font_size).width_px.max(0.0))
+        .unwrap_or(0.0)
 }
 
 fn resolve_alignment(
@@ -2250,6 +2438,38 @@ fn resolve_stroke(
             color,
             width: StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
         })
+}
+
+fn resolve_reviewed_stroke(
+    typography: Option<&Typography>,
+    review: Option<&TypesettingReview>,
+    role: Option<&TextRole>,
+    foreground: [u8; 4],
+) -> Option<StrokeOptions> {
+    let base = resolve_stroke(typography, role, foreground);
+    let Some(review) = review else {
+        return base;
+    };
+    if review.stroke_color.is_none() && review.stroke_width.is_none() {
+        return base;
+    }
+    if review.stroke_width == Some(0.0) {
+        return None;
+    }
+    let color = review
+        .stroke_color
+        .or_else(|| base.map(|stroke| stroke.color))
+        .or_else(|| opposing_halo_color(foreground))?;
+    let width = review.stroke_width.map_or_else(
+        || {
+            base.map_or(
+                StrokeWidth::FontRelative(GENERATED_TEXT_HALO_EM),
+                |stroke| stroke.width,
+            )
+        },
+        StrokeWidth::Absolute,
+    );
+    Some(StrokeOptions { color, width })
 }
 
 fn accepted_explicit_stroke_width(
@@ -2662,6 +2882,16 @@ mod tests {
     }
 
     #[test]
+    fn symbol_only_text_does_not_mistake_dialogue_or_invisible_text_for_a_symbol() {
+        for text in ["!", "！？", "...", "♡", " ♪ ", "👁\u{fe0f}"] {
+            assert!(symbol_only_text(text), "{text:?}");
+        }
+        for text in ["", " \n", "\u{200d}", "Ne?!", "夢", "99%", "ありがとう…"] {
+            assert!(!symbol_only_text(text), "{text:?}");
+        }
+    }
+
+    #[test]
     fn translation_demand_scales_visual_area_only_when_the_target_is_longer() {
         let source = |text: &str| SourceText {
             text: Authored::user(text.to_owned()),
@@ -2680,6 +2910,31 @@ mod tests {
         assert_eq!(
             translation_visual_area_scale(Some(&source("a")), "abcdefghijkl"),
             MAX_TRANSLATION_VISUAL_AREA_SCALE
+        );
+    }
+
+    #[test]
+    fn reviewed_free_text_size_unlocks_obstacle_aware_area_families() {
+        let source = SourceText {
+            text: Authored::user("longer source text".to_owned()),
+            language: None,
+        };
+        let short_source = SourceText {
+            text: Authored::user("a".to_owned()),
+            language: None,
+        };
+
+        assert_eq!(
+            reviewed_free_text_visual_area_scale(Some(&source), "short", false),
+            1.0
+        );
+        assert_eq!(
+            reviewed_free_text_visual_area_scale(Some(&source), "short", true),
+            REVIEWED_FREE_TEXT_VISUAL_AREA_MULTIPLIER
+        );
+        assert_eq!(
+            reviewed_free_text_visual_area_scale(Some(&short_source), "abcdefghijkl", true),
+            MAX_REVIEWED_FREE_TEXT_VISUAL_AREA_SCALE
         );
     }
 
@@ -3056,10 +3311,10 @@ mod tests {
                     extensions: BTreeMap::new(),
                 },
             )?;
-            Ok((edit.finish()?, page, layer))
+            Ok((edit.finish()?, page, layer, content, source))
         })()
         .unwrap();
-        let (patch, page, layer) = create;
+        let (patch, page, layer, content, source) = create;
         let base = session.commit(patch).await.unwrap().snapshot;
         let renderer = Renderer::default();
         let compiled = renderer.compile(&base, page).unwrap();
@@ -3073,8 +3328,123 @@ mod tests {
         };
         assert!(descriptor.automatic_free_text);
         assert_eq!(descriptor.writing_mode, WritingMode::Horizontal);
-        assert_eq!(descriptor.preferred_font_size, Some(24.0));
+        assert_eq!(descriptor.preferred_line_count, None);
+        assert_eq!(
+            descriptor.font_size_reference,
+            Some(FontSizeReference::CrossLine(24.0))
+        );
         assert!(descriptor.free_text_candidates.len() > 1);
+
+        let symbols = base
+            .patch(|edit| {
+                edit.set(
+                    content,
+                    &SourceText {
+                        text: Authored::user("！".to_owned()),
+                        language: None,
+                    },
+                )?;
+                edit.set(
+                    content,
+                    &Translation {
+                        text: Authored::user("!".to_owned()),
+                        language: None,
+                    },
+                )?;
+                edit.set(source, &Geometry::rectangle(100.0, 80.0, 8.0, 50.0))
+            })
+            .unwrap();
+        let symbolic = base.preview([&symbols]).unwrap();
+        let compiled = renderer.compile(&symbolic, page).unwrap();
+        let symbol_draft = compiled
+            .layers
+            .iter()
+            .find(|draft| draft.entity == layer)
+            .unwrap();
+        let NodeDescriptor::Text(symbol) = &symbol_draft.descriptor else {
+            panic!("expected text");
+        };
+        assert_eq!(
+            symbol.font_size_reference,
+            Some(FontSizeReference::InkArea(400.0))
+        );
+        let changed = symbolic
+            .patch(|edit| edit.set(source, &Geometry::rectangle(100.0, 80.0, 16.0, 100.0)))
+            .unwrap();
+        let resized = symbolic.preview([&changed]).unwrap();
+        let compiled = renderer.compile(&resized, page).unwrap();
+        let resized_draft = compiled
+            .layers
+            .iter()
+            .find(|draft| draft.entity == layer)
+            .unwrap();
+        let NodeDescriptor::Text(resized_descriptor) = &resized_draft.descriptor else {
+            panic!("expected text");
+        };
+        assert_eq!(
+            resized_descriptor.font_size_reference,
+            Some(FontSizeReference::InkArea(1600.0))
+        );
+        assert_ne!(symbol_draft.descriptor, resized_draft.descriptor);
+
+        let authored = symbolic
+            .patch(|edit| {
+                edit.promote_entity_to_user(layer)?;
+                let mut typography = symbolic.component::<Typography>(layer)?.unwrap();
+                typography.origin = Origin::User;
+                edit.set(layer, &typography)
+            })
+            .unwrap();
+        let authored = symbolic.preview([&authored]).unwrap();
+        let compiled = renderer.compile(&authored, page).unwrap();
+        let authored_draft = compiled
+            .layers
+            .iter()
+            .find(|draft| draft.entity == layer)
+            .unwrap();
+        let NodeDescriptor::Text(authored_descriptor) = &authored_draft.descriptor else {
+            panic!("expected text");
+        };
+        assert_eq!(authored_descriptor.font_size_reference, None);
+        assert_eq!(authored_descriptor.font_size, Some(24.0));
+
+        let review = base
+            .patch(|edit| {
+                edit.set(
+                    layer,
+                    &TypesettingReview {
+                        origin: origin.clone(),
+                        preferred_font: None,
+                        font_weight: None,
+                        font_style: None,
+                        font_size: Some(22.5),
+                        color: None,
+                        stroke_color: None,
+                        stroke_width: None,
+                        alignment: None,
+                        preferred_line_count: Some(3),
+                        allow_discretionary_hyphenation: None,
+                        offset_x: 0.0,
+                        offset_y: 0.0,
+                    },
+                )
+            })
+            .unwrap();
+        let reviewed = session.commit(review).await.unwrap();
+        let affected = AffectedDependencies::new(&reviewed.snapshot, &reviewed.changes).unwrap();
+        assert!(affected.intersects(&draft.dependencies));
+        let compiled = renderer.compile(&reviewed.snapshot, page).unwrap();
+        let draft = compiled
+            .layers
+            .iter()
+            .find(|draft| draft.entity == layer)
+            .unwrap();
+        let NodeDescriptor::Text(descriptor) = &draft.descriptor else {
+            panic!("expected text");
+        };
+        assert_eq!(descriptor.preferred_line_count, Some(3));
+        assert_eq!(descriptor.reviewed_font_size, Some(22.5));
+        assert_eq!(descriptor.font_size_reference, None);
     }
 
     #[tokio::test]
@@ -3100,7 +3470,8 @@ mod tests {
         let snapshot = session.commit(create).await.unwrap().snapshot;
         let (page, region) = ids.unwrap();
 
-        let compiled = Renderer::default().compile(&snapshot, page).unwrap();
+        let renderer = Renderer::default();
+        let compiled = renderer.compile(&snapshot, page).unwrap();
         assert!(compiled.layers.iter().all(|layer| layer.entity != region));
     }
 
@@ -3272,7 +3643,14 @@ mod tests {
             .unwrap();
         let before = session.commit(create).await.unwrap().snapshot;
         let (page, source, layer) = ids.unwrap();
-        let renderer = Renderer::default();
+        let family = crate::fonts::FontSystem::new()
+            .first_font()
+            .unwrap()
+            .family_name()
+            .to_owned();
+        let renderer = Renderer::with_typesetting(TypesettingConfig {
+            font_families: vec![family],
+        });
         let compiled_before = renderer.compile(&before, page).unwrap();
         let first = compiled_before
             .layers
@@ -3294,6 +3672,50 @@ mod tests {
             .find(|candidate| candidate.entity == layer)
             .unwrap();
         assert_eq!(first.descriptor, second.descriptor);
+
+        let rendered = renderer.render(&after.snapshot, page).await.unwrap();
+        let LayerKind::Text(metadata) = rendered.layer(layer).unwrap().kind() else {
+            panic!("expected text metadata");
+        };
+        assert_eq!(metadata.flow_center, Some((120.0, 140.0)));
+        let offset = after
+            .snapshot
+            .patch(|edit| {
+                edit.set(
+                    layer,
+                    &TypesettingReview {
+                        origin: Origin::User,
+                        preferred_font: None,
+                        font_weight: None,
+                        font_style: None,
+                        font_size: None,
+                        color: None,
+                        stroke_color: None,
+                        stroke_width: None,
+                        alignment: None,
+                        preferred_line_count: None,
+                        allow_discretionary_hyphenation: None,
+                        offset_x: 10.0,
+                        offset_y: -7.0,
+                    },
+                )
+            })
+            .unwrap();
+        let moved = session.commit(offset).await.unwrap();
+        let updated = renderer
+            .update(&rendered, &moved.snapshot, &moved.changes)
+            .await
+            .unwrap();
+        let LayerKind::Text(updated_metadata) = updated.layer(layer).unwrap().kind() else {
+            panic!("expected text metadata");
+        };
+        assert_eq!(updated_metadata.flow_center, metadata.flow_center);
+        assert!(
+            (updated_metadata.rendered_bounds.x - metadata.rendered_bounds.x - 10.0).abs() < 0.01
+        );
+        assert!(
+            (updated_metadata.rendered_bounds.y - metadata.rendered_bounds.y + 7.0).abs() < 0.01
+        );
     }
 
     #[tokio::test]
@@ -3596,6 +4018,163 @@ mod tests {
                 opacity: 1.0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn generated_free_text_rebuilds_from_changed_cleanup_pixels() -> anyhow::Result<()> {
+        let mut session = Session::memory().await?;
+        let generation = Generation::new(ProducerId::new("dev.koharu.pipeline.detection")?);
+        let origin = Origin::Generated(generation.clone());
+        let source_role = AssetRole::new("source")?;
+        let mut edit = session.snapshot().edit_as(generation);
+        let page = edit.add_page(PageDraft::new("page", 400.0, 400.0), At::End)?;
+        edit.set_asset(page, &source_role, asset(png(400, 400, [255; 4]), 400, 400))?;
+        let cleanup = edit.add_entity(page, At::End)?;
+        edit.set(
+            cleanup,
+            &RasterLayer {
+                origin: origin.clone(),
+                name: "Cleanup".to_owned(),
+                kind: RasterLayerKind::Cleanup,
+            },
+        )?;
+        edit.set_asset(
+            cleanup,
+            &source_role,
+            asset(png(400, 400, [0; 4]), 400, 400),
+        )?;
+        let source = edit.add_analysis_region::<TextRegion>(
+            page,
+            At::End,
+            &Geometry::rectangle(120.0, 60.0, 60.0, 180.0),
+            None,
+        )?;
+        let content = edit.add_text_content(page, At::End)?;
+        edit.set(
+            content,
+            &SourceText {
+                text: Authored::user("縦書きの文章".to_owned()),
+                language: Some(koharu_scene::LanguageTag::new("ja")?),
+            },
+        )?;
+        edit.set(
+            content,
+            &Translation {
+                text: Authored::user(
+                    "A translated caption can choose its own line breaks.".to_owned(),
+                ),
+                language: Some(koharu_scene::LanguageTag::new("en")?),
+            },
+        )?;
+        edit.set(
+            content,
+            &TextRole {
+                origin: origin.clone(),
+                role: FREE_TEXT_ROLE.to_owned(),
+            },
+        )?;
+        edit.relate::<RecognizedFrom>(content, source)?;
+        let text = edit.add_text_layer(
+            page,
+            At::End,
+            content,
+            &SceneTextLayout {
+                origin: origin.clone(),
+                kind: TextLayoutKind::Paragraph,
+            },
+        )?;
+        edit.relate::<FitsTo>(text, source)?;
+        edit.set(
+            text,
+            &Typography {
+                origin,
+                preferred_font: None,
+                font_weight: None,
+                font_style: None,
+                size: Some(32.0),
+                auto_fit: true,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                alignment: None,
+                writing_mode: Some(koharu_scene::WritingMode::Vertical),
+                extensions: BTreeMap::new(),
+            },
+        )?;
+        let first = session.commit(edit.finish()?).await?;
+        let renderer = Renderer::default();
+        let before = renderer.render(&first.snapshot, page).await?;
+        let before_text = before.layer(text).unwrap();
+        let NodeDescriptor::Text(descriptor) = &before_text.0.node.descriptor else {
+            panic!("expected text");
+        };
+        assert!(descriptor.artwork.is_some());
+        let initial_metadata = before_text.0.node.text.as_ref().unwrap();
+
+        let artwork = image::RgbaImage::from_fn(400, 400, |x, y| {
+            if !(120..180).contains(&x) && ((x / 4 + y / 4) % 2 == 0) {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255; 4])
+            }
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        artwork.write_to(&mut bytes, image::ImageFormat::Png)?;
+        let patch = first.snapshot.patch(|edit| {
+            edit.set_asset(
+                cleanup,
+                &source_role,
+                asset(bytes.into_inner().into(), 400, 400),
+            )
+        })?;
+        let changed = session.commit(patch).await?;
+        let after = renderer
+            .update(&before, &changed.snapshot, &changed.changes)
+            .await?;
+        let after_text = after.layer(text).unwrap();
+        assert!(
+            !Arc::ptr_eq(&before_text.0.node, &after_text.0.node),
+            "cleanup must invalidate the lettering evidence"
+        );
+        assert!(Arc::ptr_eq(
+            &before.layer(page).unwrap().0.node,
+            &after.layer(page).unwrap().0.node
+        ));
+        let actual = after_text.0.node.text.as_ref().unwrap();
+        assert_ne!(
+            actual.rendered_bounds, initial_metadata.rendered_bounds,
+            "the renderer ignored newly covered artwork"
+        );
+        assert!(
+            after_text.0.node.diagnostics.is_empty(),
+            "artwork avoidance must still produce a legal readable layout"
+        );
+        let cold = Renderer::default().render(&changed.snapshot, page).await?;
+        let cold_text = cold.layer(text).unwrap().0.node.text.as_ref().unwrap();
+        assert_eq!(actual.rendered_bounds, cold_text.rendered_bounds);
+        assert_eq!(actual.font_size, cold_text.font_size);
+        assert_eq!(actual.line_ranges, cold_text.line_ranges);
+
+        let authored = changed.snapshot.patch(|edit| {
+            edit.promote_entity_to_user(text)?;
+            edit.set(text, &Geometry::rectangle(20.0, 20.0, 200.0, 100.0))
+        })?;
+        let authored = changed.snapshot.preview([&authored])?;
+        let compiled = renderer.compile(&authored, page)?;
+        let NodeDescriptor::Text(descriptor) = &compiled
+            .layers
+            .iter()
+            .find(|layer| layer.entity == text)
+            .unwrap()
+            .descriptor
+        else {
+            panic!("expected text");
+        };
+        assert!(
+            descriptor.artwork.is_none(),
+            "authored placement must remain authoritative"
+        );
+        Ok(())
     }
 
     #[tokio::test]
