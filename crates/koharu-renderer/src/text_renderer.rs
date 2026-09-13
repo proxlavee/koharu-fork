@@ -702,13 +702,14 @@ impl TextRenderer {
                     |size| free_text_content_bounds(descriptor, &candidate, size),
                     |layout| free_text_layout_fits(descriptor, &candidate, layout),
                     |layout, reference| {
-                        free_text_composition_quality(
+                        free_text_composition(
                             descriptor,
                             &candidate,
                             layout,
                             reference,
                             artwork.as_ref(),
                         )
+                        .quality
                     },
                 )
                 .map_err(|source| Error::Layout {
@@ -718,15 +719,12 @@ impl TextRenderer {
                 Some(layout) => layout,
                 None => self.layout_free_text_at(descriptor, &candidate, &builder, minimum)?,
             };
+            let composition =
+                free_text_composition(descriptor, &candidate, &layout, reference, artwork.as_ref());
             measured.push(MeasuredFreeTextLayout {
                 fits: free_text_layout_fits(descriptor, &candidate, &layout),
-                quality: free_text_composition_quality(
-                    descriptor,
-                    &candidate,
-                    &layout,
-                    reference,
-                    artwork.as_ref(),
-                ),
+                quality: composition.quality,
+                preferred_center: composition.preferred_center,
                 layout,
                 candidate,
             });
@@ -880,15 +878,21 @@ struct MeasuredFreeTextLayout<'a> {
     candidate: FreeTextCandidate,
     fits: bool,
     quality: CompositionQuality,
+    preferred_center: (f32, f32),
 }
 
-fn free_text_composition_quality(
+struct FreeTextComposition {
+    quality: CompositionQuality,
+    preferred_center: (f32, f32),
+}
+
+fn free_text_composition(
     descriptor: &TextNodeDescriptor,
     candidate: &FreeTextCandidate,
     layout: &LayoutRun<'_>,
     reference: f32,
     artwork: Option<&ArtworkField>,
-) -> CompositionQuality {
+) -> FreeTextComposition {
     let stroke = descriptor
         .stroke
         .map_or(0.0, |stroke| {
@@ -904,29 +908,49 @@ fn free_text_composition_quality(
         layout.height,
         candidate.preferred_center,
     );
+    let footprint = LayoutBox {
+        x: x + layout.placement_offset_x() - stroke,
+        y: y + layout.placement_offset_y() - stroke,
+        width: layout.width + stroke * 2.0,
+        height: layout.height + stroke * 2.0,
+    };
+    let original_footprint = footprint;
+    let footprint = artwork.map_or(footprint, |field| {
+        let envelope = LayoutBox {
+            x: candidate.bounds.x + layout.placement_offset_x().max(0.0),
+            y: candidate.bounds.y + layout.placement_offset_y().max(0.0),
+            width: candidate.bounds.width - layout.placement_offset_x().abs(),
+            height: candidate.bounds.height - layout.placement_offset_y().abs(),
+        };
+        field.place(footprint, envelope, candidate.preferred_center, source_area)
+    });
     let center = (
-        x + layout.placement_offset_x() + layout.width * 0.5,
-        y + layout.placement_offset_y() + layout.height * 0.5,
+        footprint.x + footprint.width * 0.5,
+        footprint.y + footprint.height * 0.5,
     );
     let displacement = (center.0 - candidate.preferred_center.0)
         .hypot(center.1 - candidate.preferred_center.1)
         / source_area.sqrt();
-    CompositionQuality {
-        requested_lines_error: descriptor
-            .preferred_line_count
-            .map_or(0, |requested| layout.lines.len().abs_diff(requested)),
-        cost: layout.composition_cost(&descriptor.text, reference)
-            + displacement.powi(2)
-            + excess_area.powi(2) * 0.25
-            + artwork.map_or(0.0, |field| {
-                field.cost(LayoutBox {
-                    x: x + layout.placement_offset_x() - stroke,
-                    y: y + layout.placement_offset_y() - stroke,
-                    width: layout.width + stroke * 2.0,
-                    height: layout.height + stroke * 2.0,
-                })
-            }),
-        ..CompositionQuality::default()
+    FreeTextComposition {
+        // The final draw adds the shaped layout offset after anchored placement.
+        preferred_center: if footprint == original_footprint {
+            candidate.preferred_center
+        } else {
+            (
+                center.0 - layout.placement_offset_x(),
+                center.1 - layout.placement_offset_y(),
+            )
+        },
+        quality: CompositionQuality {
+            requested_lines_error: descriptor
+                .preferred_line_count
+                .map_or(0, |requested| layout.lines.len().abs_diff(requested)),
+            cost: layout.composition_cost(&descriptor.text, reference)
+                + displacement.powi(2)
+                + excess_area.powi(2) * 0.25
+                + artwork.map_or(0.0, |field| field.cost(footprint)),
+            ..CompositionQuality::default()
+        },
     }
 }
 
@@ -935,7 +959,7 @@ impl<'a> MeasuredFreeTextLayout<'a> {
         SelectedTextLayout {
             layout: self.layout,
             bounds: self.candidate.bounds,
-            preferred_center: Some(self.candidate.preferred_center),
+            preferred_center: Some(self.preferred_center),
             maximum_visual_area: Some(self.candidate.maximum_visual_area),
         }
     }
@@ -1706,10 +1730,82 @@ mod tests {
         assert!(free_text_layout_fits(&descriptor, &wide, &layout));
         assert!(free_text_layout_fits(&descriptor, &tall, &layout));
         assert_eq!(
-            free_text_composition_quality(&descriptor, &wide, &layout, 24.0, None).cost,
-            free_text_composition_quality(&descriptor, &tall, &layout, 24.0, None).cost,
+            free_text_composition(&descriptor, &wide, &layout, 24.0, None)
+                .quality
+                .cost,
+            free_text_composition(&descriptor, &tall, &layout, 24.0, None)
+                .quality
+                .cost,
             "identical painted text must not be penalized for the unused rectangle aspect ratio"
         );
+
+        descriptor.text = "Hi there".to_owned();
+        descriptor.source_font_size = Some(24.0);
+        let envelope = LayoutBox {
+            x: -60.0,
+            y: 0.0,
+            width: 160.0,
+            height: 80.0,
+        };
+        descriptor.free_text_candidates = vec![FreeTextCandidate {
+            bounds: envelope,
+            preferred_center: (20.0, 40.0),
+            maximum_visual_area: 12_800.0,
+            translation_visual_area_scale: 4.0,
+        }];
+        let baseline = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::new())
+            .unwrap();
+        let pixels = (0..80)
+            .flat_map(|y| {
+                (0..160).flat_map(move |x| {
+                    if x >= 100 && (x / 4 + y / 4) % 2 == 0 {
+                        [0, 0, 0, 255]
+                    } else {
+                        [255; 4]
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let blob = koharu_scene::BlobId::for_bytes(&pixels);
+        let image = Arc::new(DecodedImage {
+            width: 160,
+            height: 80,
+            encoded: Arc::from([]),
+            pixels: pixels.into(),
+        });
+        descriptor.artwork = Some(ArtworkContext {
+            layers: Arc::from([crate::artwork::ArtworkLayer {
+                blob,
+                bounds: envelope,
+                opacity: 1.0,
+            }]),
+            text_frame: crate::bubble::GeometryFrame {
+                bounds: LayoutBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 40.0,
+                    height: 80.0,
+                },
+                angle_degrees: 0.0,
+            },
+        });
+        let shifted = renderer
+            .render_descriptor(&descriptor, &fonts, &HashMap::from([(blob, image)]))
+            .unwrap();
+        let baseline_bounds = baseline.metadata.rendered_bounds;
+        let shifted_bounds = shifted.metadata.rendered_bounds;
+        assert!(
+            shifted_bounds.x < baseline_bounds.x - 1.0,
+            "the selected quiet-space position must reach the final text draw: {:?} vs {:?}",
+            shifted_bounds,
+            baseline_bounds
+        );
+        assert!(
+            shifted.metadata.font_size >= baseline.metadata.font_size * 0.9,
+            "available quiet space should preserve readability"
+        );
+        assert!(shifted_bounds.x >= envelope.x && shifted_bounds.x + shifted_bounds.width <= 45.0);
     }
 
     #[test]

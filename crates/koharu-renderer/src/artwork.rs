@@ -163,6 +163,67 @@ impl ArtworkField {
         ((self.integrate(bounds) - self.integrate(owned)).max(0.0) * self.cell_area_em) as f32
     }
 
+    /// Search only inside the already validated text-site corridor. Artwork
+    /// evidence may change placement, never the footprint or its legal envelope.
+    pub(crate) fn place(
+        &self,
+        footprint: LayoutBox,
+        envelope: LayoutBox,
+        preferred_center: (f32, f32),
+        source_area: f32,
+    ) -> LayoutBox {
+        if self.cost(footprint) <= f32::EPSILON
+            || footprint.width > envelope.width
+            || footprint.height > envelope.height
+        {
+            return footprint;
+        }
+        let score = |bounds: LayoutBox| {
+            let dx = bounds.x + bounds.width * 0.5 - preferred_center.0;
+            let dy = bounds.y + bounds.height * 0.5 - preferred_center.1;
+            self.cost(bounds) + (dx * dx + dy * dy) / source_area
+        };
+        let mut best = footprint;
+        let mut best_score = score(best);
+        let maximum_x = envelope.x + envelope.width - footprint.width;
+        let maximum_y = envelope.y + envelope.height - footprint.height;
+        let mut left = envelope.x;
+        let mut top = envelope.y;
+        let mut right = maximum_x;
+        let mut bottom = maximum_y;
+        // Refine the measured field, not arbitrary page-pixel offsets. The
+        // first grid spans the corridor so a quiet pocket need not be adjacent
+        // to the source anchor. Later grids stop at the field's own resolution.
+        loop {
+            let step_x = (right - left) * 0.25;
+            let step_y = (bottom - top) * 0.25;
+            for row in 0..=4 {
+                for column in 0..=4 {
+                    let candidate = LayoutBox {
+                        x: left + column as f32 * step_x,
+                        y: top + row as f32 * step_y,
+                        ..footprint
+                    };
+                    let cost = score(candidate);
+                    if cost < best_score {
+                        best = candidate;
+                        best_score = cost;
+                    }
+                }
+            }
+            if step_x <= self.bounds.width / self.columns as f32
+                && step_y <= self.bounds.height / self.rows as f32
+            {
+                break;
+            }
+            left = (best.x - step_x).max(envelope.x);
+            top = (best.y - step_y).max(envelope.y);
+            right = (best.x + step_x).min(maximum_x);
+            bottom = (best.y + step_y).min(maximum_y);
+        }
+        best
+    }
+
     fn integrate(&self, bounds: LayoutBox) -> f64 {
         let left = (bounds.x - self.bounds.x) / self.bounds.width * self.columns as f32;
         let top = (bounds.y - self.bounds.y) / self.bounds.height * self.rows as f32;
@@ -269,6 +330,7 @@ mod tests {
     #[test]
     fn artwork_cost_protects_new_territory_without_penalizing_the_source() -> Result<()> {
         let mut baseline: Option<f32> = None;
+        let mut baseline_placement: Option<(f32, f32)> = None;
         for scale in [1.0, 2.0, 3.0] {
             for angle in [0.0, 90.0] {
                 let source = GeometryFrame {
@@ -341,6 +403,34 @@ mod tests {
                     ..owned
                 });
                 assert!(cost > 1.0, "the expanded text missed high-contrast artwork");
+                let footprint = LayoutBox {
+                    x: -20.0 * scale,
+                    y: 20.0 * scale,
+                    width: 80.0 * scale,
+                    height: 80.0 * scale,
+                };
+                let placed = field.place(
+                    footprint,
+                    candidate.bounds,
+                    candidate.preferred_center,
+                    4_800.0 * scale * scale,
+                );
+                assert_eq!(placed.width, footprint.width);
+                assert_eq!(placed.height, footprint.height);
+                assert!(field.cost(placed) < field.cost(footprint) * 0.1);
+                assert!(placed.x >= candidate.bounds.x);
+                assert!(placed.y >= candidate.bounds.y);
+                assert!(placed.x + placed.width <= candidate.bounds.x + candidate.bounds.width);
+                assert!(placed.y + placed.height <= candidate.bounds.y + candidate.bounds.height);
+                let normalized = (placed.x / scale, placed.y / scale);
+                if let Some(expected) = baseline_placement {
+                    assert!(
+                        (normalized.0 - expected.0).hypot(normalized.1 - expected.1) < 0.02,
+                        "placement changed with scale/rotation: {normalized:?} vs {expected:?}"
+                    );
+                } else {
+                    baseline_placement = Some(normalized);
+                }
                 if let Some(expected) = baseline {
                     assert!(
                         (cost - expected).abs() < 0.02,
@@ -370,6 +460,16 @@ mod tests {
                     clean_field.cost(candidate.bounds),
                     0.0,
                     "inpainting must replace the original artwork evidence"
+                );
+                assert_eq!(
+                    clean_field.place(
+                        footprint,
+                        candidate.bounds,
+                        candidate.preferred_center,
+                        4_800.0 * scale * scale,
+                    ),
+                    footprint,
+                    "quiet artwork must preserve the original placement exactly"
                 );
             }
         }
