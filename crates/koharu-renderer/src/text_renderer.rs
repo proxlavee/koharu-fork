@@ -17,7 +17,7 @@ use crate::{
     fonts::{Fonts, font_key},
     free_text::FreeTextCandidate,
     images::DecodedImage,
-    layout::CompositionQuality,
+    layout::{CompositionQuality, font_scale_cost},
     script::is_chinese_or_japanese_text,
 };
 
@@ -652,18 +652,27 @@ impl TextRenderer {
                 .filter(|candidate| candidate.translation_visual_area_scale == source_family)
             {
                 let (minimum, maximum) = font_size_limits(descriptor, candidate.bounds);
-                if let Some(layout) = template
-                    .run_fitting_with_bounds(
+                let Some(mut search) = template
+                    .fitting_compositions(
                         &descriptor.text,
                         minimum,
                         maximum,
                         |size| free_text_content_bounds(descriptor, candidate, size),
                         |layout| free_text_layout_fits(descriptor, candidate, layout),
-                        |layout, reference| CompositionQuality {
-                            cost: layout.composition_cost(&descriptor.text, reference),
-                            ..CompositionQuality::default()
-                        },
                     )
+                    .map_err(|source| Error::Layout {
+                        entity: descriptor.entity,
+                        source,
+                    })?
+                else {
+                    continue;
+                };
+                let capacity = search.reference();
+                if let Some(layout) = search
+                    .select(capacity, None, |layout| CompositionQuality {
+                        cost: layout.composition_cost(&descriptor.text, capacity),
+                        ..CompositionQuality::default()
+                    })
                     .map_err(|source| Error::Layout {
                         entity: descriptor.entity,
                         source,
@@ -690,18 +699,60 @@ impl TextRenderer {
                     .max(descriptor.minimum_font_size)
             })
         };
+        // Every footprint shares one attainable scale. Rebasing independently
+        // inside each rectangle would reward a narrow candidate for shrinking
+        // text even when another legal footprint can preserve its readability.
+        let mut nearest: Option<f32> = None;
         let builder = template.clone().with_preferred_font_size(reference);
-        let mut measured = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let (minimum, maximum) = font_size_limits(descriptor, candidate.bounds);
-            let layout = match builder
-                .run_fitting_with_bounds(
+        let mut searches = candidates
+            .iter()
+            .map(|candidate| {
+                let (minimum, maximum) = font_size_limits(descriptor, candidate.bounds);
+                builder.fitting_compositions(
                     &descriptor.text,
                     minimum,
                     maximum,
-                    |size| free_text_content_bounds(descriptor, &candidate, size),
-                    |layout| free_text_layout_fits(descriptor, &candidate, layout),
-                    |layout, reference| {
+                    |size| free_text_content_bounds(descriptor, candidate, size),
+                    |layout| free_text_layout_fits(descriptor, candidate, layout),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(|source| Error::Layout {
+                entity: descriptor.entity,
+                source,
+            })?;
+        for search in searches.iter_mut().flatten() {
+            let ceiling = nearest.map(|size| CompositionQuality {
+                cost: font_scale_cost(size, reference),
+                ..CompositionQuality::default()
+            });
+            if let Some(layout) = search
+                .select(reference, ceiling, |layout| CompositionQuality {
+                    cost: font_scale_cost(layout.font_size, reference),
+                    ..CompositionQuality::default()
+                })
+                .map_err(|source| Error::Layout {
+                    entity: descriptor.entity,
+                    source,
+                })?
+                && nearest.is_none_or(|current| {
+                    font_scale_cost(layout.font_size, reference)
+                        < font_scale_cost(current, reference)
+                })
+            {
+                nearest = Some(layout.font_size);
+                if layout.font_size == reference {
+                    break;
+                }
+            }
+        }
+        let reference = nearest.unwrap_or(reference);
+        let mut measured = Vec::with_capacity(candidates.len());
+        for (candidate, search) in candidates.iter().copied().zip(searches) {
+            let (minimum, _) = font_size_limits(descriptor, candidate.bounds);
+            let layout = if let Some(mut search) = search {
+                search
+                    .select(reference, None, |layout| {
                         free_text_composition(
                             descriptor,
                             &candidate,
@@ -710,12 +761,16 @@ impl TextRenderer {
                             artwork.as_ref(),
                         )
                         .quality
-                    },
-                )
-                .map_err(|source| Error::Layout {
-                    entity: descriptor.entity,
-                    source,
-                })? {
+                    })
+                    .map_err(|source| Error::Layout {
+                        entity: descriptor.entity,
+                        source,
+                    })?
+                    .cloned()
+            } else {
+                None
+            };
+            let layout = match layout {
                 Some(layout) => layout,
                 None => self.layout_free_text_at(descriptor, &candidate, &builder, minimum)?,
             };

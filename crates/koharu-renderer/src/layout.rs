@@ -206,7 +206,7 @@ impl CompositionQuality {
     }
 }
 
-fn font_scale_cost(size: f32, reference: f32) -> f32 {
+pub(crate) fn font_scale_cost(size: f32, reference: f32) -> f32 {
     // A scale change is a soft contextual prior, not an exact CJK-to-Latin em
     // conversion. A twofold change must cost much more than one word split.
     (16.0 * (f64::from(size) / f64::from(reference)).ln().powi(2)) as f32
@@ -238,51 +238,120 @@ fn composition_font_sizes(minimum: f32, maximum: f32, reference: f32) -> Vec<f32
     sizes
 }
 
-fn search_compositions<'a>(
+enum CompositionMeasurement<'a> {
+    Pending,
+    Infeasible,
+    Fitting(LayoutRun<'a>),
+}
+
+type FittingLayoutResult<'a> = Result<Option<LayoutRun<'a>>>;
+
+/// One immutable text/footprint measurement context, reused when calibrating
+/// the attainable scale and evaluating readability. Failed fits are retained
+/// too; a new scoring reference does not repeat shaping for this footprint.
+pub(crate) struct CompositionSearch<'a, M> {
     minimum: f32,
     maximum: f32,
     reference: f32,
-    mut layout_at: impl FnMut(f32) -> Result<LayoutRun<'a>>,
-    fits: impl Fn(&LayoutRun<'a>) -> bool,
-    quality_at: impl Fn(&LayoutRun<'a>) -> CompositionQuality,
-) -> Result<Option<LayoutRun<'a>>> {
-    anyhow::ensure!(
-        minimum.is_finite()
-            && maximum.is_finite()
-            && reference.is_finite()
-            && minimum > 0.0
-            && maximum >= minimum
-            && reference > 0.0,
-        "invalid composition font-size interval"
-    );
-    let mut selected: Option<(LayoutRun<'a>, CompositionQuality)> = None;
-    for size in composition_font_sizes(minimum, maximum, reference) {
-        if selected.as_ref().is_some_and(|(_, quality)| {
-            quality.requested_lines_error == 0
-                && !quality.outside_owned_center
-                && font_scale_cost(size, reference) > quality.cost
-        }) {
-            // Samples are ordered by the scale lower bound. No unmeasured
-            // candidate can beat this complete score; reflow need not be monotonic.
-            break;
-        }
-        let candidate = layout_at(size)?;
-        if !fits(&candidate) {
-            continue;
-        }
-        let quality = quality_at(&candidate);
+    samples: Vec<(f32, CompositionMeasurement<'a>)>,
+    measure: M,
+}
+
+impl<'a, M: FnMut(f32) -> FittingLayoutResult<'a>> CompositionSearch<'a, M> {
+    fn new(minimum: f32, maximum: f32, reference: f32, measure: M) -> Result<Self> {
         anyhow::ensure!(
-            quality.cost.is_finite() && quality.cost >= 0.0,
-            "invalid composition quality"
+            minimum.is_finite()
+                && maximum.is_finite()
+                && reference.is_finite()
+                && minimum > 0.0
+                && maximum >= minimum
+                && reference > 0.0,
+            "invalid composition font-size interval"
         );
-        if selected
-            .as_ref()
-            .is_none_or(|(_, current)| quality.compare(*current).is_lt())
-        {
-            selected = Some((candidate, quality));
-        }
+        Ok(Self {
+            minimum,
+            maximum,
+            reference,
+            samples: composition_font_sizes(minimum, maximum, reference)
+                .into_iter()
+                .map(|size| (size, CompositionMeasurement::Pending))
+                .collect(),
+            measure,
+        })
     }
-    Ok(selected.map(|(layout, _)| layout))
+
+    pub(crate) fn reference(&self) -> f32 {
+        self.reference
+    }
+
+    pub(crate) fn select(
+        &mut self,
+        reference: f32,
+        ceiling: Option<CompositionQuality>,
+        quality_at: impl Fn(&LayoutRun<'a>) -> CompositionQuality,
+    ) -> Result<Option<&LayoutRun<'a>>> {
+        anyhow::ensure!(
+            reference.is_finite() && reference > 0.0,
+            "invalid composition reference"
+        );
+        anyhow::ensure!(
+            ceiling.is_none_or(|quality| quality.cost.is_finite() && quality.cost >= 0.0),
+            "invalid composition ceiling"
+        );
+        // Keep the measured sampling grid fixed. A shared reference from another
+        // footprint is also considered exactly, without quantizing cached sizes.
+        let exact = reference.clamp(self.minimum, self.maximum);
+        if !self.samples.iter().any(|(size, _)| *size == exact) {
+            self.samples.push((exact, CompositionMeasurement::Pending));
+        }
+        self.samples.sort_by(|(left, _), (right, _)| {
+            font_scale_cost(*left, reference)
+                .total_cmp(&font_scale_cost(*right, reference))
+                .then_with(|| right.total_cmp(left))
+        });
+        let mut selected: Option<(usize, CompositionQuality)> = None;
+        for (index, (size, measurement)) in self.samples.iter_mut().enumerate() {
+            let bound = selected.as_ref().map(|(_, quality)| *quality).or(ceiling);
+            if bound.is_some_and(|quality| {
+                quality.requested_lines_error == 0
+                    && !quality.outside_owned_center
+                    && font_scale_cost(*size, reference) > quality.cost
+            }) {
+                // The scale lower bound also applies to an incumbent from
+                // another footprint. Reflow itself need not be monotonic.
+                break;
+            }
+            if matches!(measurement, CompositionMeasurement::Pending) {
+                *measurement = match (self.measure)(*size)? {
+                    Some(layout) => CompositionMeasurement::Fitting(layout),
+                    None => CompositionMeasurement::Infeasible,
+                };
+            }
+            let CompositionMeasurement::Fitting(candidate) = measurement else {
+                continue;
+            };
+            let quality = quality_at(candidate);
+            anyhow::ensure!(
+                quality.cost.is_finite() && quality.cost >= 0.0,
+                "invalid composition quality"
+            );
+            if ceiling.is_some_and(|ceiling| quality.compare(ceiling).is_gt()) {
+                continue;
+            }
+            if selected
+                .as_ref()
+                .is_none_or(|(_, current)| quality.compare(*current).is_lt())
+            {
+                selected = Some((index, quality));
+            }
+        }
+        Ok(selected.map(|(index, _)| {
+            let CompositionMeasurement::Fitting(layout) = &self.samples[index].1 else {
+                unreachable!("only fitting compositions can be selected")
+            };
+            layout
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -809,18 +878,17 @@ impl<'a> TextLayout<'a> {
         }
     }
 
-    /// Fits against the caller's painted bounds and composition criteria.
-    /// Outline dilation is reserved before wrapping, not diagnosed afterward.
-    pub(crate) fn run_fitting_with_bounds(
+    /// Owns measurements against the caller's painted bounds. Outline dilation
+    /// is reserved before wrapping, not diagnosed afterward.
+    pub(crate) fn fitting_compositions(
         &self,
         text: &str,
         minimum: f32,
         maximum: f32,
         bounds_at: impl Fn(f32) -> (f32, f32),
         fits: impl Fn(&LayoutRun<'a>) -> bool,
-        quality_at: impl Fn(&LayoutRun<'a>, f32) -> CompositionQuality,
-    ) -> Result<Option<LayoutRun<'a>>> {
-        let layout_at = |size| {
+    ) -> Result<Option<CompositionSearch<'a, impl FnMut(f32) -> FittingLayoutResult<'a>>>> {
+        let layout_at = move |size| {
             let (width, height) = bounds_at(size);
             self.clone()
                 .with_font_size(size)
@@ -832,16 +900,22 @@ impl<'a> TextLayout<'a> {
             Some(reference) => reference,
             None => {
                 let Some(capacity) =
-                    largest_monotonic_fitting_font_size(minimum, maximum, layout_at, &fits)?
+                    largest_monotonic_fitting_font_size(minimum, maximum, &layout_at, &fits)?
                 else {
                     return Ok(None);
                 };
                 capacity.font_size
             }
         };
-        search_compositions(minimum, maximum, reference, layout_at, fits, |layout| {
-            quality_at(layout, reference)
-        })
+        Ok(Some(CompositionSearch::new(
+            minimum,
+            maximum,
+            reference,
+            move |size| {
+                let layout = layout_at(size)?;
+                Ok(fits(&layout).then_some(layout))
+            },
+        )?))
     }
 
     fn run_auto(
@@ -884,10 +958,30 @@ impl<'a> TextLayout<'a> {
                 capacity.font_size
             }
         };
-        let selected =
-            search_compositions(minimum, maximum, reference, &layout_at, fits, |candidate| {
-                self.composition_quality(text, candidate, reference)
+        let mut search = CompositionSearch::new(minimum, maximum, reference, |size| {
+            let layout = layout_at(size)?;
+            Ok(fits(&layout).then_some(layout))
+        })?;
+        let reference = if self.preferred_font_size.is_some() {
+            // An unreachable source em must not make a marginal size gain more
+            // valuable than intact words. Score aesthetics at the nearest size
+            // that can actually fit while retaining explicit flow ownership.
+            let nearest = search.select(reference, None, |candidate| CompositionQuality {
+                cost: font_scale_cost(candidate.font_size, reference),
+                ..self.composition_quality(text, candidate, reference)
             })?;
+            let Some(nearest) = nearest else {
+                return layout_at(minimum);
+            };
+            nearest.font_size
+        } else {
+            reference
+        };
+        let selected = search
+            .select(reference, None, |candidate| {
+                self.composition_quality(text, candidate, reference)
+            })?
+            .cloned();
         #[cfg(debug_assertions)]
         if let Some(selected) = &selected {
             tracing::trace!(
@@ -3499,28 +3593,85 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_source_scale_preserves_capacity_based_composition() -> anyhow::Result<()> {
+        let font = any_system_font();
+        let mut intact_cases = 0;
+        for (language, text) in [("en-US", "Take control!"), ("tr-TR", "Lanet olsun!")] {
+            for scale in [0.5, 1.0, 2.0] {
+                let width = 120.0 * scale;
+                let height = 240.0 * scale;
+                let base = TextLayout::new(&font)
+                    .with_language_tag(language)
+                    .with_hyphenation_policy(HyphenationPolicy::LastResort)
+                    .with_alignment(TextAlign::Center)
+                    .with_line_height(1.2)
+                    .with_min_font_size(12.0 * scale)
+                    .with_max_font_size(160.0 * scale)
+                    .with_max_width(width)
+                    .with_max_height(height)
+                    .with_comic_balloon(
+                        width,
+                        height,
+                        vec![(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)],
+                        4.0 * scale,
+                    );
+                let expected = base.run(text)?;
+                intact_cases += usize::from(expected.discretionary_hyphen_count() == 0);
+                for source_scale in [200.0, 800.0] {
+                    let layout = base
+                        .clone()
+                        .with_preferred_font_size(source_scale * scale)
+                        .run(text)?;
+                    assert!(!layout.overflowed(), "{language} at {scale}");
+                    assert_eq!(
+                        layout.discretionary_hyphen_count(),
+                        expected.discretionary_hyphen_count(),
+                        "{language}: unreachable source size {source_scale} changed fragmentation"
+                    );
+                    assert_eq!(
+                        layout.lines.len(),
+                        expected.lines.len(),
+                        "{language} at {scale}"
+                    );
+                    assert!(
+                        (layout.font_size / expected.font_size - 1.0).abs() < 0.025,
+                        "only infeasible typography changed: {} vs {}",
+                        expected.font_size,
+                        layout.font_size
+                    );
+                }
+            }
+        }
+        assert!(
+            intact_cases > 0,
+            "no unfragmented composition was exercised"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn preferred_font_size_searches_both_sides_of_a_nonmonotonic_gap() -> anyhow::Result<()> {
         let font = any_system_font();
         let builder = TextLayout::new(&font).with_preferred_font_size(24.5);
         let layout_at = |size| TextLayout::new(&font).with_font_size(size).run("A phrase");
-        let selected = search_compositions(
-            12.0,
-            50.0,
-            24.5,
-            layout_at,
-            |layout| (23.9..24.2).contains(&layout.font_size) || layout.font_size >= 26.0,
-            |layout| builder.composition_quality("A phrase", layout, 24.5),
-        )?
+        let selected = CompositionSearch::new(12.0, 50.0, 24.5, |size| {
+            ((23.9..24.2).contains(&size) || size >= 26.0)
+                .then(|| layout_at(size))
+                .transpose()
+        })?
+        .select(24.5, None, |layout| {
+            builder.composition_quality("A phrase", layout, 24.5)
+        })?
+        .cloned()
         .unwrap();
         assert!((23.9..24.2).contains(&selected.font_size));
-        let selected_above = search_compositions(
-            12.0,
-            50.0,
-            24.5,
-            layout_at,
-            |layout| layout.font_size >= 26.0,
-            |layout| builder.composition_quality("A phrase", layout, 24.5),
-        )?
+        let selected_above = CompositionSearch::new(12.0, 50.0, 24.5, |size| {
+            (size >= 26.0).then(|| layout_at(size)).transpose()
+        })?
+        .select(24.5, None, |layout| {
+            builder.composition_quality("A phrase", layout, 24.5)
+        })?
+        .cloned()
         .unwrap();
         assert!((26.0..26.3).contains(&selected_above.font_size));
         Ok(())
@@ -3551,15 +3702,15 @@ mod tests {
                 }
                 Ok(layout)
             };
-            let selected = search_compositions(
-                12.0 * scale,
-                40.0 * scale,
-                24.0 * scale,
-                layout_at,
-                |_| true,
-                |layout| builder.composition_quality(text, layout, 24.0 * scale),
-            )?
-            .unwrap();
+            let selected =
+                CompositionSearch::new(12.0 * scale, 40.0 * scale, 24.0 * scale, |size| {
+                    layout_at(size).map(Some)
+                })?
+                .select(24.0 * scale, None, |layout| {
+                    builder.composition_quality(text, layout, 24.0 * scale)
+                })?
+                .cloned()
+                .unwrap();
             assert!(
                 (27.0..27.5).contains(&(selected.font_size / scale)),
                 "the closer whole-word composition above the source size was discarded: {} at scale {scale}",
@@ -3638,8 +3789,8 @@ mod tests {
             .run("Şup♡")?;
         let maximum_area = unrestricted.width * unrestricted.height * 0.4;
 
-        let fitted = builder
-            .run_fitting_with_bounds(
+        let mut search = builder
+            .fitting_compositions(
                 "Şup♡",
                 12.0,
                 preferred_size,
@@ -3649,12 +3800,15 @@ mod tests {
                     (layout.width + dilation * 2.0) * (layout.height + dilation * 2.0)
                         <= maximum_area
                 },
-                |layout, reference| CompositionQuality {
-                    cost: layout.composition_cost("Şup♡", reference),
-                    ..CompositionQuality::default()
-                },
             )?
             .expect("the minimum setting fits the painted footprint");
+        let reference = search.reference();
+        let fitted = search
+            .select(reference, None, |layout| CompositionQuality {
+                cost: layout.composition_cost("Şup♡", reference),
+                ..CompositionQuality::default()
+            })?
+            .expect("a fitting composition exists");
 
         assert!(fitted.font_size < preferred_size);
         let dilation = fitted.font_size * 0.1;
@@ -5295,6 +5449,146 @@ mod tests {
     }
 
     #[test]
+    fn composition_search_reuses_fits_when_the_reference_changes() -> anyhow::Result<()> {
+        use std::{cell::RefCell, collections::BTreeMap};
+        let font = any_system_font();
+        let measurements = RefCell::new(BTreeMap::new());
+        let mut search = CompositionSearch::new(6.0, 96.0, 48.0, |size| {
+            *measurements.borrow_mut().entry(size.to_bits()).or_insert(0) += 1;
+            let layout = TextLayout::new(&font).with_font_size(size).run("One two")?;
+            // A nonmonotonic gap must stay infeasible across both passes.
+            Ok((size <= 24.0 && !(21.0..23.0).contains(&size)).then_some(layout))
+        })?;
+        let nearest = search
+            .select(48.0, None, |layout| CompositionQuality {
+                cost: font_scale_cost(layout.font_size, 48.0),
+                ..CompositionQuality::default()
+            })?
+            .unwrap()
+            .font_size;
+        let quality_at = |layout: &LayoutRun<'_>| CompositionQuality {
+            cost: font_scale_cost(layout.font_size, nearest)
+                + (layout.font_size / 9.0).sin().powi(2),
+            ..CompositionQuality::default()
+        };
+        let selected = search.select(nearest, None, quality_at)?.unwrap().font_size;
+        let visited = measurements.borrow().len();
+        assert_eq!(
+            search.select(nearest, None, quality_at)?.unwrap().font_size,
+            selected
+        );
+        assert_eq!(measurements.borrow().len(), visited);
+        assert!(measurements.borrow().values().all(|count| *count == 1));
+        let exhaustive = composition_font_sizes(6.0, 96.0, 48.0)
+            .into_iter()
+            .filter(|size| *size <= 24.0 && !(21.0..23.0).contains(size))
+            .map(|size| TextLayout::new(&font).with_font_size(size).run("One two"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .min_by(|left, right| quality_at(left).compare(quality_at(right)))
+            .unwrap();
+        assert_eq!(selected, exhaustive.font_size);
+        Ok(())
+    }
+
+    #[test]
+    fn composition_search_measures_a_shared_reference_exactly() -> anyhow::Result<()> {
+        use std::cell::Cell;
+        let font = any_system_font();
+        let count = Cell::new(0);
+        let mut search = CompositionSearch::new(6.0, 96.0, 48.0, |size| {
+            count.set(count.get() + 1);
+            TextLayout::new(&font)
+                .with_font_size(size)
+                .run("Text")
+                .map(Some)
+        })?;
+        for reference in [48.0, 23.17, 48.0] {
+            let selected = search
+                .select(reference, None, |layout| CompositionQuality {
+                    cost: font_scale_cost(layout.font_size, reference),
+                    ..CompositionQuality::default()
+                })?
+                .unwrap();
+            assert_eq!(selected.font_size, reference);
+        }
+        assert_eq!(count.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn composition_search_does_not_cache_measurement_errors_as_failed_fits() -> anyhow::Result<()> {
+        use std::cell::Cell;
+        let font = any_system_font();
+        let count = Cell::new(0);
+        let mut search = CompositionSearch::new(6.0, 96.0, 48.0, |size| {
+            count.set(count.get() + 1);
+            anyhow::ensure!(count.get() > 1, "measurement failed");
+            TextLayout::new(&font)
+                .with_font_size(size)
+                .run("Text")
+                .map(Some)
+        })?;
+        let quality_at = |layout: &LayoutRun<'_>| CompositionQuality {
+            cost: font_scale_cost(layout.font_size, 48.0),
+            ..CompositionQuality::default()
+        };
+        assert!(search.select(48.0, None, quality_at).is_err());
+        assert_eq!(
+            search.select(48.0, None, quality_at)?.unwrap().font_size,
+            48.0
+        );
+        assert_eq!(count.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn composition_search_incumbent_prunes_only_worse_footprints() -> anyhow::Result<()> {
+        use std::cell::Cell;
+        let font = any_system_font();
+        let count = Cell::new(0);
+        let reference = 48.0;
+        let incumbent = CompositionQuality {
+            cost: font_scale_cost(40.0, reference),
+            ..CompositionQuality::default()
+        };
+        let mut search = CompositionSearch::new(6.0, 24.0, reference, |size| {
+            count.set(count.get() + 1);
+            TextLayout::new(&font)
+                .with_font_size(size)
+                .run("One two")
+                .map(Some)
+        })?;
+        let quality_at = |layout: &LayoutRun<'_>| CompositionQuality {
+            cost: font_scale_cost(layout.font_size, reference),
+            ..CompositionQuality::default()
+        };
+        assert!(
+            search
+                .select(reference, Some(incumbent), quality_at)?
+                .is_none()
+        );
+        assert_eq!(
+            count.get(),
+            0,
+            "a worse scale interval was shaped unnecessarily"
+        );
+        // A footprint that can honor an explicit line count outranks scale cost.
+        let relaxed = CompositionQuality {
+            requested_lines_error: 1,
+            ..incumbent
+        };
+        assert_eq!(
+            search
+                .select(reference, Some(relaxed), quality_at)?
+                .unwrap()
+                .font_size,
+            24.0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn composition_search_pruning_matches_the_complete_frontier() -> anyhow::Result<()> {
         use std::cell::Cell;
         let font = any_system_font();
@@ -5315,7 +5609,9 @@ mod tests {
                 ..CompositionQuality::default()
             };
             let selected =
-                search_compositions(6.0, 96.0, reference, layout_at, |_| true, quality_at)?
+                CompositionSearch::new(6.0, 96.0, reference, |size| layout_at(size).map(Some))?
+                    .select(reference, None, quality_at)?
+                    .cloned()
                     .unwrap();
             let visited = count.get();
             let exhaustive = samples
