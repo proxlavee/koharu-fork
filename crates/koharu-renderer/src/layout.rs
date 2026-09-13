@@ -561,6 +561,7 @@ struct ParagraphShaper<'t, 'a> {
     bidi: BidiInfo<'t>,
     options: ShapingOptions<'t>,
     fonts: Vec<&'a Font>,
+    primary_covers_text: bool,
 }
 
 impl<'a> ParagraphShaper<'_, 'a> {
@@ -619,7 +620,13 @@ impl<'a> ParagraphShaper<'_, 'a> {
             let shaping_text = normalized
                 .as_ref()
                 .map_or(run_text, |(text, _)| text.as_str());
-            for mut shaped in shape_script_runs(&shaper, shaping_text, &self.fonts, &run_options)? {
+            for mut shaped in shape_script_runs(
+                &shaper,
+                shaping_text,
+                &self.fonts,
+                &run_options,
+                self.primary_covers_text && normalized.is_none(),
+            )? {
                 self.layout.apply_spacing(shaping_text, &mut shaped);
                 if self.layout.writing_mode.is_vertical() && self.layout.center_vertical_punctuation
                 {
@@ -1280,6 +1287,7 @@ impl<'a> TextLayout<'a> {
             bidi: bidi_info,
             options,
             fonts,
+            primary_covers_text: !self.cjk_punctuation_layout && self.font.covers(text),
         };
 
         let mut shaped_segments = Vec::new();

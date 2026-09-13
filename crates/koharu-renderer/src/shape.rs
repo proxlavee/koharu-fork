@@ -135,11 +135,17 @@ impl TextShaper {
     }
 }
 
+/// Shape script runs when the caller has already established that the primary
+/// face covers the complete paragraph. Coverage checks otherwise reopen and
+/// rescan the font for every candidate line, which is disproportionately costly
+/// for long paragraphs. The fallback path remains the default for independent
+/// callers and for paragraphs containing missing glyphs.
 pub(crate) fn shape_script_runs<'a>(
     shaper: &TextShaper,
     text: &str,
     fonts: &[&'a Font],
     options: &ShapingOptions,
+    primary_covers_text: bool,
 ) -> Result<Vec<ShapedRun<'a>>> {
     if text.is_empty() || fonts.is_empty() {
         return Ok(Vec::new());
@@ -175,11 +181,11 @@ pub(crate) fn shape_script_runs<'a>(
         let mut run_opts = options.clone();
         run_opts.script = crate::script::harfrust_script(script);
 
-        if let Some(font) = fonts
+        let primary = fonts
             .first()
             .copied()
-            .filter(|font| font.covers(script_run_text))
-        {
+            .filter(|font| primary_covers_text || font.covers(script_run_text));
+        if let Some(font) = primary {
             push_font_run(shaper, script_run_text, font, &run_opts, start, &mut runs)?;
             continue;
         }
@@ -378,7 +384,7 @@ mod tests {
             language: None,
             features: &[],
         };
-        let runs = shape_script_runs(&shaper, &text, &[&primary, &fallback], &options)?;
+        let runs = shape_script_runs(&shaper, &text, &[&primary, &fallback], &options, false)?;
 
         let glyph_count: usize = runs.iter().map(|r| r.glyphs.len()).sum();
         assert!(glyph_count >= 3);
@@ -424,7 +430,7 @@ mod tests {
 
         // "مرحبا" (Marhaba)
         let text = "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}";
-        let shaped = shape_script_runs(&shaper, text, &[&primary, &fallback], &options)?;
+        let shaped = shape_script_runs(&shaper, text, &[&primary, &fallback], &options, false)?;
 
         assert!(!shaped.is_empty());
         // Verify it used a consistent font for the whole run to ensure joining.
@@ -458,12 +464,66 @@ mod tests {
 
         // Mixed script: Arabic + Hebrew (will be detected as separate script runs).
         let text = "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627} \u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-        let shaped = shape_script_runs(&shaper, text, &[&font], &options)?;
+        let shaped = shape_script_runs(&shaper, text, &[&font], &options, false)?;
 
         // Now returns separate script runs in logical order.
         assert!(shaped.len() >= 2); // Arabic+space, Hebrew (or maybe space separate)
         assert!(shaped[0].glyphs[0].cluster < shaped[shaped.len() - 1].glyphs[0].cluster);
 
+        Ok(())
+    }
+
+    #[test]
+    fn primary_coverage_fast_path_preserves_shaping() -> Result<()> {
+        let mut fonts = FontSystem::new();
+        let font = PRIMARY_FAMILIES
+            .iter()
+            .find_map(|name| query_font(&mut fonts, name))
+            .expect("no font available");
+        let text = "office affinity";
+        assert!(
+            font.covers(text),
+            "selected test font lacks the fixture text"
+        );
+
+        let shaper = TextShaper::new();
+        let options = ShapingOptions {
+            direction: harfrust::Direction::LeftToRight,
+            script: None,
+            font_size: 24.0,
+            language: None,
+            features: &[],
+        };
+        let shape = |primary_covers_text| {
+            shape_script_runs(&shaper, text, &[&font], &options, primary_covers_text)
+        };
+        let fallback = shape(false)?;
+        let fast = shape(true)?;
+        assert_eq!(
+            fallback
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .map(|glyph| {
+                    (
+                        glyph.glyph_id,
+                        glyph.cluster,
+                        glyph.x_advance,
+                        glyph.x_offset,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            fast.iter()
+                .flat_map(|run| &run.glyphs)
+                .map(|glyph| {
+                    (
+                        glyph.glyph_id,
+                        glyph.cluster,
+                        glyph.x_advance,
+                        glyph.x_offset,
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 }
