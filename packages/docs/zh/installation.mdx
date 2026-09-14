@@ -1,0 +1,27 @@
+---
+title: '安装 Koharu'
+description: '下载发行版，完成首次启动，并保持应用更新。'
+icon: 'download'
+---
+
+<Steps>
+  <Step title="选择发行版">
+    打开此分支的[最新 GitHub 发行版](https://github.com/proxlavee/koharu-fork/releases/latest)，运行 64 位 Windows NSIS 安装程序。该安装程序没有代码签名，因此 Microsoft Defender SmartScreen 可能会显示警告。此分支不发布 macOS 或 Linux 应用程序二进制文件。
+
+  </Step>
+  <Step title="等待运行时初始化">
+    启动 Koharu，等待项目列表出现。首次启动可能需要下载原生运行时，因此耗时较长。模型文件会在首次使用所选模型时下载。
+
+    运行时软件包来自 GitHub 发行资源、CUDA 对应的 PyPI 以及 ROCm 对应的 AMD 仓库；模型权重来自 Hugging Face。活动中心会显示进度，请保持应用打开直到完成。
+
+  </Step>
+  <Step title="创建项目">
+    准备一张清晰的漫画图片，按照[快速开始](/zh/quickstart)操作。如果设备初始化失败，先查看[硬件与运行时](/zh/hardware)。
+  </Step>
+</Steps>
+
+## 安装更新
+
+此未签名版本不启用 Tauri 的签名更新器。如需更新，请关闭 Koharu，然后从此分支的 GitHub Releases 页面运行新版安装程序。
+
+<Tip>日常翻译使用发行版。需要修改代码时，请参考[开发环境](/zh/development/setup)。</Tip>

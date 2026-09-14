@@ -1,0 +1,29 @@
+---
+title: 'Koharu のインストール'
+description: 'リリースを入手し、初回起動を完了して、アプリを更新します。'
+icon: 'download'
+---
+
+<Steps>
+  <Step title="リリースを選ぶ">
+    このフォークの[最新の GitHub リリース](https://github.com/proxlavee/koharu-fork/releases/latest)から 64-bit Windows 向けの NSIS インストーラーを実行します。コード署名されていないため、Microsoft Defender SmartScreen の警告が表示される場合があります。このフォークは macOS または Linux 向けアプリケーションバイナリを公開しません。
+
+  </Step>
+  <Step title="ランタイムの初期化を待つ">
+    Koharu を起動し、プロジェクト一覧が表示されるまで待ちます。初回はネイティブパッケージの取得に時間がかかることがあります。モデル本体は選択したモデルを初めて使う際に取得されます。
+
+    ランタイムパッケージは GitHub のリリースアセットから、CUDA 用は PyPI から、ROCm 用は AMD のリポジトリから取得し、モデルの重みは Hugging Face から取得します。アクティビティセンターで進捗を確認し、完了までアプリを開いたままにします。
+
+  </Step>
+  <Step title="プロジェクトを作る">
+    読みやすいマンガ画像を 1 枚用意し、[クイックスタート](/ja/quickstart)へ進みます。デバイス初期化に失敗した場合は[ハードウェア](/ja/hardware)を確認してください。
+  </Step>
+</Steps>
+
+## アップデート
+
+この未署名ビルドでは Tauri の署名付きアップデーターを有効にしません。更新するには Koharu を終了し、このフォークの GitHub Releases ページから新しいインストーラーを実行してください。
+
+<Tip>
+  翻訳作業にはリリース版を使います。コードを変更する場合は[開発環境のセットアップ](/ja/development/setup)を参照してください。
+</Tip>

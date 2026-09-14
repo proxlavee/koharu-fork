@@ -11,7 +11,8 @@ use koharu_scene::{AssetRole, EntityId, Snapshot};
 use serde::Deserialize;
 use specta::Type;
 use std::sync::Arc;
-use tauri::{Cef, State, WebviewWindow, ipc::IpcResponse};
+use tauri::{State, WebviewWindow, ipc::IpcResponse};
+use tauri_runtime_cef::CefRuntime;
 
 use super::{Error, project::CurrentProject};
 use koharu_desktop::Desktop;
@@ -44,7 +45,7 @@ pub enum ExportFormat {
 #[tauri::command]
 #[specta::specta]
 pub(crate) async fn export_pages(
-    window: WebviewWindow<Cef>,
+    window: WebviewWindow<CefRuntime>,
     pages: Vec<EntityId>,
     format: ExportFormat,
     project: State<'_, CurrentProject>,
@@ -156,7 +157,7 @@ fn encode_png(writer: impl std::io::Write, image: RgbaImage) -> image::ImageResu
     let (width, height) = image.dimensions();
     let mut pixels = image.into_raw();
     let (mut opaque, mut grayscale) = (true, true);
-    for pixel in pixels.chunks_exact(4) {
+    for pixel in pixels.as_chunks::<4>().0 {
         opaque &= pixel[3] == u8::MAX;
         grayscale &= pixel[0] == pixel[1] && pixel[1] == pixel[2];
         if !opaque && !grayscale {

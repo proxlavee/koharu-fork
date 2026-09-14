@@ -3,7 +3,8 @@ use koharu_desktop::Desktop;
 use koharu_scene::{EntityId, LanguageTag, Snapshot};
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::{Cef, State, WebviewWindow};
+use tauri::{State, WebviewWindow};
+use tauri_runtime_cef::CefRuntime;
 
 use super::{
     ChannelExt as _, Error,
@@ -47,7 +48,7 @@ struct OrderedTextSegment {
 #[tauri::command]
 #[specta::specta]
 pub(crate) async fn export_translation_package(
-    window: WebviewWindow<Cef>,
+    window: WebviewWindow<CefRuntime>,
     target_language: String,
     project: State<'_, CurrentProject>,
 ) -> std::result::Result<Option<TranslationPackageSummary>, Error> {
@@ -79,7 +80,7 @@ pub(crate) async fn export_translation_package(
 #[tauri::command]
 #[specta::specta]
 pub(crate) async fn import_translation_package(
-    window: WebviewWindow<Cef>,
+    window: WebviewWindow<CefRuntime>,
     target_language: String,
     desktop: State<'_, Desktop>,
     project: State<'_, CurrentProject>,

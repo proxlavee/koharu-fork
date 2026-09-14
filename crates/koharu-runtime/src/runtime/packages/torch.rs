@@ -6,16 +6,13 @@ use strum::EnumProperty;
 use crate::{
     Hardware, Store, download,
     runtime::{
-        DiscoverablePackage, Package, RuntimePackage,
-        graph::Component,
-        loader,
-        packages::{Cuda, Rocm},
+        DiscoverablePackage, Package, RuntimePackage, graph::Component, loader, packages::Cuda,
         sealed,
     },
     source::extract,
 };
 
-const RELEASE: &str = "v2.13.0.3";
+const RELEASE: &str = "v2.13.0.7";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::Display, strum::EnumProperty)]
 pub enum Torch {
@@ -26,22 +23,22 @@ pub enum Torch {
     #[strum(props(
         windows = "libiomp5md.dll,c10.dll,torch_global_deps.dll,torch_cpu.dll,torch.dll,koharu-torch.dll",
         linux = "libgomp.so.1,libc10.so,libtorch_global_deps.so,libtorch_cpu.so,libtorch.so,libkoharu-torch.so",
-        macos = "libtorch.dylib,libomp.dylib,libtorch_global_deps.dylib,libtorch_cpu.dylib,libc10.dylib,libkoharu-torch.dylib"
+        macos = "libtorch.dylib,libtorch_global_deps.dylib,libtorch_cpu.dylib,libc10.dylib,libkoharu-torch.dylib"
     ))]
     Cpu,
     #[strum(
         serialize = "cuda",
         props(
-            windows = "libiomp5md.dll,c10.dll,c10_cuda.dll,caffe2_nvrtc.dll,torch_global_deps.dll,torch_cpu.dll,torch_cuda.dll,torch.dll,koharu-torch.dll",
-            linux = "libgomp.so.1,libc10.so,libc10_cuda.so,libcaffe2_nvrtc.so,libtorch_global_deps.so,libtorch_cpu.so,libtorch_cuda.so,libtorch.so,libkoharu-torch.so"
+            windows = "c10.dll,c10_cuda.dll,caffe2_nvrtc.dll,torch_global_deps.dll,torch_cpu.dll,torch_cuda.dll,torch.dll,koharu-torch.dll",
+            linux = "libc10.so,libc10_cuda.so,libcaffe2_nvrtc.so,libtorch_global_deps.so,libtorch_cpu.so,libtorch_cuda.so,libtorch.so,libkoharu-torch.so"
         )
     )]
     Cuda,
     #[strum(
         serialize = "hip",
         props(
-            windows = "libiomp5md.dll,c10.dll,c10_hip.dll,caffe2_nvrtc.dll,torch_global_deps.dll,torch_cpu.dll,torch_hip.dll,torch.dll,koharu-torch.dll",
-            linux = "libgomp.so.1,libc10.so,libc10_hip.so,libcaffe2_nvrtc.so,libtorch_global_deps.so,libtorch_cpu.so,libtorch_hip.so,libtorch.so,libkoharu-torch.so"
+            windows = "c10.dll,c10_hip.dll,caffe2_nvrtc.dll,torch_global_deps.dll,torch_cpu.dll,torch_hip.dll,torch.dll,koharu-torch.dll",
+            linux = "libc10.so,libc10_hip.so,libcaffe2_nvrtc.so,libtorch_global_deps.so,libtorch_cpu.so,libtorch_hip.so,libtorch.so,libkoharu-torch.so"
         )
     )]
     Rocm,
@@ -70,16 +67,18 @@ impl Torch {
     }
 
     fn asset(self) -> Result<String> {
-        let platform = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-            "Windows"
+        let target = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            "x86_64-pc-windows-msvc"
         } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "Linux"
+            "x86_64-unknown-linux-gnu"
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            "aarch64-unknown-linux-gnu"
         } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            "macOS"
+            "aarch64-apple-darwin"
         } else {
             anyhow::bail!("Torch {self} does not support this target")
         };
-        Ok(format!("{platform}-{self}.tar.gz"))
+        Ok(format!("{target}-{self}.tar.gz"))
     }
 }
 
@@ -118,6 +117,9 @@ impl DiscoverablePackage for Torch {
         if hardware.supports_metal() {
             return Some(Self::Cpu);
         }
+        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            return hardware.supports_cuda().then_some(Self::Cuda);
+        }
         if !cfg!(any(
             all(target_os = "windows", target_arch = "x86_64"),
             all(target_os = "linux", target_arch = "x86_64")
@@ -127,7 +129,7 @@ impl DiscoverablePackage for Torch {
         if hardware.supports_cuda() {
             return Some(Self::Cuda);
         }
-        if hardware.supports_rocm() && Rocm::discover(hardware).is_ok() {
+        if hardware.supports_rocm() {
             return Some(Self::Rocm);
         }
         tracing::warn!("no supported Torch accelerator was discovered; using CPU");
@@ -141,7 +143,7 @@ impl RuntimePackage for Torch {
     fn dependencies(self, hardware: &Hardware) -> Result<Vec<Component>> {
         match self {
             Self::Cpu => Ok(Vec::new()),
-            Self::Rocm => Ok(vec![Component::Rocm(Rocm::discover(hardware)?)]),
+            Self::Rocm => Ok(vec![Component::Rocm(hardware.rocm_target()?)]),
             Self::Cuda => {
                 let packages = [
                     Cuda::Runtime13,
@@ -152,7 +154,7 @@ impl RuntimePackage for Torch {
                     Cuda::Rand10,
                     Cuda::Sparse12,
                     Cuda::Solver12,
-                    Cuda::Dnn920,
+                    Cuda::Dnn925,
                 ];
                 Ok(packages.into_iter().map(Component::Cuda).collect())
             }
