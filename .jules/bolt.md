@@ -1,0 +1,3 @@
+## 2024-08-28 - O(N²) bottlenecks in canvas layer traversal
+**Learning:** Koharu's canvas interactions heavily rely on iterating through arrays of layers for visibility and selection. Functions like `effectiveLayerVisibility` recursively traversed up a layer's parents by doing O(N) `Array.prototype.find()` lookups inside loops, creating O(N²) bottlenecks during real-time hover/selection updates (e.g., inside `hitTestLayers` and `CanvasOverlay`).
+**Action:** Always precompute a `Map<string, Layer>` of layers keyed by `id` before mapping or iterating over layers in hot paths, and pass it down to helpers to ensure O(1) lookups.
