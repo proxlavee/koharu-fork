@@ -53,13 +53,16 @@ export function CanvasOverlay({
   const selectedIds = useMemo(() => new Set(expandedSelection), [expandedSelection])
   const multipleSelected = expandedSelection.length > 1
   const layers = useMemo(
-    () =>
-      page.layers.flatMap((layer) => {
-        const visibility = effectiveLayerVisibility(page.layers, layer)
+    () => {
+      // ⚡ Bolt: Build map for O(1) layer lookups instead of O(N^2) during map
+      const layerMap = new Map(page.layers.map((layer) => [layer.id, layer]))
+      return page.layers.flatMap((layer) => {
+        const visibility = effectiveLayerVisibility(layerMap, layer)
         if (!visibility.visible || visibility.opacity <= 0) return []
         const frame = previews[layer.id] ?? controlFrame(layer, frames)
         return frame ? [{ layer, frame, opacity: visibility.opacity }] : []
-      }),
+      })
+    },
     [page.layers, previews, frames],
   )
   const selectedLayer =
