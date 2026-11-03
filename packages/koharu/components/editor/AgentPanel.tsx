@@ -18,6 +18,7 @@ import {
 } from '@koharu/bridge/protocol'
 import { Badge } from '@koharu/ui/components/badge'
 import { Button } from '@koharu/ui/components/button'
+import { Spinner } from '@koharu/ui/components/spinner'
 import { ScrollArea } from '@koharu/ui/components/scroll-area'
 import {
   Select,
@@ -88,7 +89,7 @@ export function AgentPanel() {
           </div>
         ) : null}
         <Button className='mt-4 w-full max-w-64' disabled={loggingIn} onClick={() => void login()}>
-          {loggingIn ? t('agent.signingIn') : t('agent.signIn')}
+          {loggingIn ? (<><Spinner className='mr-1.5' /> {t('agent.signingIn')}</>) : (t('agent.signIn'))}
         </Button>
       </div>
     )
